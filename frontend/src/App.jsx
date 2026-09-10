@@ -1,10 +1,10 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, Navigate, Link, useLocation } from 'react-router-dom';
 import { io } from 'socket.io-client';
-import { Activity, Plus, ShieldCheck, User, LogOut, Image as ImageIcon, X, Paperclip, Users, Ticket, UserPlus, Copy, Check, Trash2, Box, PackagePlus, ChevronRight, Search, Headphones, KeyRound, AlertCircle, Monitor, Laptop, FilePlus, ChevronDown, Filter, MessageSquare, Send } from 'lucide-react';
+import { Activity, LogOut, Image as ImageIcon, X, Users, Ticket, UserPlus, Trash2, Box, PackagePlus, ChevronRight, Search, Headphones, KeyRound, AlertCircle, Monitor, Laptop, FilePlus, ChevronDown, MessageSquare, Send } from 'lucide-react';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
-const socket = io(API_URL, { autoConnect: false });
+const API_URL = import.meta.env.VITE_API_URL || '';
+const socket = io(API_URL || undefined, { autoConnect: false });
 
 export default function App() {
   return (
@@ -16,34 +16,28 @@ export default function App() {
 
 function MainRouter() {
   const [token, setToken] = useState(localStorage.getItem('token') || '');
-  const [user, setUser] = useState(JSON.parse(localStorage.getItem('user') || 'null'));
+  const [user, setUser] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('user') || 'null');
+    } catch {
+      return null;
+    }
+  });
   const [tickets, setTickets] = useState([]);
   const [usersList, setUsersList] = useState([]);
   const [inventoryList, setInventoryList] = useState([]);
-  
   const navigate = useNavigate();
 
-  useEffect(() => {
-    if (!token) {
-      socket.disconnect();
-      return undefined;
-    }
+  const handleLogout = useCallback(() => {
+    localStorage.removeItem('token');
+    localStorage.removeItem('user');
+    socket.disconnect();
+    setToken('');
+    setUser(null);
+    navigate('/login');
+  }, [navigate]);
 
-    socket.auth = { token };
-    socket.connect();
-
-    return () => socket.disconnect();
-  }, [token]);
-
-  useEffect(() => {
-    if (token) {
-      fetchTickets();
-      fetchUsers();
-      if (user?.role === 'agent') fetchInventory();
-    }
-  }, [token, user?.role]);
-
-  const fetchTickets = async () => {
+  const fetchTickets = useCallback(async () => {
     try {
       const res = await fetch(`${API_URL}/api/tickets`, {
         headers: { Authorization: `Bearer ${token}` }
@@ -54,12 +48,12 @@ function MainRouter() {
       }
       const data = await res.json();
       if (res.ok) setTickets(data);
-    } catch (err) {
-      console.error(err);
+    } catch {
+      // The UI remains usable while the API is temporarily unavailable.
     }
-  };
+  }, [handleLogout, token]);
 
-  const fetchUsers = async () => {
+  const fetchUsers = useCallback(async () => {
     try {
       const res = await fetch(`${API_URL}/api/users`, {
         headers: { Authorization: `Bearer ${token}` }
@@ -70,12 +64,12 @@ function MainRouter() {
       }
       const data = await res.json();
       if (res.ok) setUsersList(data);
-    } catch (err) {
-      console.error(err);
+    } catch {
+      // The UI remains usable while the API is temporarily unavailable.
     }
-  };
+  }, [handleLogout, token]);
 
-  const fetchInventory = async () => {
+  const fetchInventory = useCallback(async () => {
     try {
       const res = await fetch(`${API_URL}/api/inventory`, {
         headers: { Authorization: `Bearer ${token}` }
@@ -86,79 +80,82 @@ function MainRouter() {
       }
       const data = await res.json();
       if (res.ok) setInventoryList(data);
-    } catch (err) {
-      console.error(err);
+    } catch {
+      // The UI remains usable while the API is temporarily unavailable.
     }
-  };
+  }, [handleLogout, token]);
 
-  const handleLogout = () => {
-    localStorage.clear();
-    setToken('');
-    setUser(null);
-    navigate('/login');
-  };
+  useEffect(() => {
+    if (!token) {
+      socket.disconnect();
+      return undefined;
+    }
+
+    socket.auth = { token };
+    socket.connect();
+    return () => socket.disconnect();
+  }, [token]);
+
+  useEffect(() => {
+    if (!token) return undefined;
+    const timer = window.setTimeout(() => {
+      fetchTickets();
+      fetchUsers();
+      if (user?.role === 'agent') fetchInventory();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [fetchInventory, fetchTickets, fetchUsers, token, user?.role]);
 
   return (
     <Routes>
-      {/* Auth Routes */}
-      <Route 
-        path="/login" 
-        element={!token ? <AuthScreen setToken={setToken} setUser={setUser} /> : <Navigate to={user?.role === 'agent' ? '/agent/tickets' : '/portal'} />} 
+      <Route
+        path="/login"
+        element={!token ? <AuthScreen setToken={setToken} setUser={setUser} /> : <Navigate to={user?.role === 'agent' ? '/agent/tickets' : '/portal'} />}
       />
-      <Route 
-        path="/signup" 
-        element={!token ? <AuthScreen initialMode="signup" setToken={setToken} setUser={setUser} /> : <Navigate to={user?.role === 'agent' ? '/agent/tickets' : '/portal'} />} 
+      <Route
+        path="/signup"
+        element={!token ? <AuthScreen initialMode="signup" setToken={setToken} setUser={setUser} /> : <Navigate to={user?.role === 'agent' ? '/agent/tickets' : '/portal'} />}
       />
-      <Route 
-        path="/forgot-password" 
-        element={<AuthScreen initialMode="forgot" setToken={setToken} setUser={setUser} />} 
+      <Route
+        path="/forgot-password"
+        element={<AuthScreen initialMode="forgot" setToken={setToken} setUser={setUser} />}
       />
-
-      {/* Customer / Employee Portal Routes */}
-      <Route 
-        path="/portal/*" 
+      <Route
+        path="/portal/*"
         element={
           token && user?.role === 'user' ? (
-            <CustomerPortal 
-              user={user} 
-              tickets={tickets} 
-              usersList={usersList} 
-              fetchTickets={fetchTickets} 
-              handleLogout={handleLogout} 
-              token={token} 
+            <CustomerPortal
+              user={user}
+              tickets={tickets}
+              usersList={usersList}
+              fetchTickets={fetchTickets}
+              handleLogout={handleLogout}
+              token={token}
             />
-          ) : (
-            <Navigate to="/login" />
-          )
-        } 
+          ) : <Navigate to="/login" />
+        }
       />
-
-      {/* Agent Console Routes */}
-      <Route 
-        path="/agent/*" 
+      <Route
+        path="/agent/*"
         element={
           token && user?.role === 'agent' ? (
-            <AgentConsole 
-              user={user} 
-              tickets={tickets} 
-              usersList={usersList} 
-              inventoryList={inventoryList || []} 
-              fetchTickets={fetchTickets} 
-              fetchUsers={fetchUsers} 
-              fetchInventory={fetchInventory} 
-              handleLogout={handleLogout} 
-              token={token} 
+            <AgentConsole
+              user={user}
+              tickets={tickets}
+              usersList={usersList}
+              inventoryList={inventoryList}
+              fetchTickets={fetchTickets}
+              fetchUsers={fetchUsers}
+              fetchInventory={fetchInventory}
+              handleLogout={handleLogout}
+              token={token}
             />
-          ) : (
-            <Navigate to="/login" />
-          )
-        } 
+          ) : <Navigate to="/login" />
+        }
       />
-
-      {/* Default Fallback */}
-      <Route 
-        path="*" 
-        element={<Navigate to={!token ? '/login' : user?.role === 'agent' ? '/agent/tickets' : '/portal'} />} 
+      <Route
+        path="*"
+        element={<Navigate to={!token ? '/login' : user?.role === 'agent' ? '/agent/tickets' : '/portal'} />}
       />
     </Routes>
   );
@@ -166,14 +163,14 @@ function MainRouter() {
 
 function AuthScreen({ initialMode = 'login', setToken, setUser }) {
   const [authMode, setAuthMode] = useState(initialMode);
-  const [authForm, setAuthForm] = useState({ name: '', email: '', password: '', role: 'user', otp: '' });
+  const [authForm, setAuthForm] = useState({ name: '', email: '', password: '', otp: '' });
   const [resetStep, setResetStep] = useState('step1'); // 'step1' for email input/OTP request, 'step2' for OTP verification & new password
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
   const [resendCooldown, setResendCooldown] = useState(0);
   const [isResending, setIsResending] = useState(false);
-  
+
   const navigate = useNavigate();
 
   // Countdown timer for resend OTP cooldown
@@ -208,7 +205,7 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
       setToken(data.token);
       setUser(data.user);
       navigate(data.user.role === 'agent' ? '/agent/tickets' : '/portal');
-    } catch (err) {
+    } catch {
       setError('An error occurred. Please try again.');
     } finally {
       setLoading(false);
@@ -233,7 +230,7 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
       setMessage('Verification code sent! Check your inbox.');
       setResetStep('step2');
       setResendCooldown(30);
-    } catch (err) {
+    } catch {
       setError('Failed to send verification code. Please try again.');
     } finally {
       setLoading(false);
@@ -256,7 +253,7 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
 
       setMessage('A new verification code has been generated!');
       setResendCooldown(30);
-    } catch (err) {
+    } catch {
       setError('Failed to resend OTP. Please try again.');
     } finally {
       setIsResending(false);
@@ -281,8 +278,8 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
       alert('Password updated successfully! Please sign in with your new password.');
       setAuthMode('login');
       setResetStep('step1');
-      setAuthForm({ name: '', email: '', password: '', role: 'user', otp: '' });
-    } catch (err) {
+      setAuthForm({ name: '', email: '', password: '', otp: '' });
+    } catch {
       setError('Failed to reset password. Please try again.');
     } finally {
       setLoading(false);
@@ -301,7 +298,7 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
 
         {error && <div className="mb-4 p-3 bg-red-50 border border-red-200 text-red-600 text-xs rounded">{error}</div>}
         {message && <div className="mb-4 p-3 bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs rounded">{message}</div>}
-        
+
         {authMode === 'forgot' ? (
           <div>
             {resetStep === 'step1' ? (
@@ -311,28 +308,28 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-slate-600 mb-1">Email Address</label>
-                  <input 
-                    required 
-                    type="email" 
+                  <input
+                    required
+                    type="email"
                     placeholder="name@sayedfarm.com"
-                    value={authForm.email} 
-                    className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" 
-                    onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })} 
+                    value={authForm.email}
+                    className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none"
+                    onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })}
                   />
                 </div>
                 <button type="submit" disabled={loading} className="w-full py-2.5 bg-[#0052CC] hover:bg-blue-700 font-medium text-xs text-white rounded transition shadow-sm disabled:opacity-50">
                   {loading ? 'Sending Code...' : 'Send Verification Code'}
                 </button>
                 <div className="text-center text-xs text-slate-500 pt-2">
-                  <button 
-                    type="button" 
-                    onClick={() => { 
-                      setAuthMode('login'); 
-                      setResetStep('step1'); 
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAuthMode('login');
+                      setResetStep('step1');
                       setError('');
                       setMessage('');
-                      setAuthForm({ name: '', email: '', password: '', role: 'user', otp: '' }); 
-                    }} 
+                      setAuthForm({ name: '', email: '', password: '', otp: '' });
+                    }}
                     className="text-[#0052CC] font-semibold hover:underline"
                   >
                     Back to Sign In
@@ -346,25 +343,25 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-slate-600 mb-1">Verification Code (OTP)</label>
-                  <input 
-                    required 
-                    type="text" 
-                    placeholder="Enter 6-digit OTP" 
+                  <input
+                    required
+                    type="text"
+                    placeholder="Enter 6-digit OTP"
                     maxLength="6"
-                    value={authForm.otp} 
-                    className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs font-mono tracking-wider focus:bg-white focus:border-[#0052CC] focus:outline-none" 
-                    onChange={(e) => setAuthForm({ ...authForm, otp: e.target.value })} 
+                    value={authForm.otp}
+                    className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs font-mono tracking-wider focus:bg-white focus:border-[#0052CC] focus:outline-none"
+                    onChange={(e) => setAuthForm({ ...authForm, otp: e.target.value })}
                   />
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-slate-600 mb-1">New Password</label>
-                  <input 
-                    required 
-                    type="password" 
+                  <input
+                    required
+                    type="password"
                     placeholder="Enter new password"
-                    value={authForm.password} 
-                    className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" 
-                    onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} 
+                    value={authForm.password}
+                    className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none"
+                    onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })}
                   />
                 </div>
                 <button type="submit" disabled={loading} className="w-full py-2.5 bg-[#0052CC] hover:bg-blue-700 font-medium text-xs text-white rounded transition shadow-sm disabled:opacity-50">
@@ -373,9 +370,9 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
 
                 {/* Side-by-Side Action Bar: Change Email & Resend OTP */}
                 <div className="text-xs text-slate-500 pt-2 flex justify-between items-center">
-                  <button 
-                    type="button" 
-                    onClick={() => { setResetStep('step1'); setError(''); setMessage(''); }} 
+                  <button
+                    type="button"
+                    onClick={() => { setResetStep('step1'); setError(''); setMessage(''); }}
                     className="text-slate-600 hover:underline"
                   >
                     Change Email
@@ -395,15 +392,15 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
                 </div>
 
                 <div className="text-center text-xs text-slate-500 pt-2">
-                  <button 
-                    type="button" 
-                    onClick={() => { 
-                      setAuthMode('login'); 
-                      setResetStep('step1'); 
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAuthMode('login');
+                      setResetStep('step1');
                       setError('');
                       setMessage('');
-                      setAuthForm({ name: '', email: '', password: '', role: 'user', otp: '' }); 
-                    }} 
+                      setAuthForm({ name: '', email: '', password: '', otp: '' });
+                    }}
                     className="text-slate-500 hover:underline"
                   >
                     Back to Sign In
@@ -466,10 +463,10 @@ function CustomerPortal({ user, tickets, usersList, fetchTickets, handleLogout, 
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isChatOpen, setIsChatOpen] = useState(false);
-  const [chatMessages, setChatMessages] = useState([
-    { sender: 'agent', senderName: 'IT Support', text: 'Hello! Welcome to SayedFarm IT support. How can I help you today?', time: 'Just now' }
-  ]);
+  const [activeChatTicketId, setActiveChatTicketId] = useState('');
+  const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
+  const [chatError, setChatError] = useState('');
   const chatBottomRef = useRef(null);
   const location = useLocation();
   const isMyTicketsView = location.pathname.includes('tickets');
@@ -493,32 +490,57 @@ function CustomerPortal({ user, tickets, usersList, fetchTickets, handleLogout, 
   });
 
   useEffect(() => {
-    socket.on('receive_message', (incomingMessage) => {
-      setChatMessages((prev) => [...prev, incomingMessage]);
-    });
-    return () => { socket.off('receive_message'); };
-  }, []);
+    const handleReceiveMessage = (incomingMessage) => {
+      if (incomingMessage.ticketId === activeChatTicketId) {
+        setChatMessages((prev) => [...prev, incomingMessage]);
+      }
+    };
+    const handleChatHistory = ({ ticketId, messages: history }) => {
+      if (ticketId === activeChatTicketId) setChatMessages(history);
+    };
+    const handleChatError = ({ error }) => setChatError(error);
+
+    socket.on('receive_message', handleReceiveMessage);
+    socket.on('chat_history', handleChatHistory);
+    socket.on('chat_error', handleChatError);
+    return () => {
+      socket.off('receive_message', handleReceiveMessage);
+      socket.off('chat_history', handleChatHistory);
+      socket.off('chat_error', handleChatError);
+    };
+  }, [activeChatTicketId]);
 
   useEffect(() => {
-    if (isChatOpen) {
-      chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }
+    if (!activeChatTicketId) return undefined;
+    const joinChat = () => socket.emit('join_ticket_chat', { ticketId: activeChatTicketId });
+    socket.on('connect', joinChat);
+    joinChat();
+    return () => socket.off('connect', joinChat);
+  }, [activeChatTicketId]);
+
+  useEffect(() => {
+    if (isChatOpen) chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages, isChatOpen]);
 
   const handleImageUpload = (e) => {
     const file = e.target.files[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setNewTicket({ ...newTicket, image: reader.result });
-      };
-      reader.readAsDataURL(file);
+    if (!file) return;
+    if (!file.type.startsWith('image/') || file.size > 1000000) {
+      setChatError('Please choose an image smaller than 1 MB.');
+      e.target.value = '';
+      return;
     }
+
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      setNewTicket((previous) => ({ ...previous, image: reader.result }));
+    };
+    reader.readAsDataURL(file);
   };
 
   const handleCreateTicket = async (e) => {
     e.preventDefault();
-    await fetch(`${API_URL}/api/tickets`, {
+    const res = await fetch(`${API_URL}/api/tickets`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -526,6 +548,11 @@ function CustomerPortal({ user, tickets, usersList, fetchTickets, handleLogout, 
       },
       body: JSON.stringify(newTicket)
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setChatError(data.error || 'Could not create this request.');
+      return;
+    }
     setIsModalOpen(false);
     setNewTicket({ title: '', description: '', category: 'Hardware', priority: 'Medium', assigned_to: 'Unassigned', image: '' });
     fetchTickets();
@@ -555,18 +582,27 @@ function CustomerPortal({ user, tickets, usersList, fetchTickets, handleLogout, 
     fetchTickets();
   };
 
+  const openTicketChat = (ticketId) => {
+    setActiveChatTicketId(ticketId);
+    setChatMessages([{
+      sender: 'agent',
+      senderName: 'IT Support',
+      text: 'Welcome to this ticket chat. How can we help?',
+      time: new Date().toISOString()
+    }]);
+    setIsChatOpen(true);
+    setChatError('');
+  };
+
   const handleSendChatMessage = (e) => {
     e.preventDefault();
+    if (!activeChatTicketId) {
+      setChatError('Select one of your requests before starting a chat.');
+      return;
+    }
     if (!chatInput.trim()) return;
 
-    const messagePayload = {
-      sender: 'user',
-      senderName: user.name,
-      text: chatInput,
-      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    };
-
-    socket.emit('send_message', messagePayload);
+    socket.emit('send_message', { ticketId: activeChatTicketId, text: chatInput });
     setChatInput('');
   };
 
@@ -620,7 +656,7 @@ function CustomerPortal({ user, tickets, usersList, fetchTickets, handleLogout, 
             <div className="mb-6">
               <label className="block text-xs text-slate-500 mb-1">Contact us about</label>
               <div className="relative w-full max-w-xl">
-                <div 
+                <div
                   onClick={() => setIsDropdownOpen(!isDropdownOpen)}
                   className="w-full bg-white border border-blue-500 text-slate-800 rounded px-3 py-2.5 text-xs shadow-xs flex items-center justify-between cursor-pointer focus:outline-none ring-2 ring-blue-100"
                 >
@@ -631,7 +667,7 @@ function CustomerPortal({ user, tickets, usersList, fetchTickets, handleLogout, 
                 {isDropdownOpen && (
                   <div className="absolute top-full left-0 right-0 mt-1 bg-white border border-slate-200 rounded shadow-xl z-30 max-h-80 overflow-y-auto divide-y divide-slate-100">
                     {Object.keys(groupDetails).map((key) => (
-                      <div 
+                      <div
                         key={key}
                         onClick={() => {
                           setSelectedGroup(key);
@@ -857,7 +893,8 @@ function CustomerPortal({ user, tickets, usersList, fetchTickets, handleLogout, 
                             {t.status}
                           </span>
                         </td>
-                        <td className="py-3 text-right">
+                        <td className="py-3 text-right space-x-3 whitespace-nowrap">
+                          <button onClick={() => openTicketChat(t.id)} className="text-blue-600 hover:underline">Chat</button>
                           {t.status !== 'Closed' && t.status !== 'Cancelled' && (
                             <button onClick={() => handleCancelTicket(t.id)} className="text-red-600 hover:underline">Cancel Request</button>
                           )}
@@ -874,50 +911,63 @@ function CustomerPortal({ user, tickets, usersList, fetchTickets, handleLogout, 
 
       <div className="fixed bottom-6 right-6 z-50">
         {!isChatOpen ? (
-          <button 
+          <button
             onClick={() => setIsChatOpen(true)}
             className="bg-[#0052CC] hover:bg-blue-700 text-white p-3.5 rounded-full shadow-lg flex items-center gap-2 transition transform hover:scale-105"
           >
             <MessageSquare className="h-5 w-5" />
-            <span className="text-xs font-semibold pr-1">Live IT Chat</span>
+            <span className="text-xs font-semibold pr-1">Ticket Chat</span>
           </button>
         ) : (
           <div className="bg-white border border-slate-200 rounded-lg shadow-2xl w-80 sm:w-96 flex flex-col h-[420px] overflow-hidden">
             <div className="bg-[#0052CC] text-white px-4 py-3 flex items-center justify-between shadow-sm">
-              <div className="flex items-center gap-2">
-                <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></div>
-                <span className="text-xs font-semibold">SayedFarm IT Support Chat</span>
+              <div>
+                <div className="flex items-center gap-2">
+                  <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></div>
+                  <span className="text-xs font-semibold">Ticket Support Chat</span>
+                </div>
+                <span className="text-[10px] text-blue-100">
+                  {activeChatTicketId ? `Request ${activeChatTicketId.slice(0, 8)}` : 'Select a request to begin'}
+                </span>
               </div>
               <button onClick={() => setIsChatOpen(false)} className="text-blue-100 hover:text-white">
                 <X className="h-4 w-4" />
               </button>
             </div>
 
-            <div className="flex-1 p-3 overflow-y-auto space-y-3 bg-slate-50 text-xs">
-              {chatMessages.map((msg, index) => (
-                <div key={index} className={`flex flex-col ${msg.sender === 'user' ? 'items-end' : 'items-start'}`}>
-                  <div className={`max-w-[85%] p-2.5 rounded-lg ${msg.sender === 'user' ? 'bg-[#0052CC] text-white rounded-br-none' : 'bg-white border border-slate-200 text-slate-800 rounded-bl-none shadow-xs'}`}>
-                    <span className="block text-[9px] font-bold text-slate-400 mb-0.5">{msg.sender === 'agent' ? `IT Agent (${msg.senderName || 'Staff'})` : 'You'}</span>
-                    {msg.text}
-                  </div>
-                  <span className="text-[10px] text-slate-400 mt-0.5 px-1">{msg.time}</span>
+            {!activeChatTicketId ? (
+              <div className="flex-1 p-4 bg-slate-50 text-xs text-slate-500">
+                Open “My Requests” and choose Chat beside a request to start a private conversation with IT.
+              </div>
+            ) : (
+              <>
+                <div className="flex-1 p-3 overflow-y-auto space-y-3 bg-slate-50 text-xs">
+                  {chatMessages.map((msg) => (
+                    <div key={msg.id || `${msg.time}-${msg.text}`} className={`flex flex-col ${msg.sender === 'user' ? 'items-end' : 'items-start'}`}>
+                      <div className={`max-w-[85%] p-2.5 rounded-lg ${msg.sender === 'user' ? 'bg-[#0052CC] text-white rounded-br-none' : 'bg-white border border-slate-200 text-slate-800 rounded-bl-none shadow-xs'}`}>
+                        <span className="block text-[9px] font-bold text-slate-400 mb-0.5">{msg.sender === 'agent' ? `IT Agent (${msg.senderName || 'Staff'})` : 'You'}</span>
+                        {msg.text}
+                      </div>
+                      <span className="text-[10px] text-slate-400 mt-0.5 px-1">{msg.time}</span>
+                    </div>
+                  ))}
+                  <div ref={chatBottomRef} />
                 </div>
-              ))}
-              <div ref={chatBottomRef} />
-            </div>
-
-            <form onSubmit={handleSendChatMessage} className="p-3 bg-white border-t border-slate-200 flex gap-2">
-              <input 
-                type="text" 
-                placeholder="Type a message to IT agent..." 
-                value={chatInput} 
-                onChange={(e) => setChatInput(e.target.value)} 
-                className="flex-1 bg-slate-100 border border-slate-200 rounded px-3 py-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" 
-              />
-              <button type="submit" className="bg-[#0052CC] hover:bg-blue-700 text-white px-3 py-2 rounded transition flex items-center justify-center">
-                <Send className="h-3.5 w-3.5" />
-              </button>
-            </form>
+                {chatError && <div className="px-3 py-1 text-[10px] text-red-600 bg-red-50">{chatError}</div>}
+                <form onSubmit={handleSendChatMessage} className="p-3 bg-white border-t border-slate-200 flex gap-2">
+                  <input
+                    type="text"
+                    placeholder="Message IT about this request..."
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    className="flex-1 bg-slate-100 border border-slate-200 rounded px-3 py-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none"
+                  />
+                  <button type="submit" className="bg-[#0052CC] hover:bg-blue-700 text-white px-3 py-2 rounded transition flex items-center justify-center">
+                    <Send className="h-3.5 w-3.5" />
+                  </button>
+                </form>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -988,16 +1038,13 @@ function CustomerPortal({ user, tickets, usersList, fetchTickets, handleLogout, 
 
 function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, fetchUsers, fetchInventory, handleLogout, token }) {
   const [isAssetModalOpen, setIsAssetModalOpen] = useState(false);
-  const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
-  const [inviteEmail, setInviteEmail] = useState('');
-  const [copied, setCopied] = useState(false);
   const [selectedImage, setSelectedImage] = useState(null);
-  
+
   const [isChatOpen, setIsChatOpen] = useState(false);
-  const [chatMessages, setChatMessages] = useState([
-    { sender: 'user', senderName: 'Employee', text: 'Hello! I need assistance with my workstation setup.', time: 'Just now' }
-  ]);
+  const [activeChatTicketId, setActiveChatTicketId] = useState('');
+  const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
+  const [chatError, setChatError] = useState('');
   const chatBottomRef = useRef(null);
 
   const [newAsset, setNewAsset] = useState({
@@ -1012,17 +1059,48 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
   const currentTab = location.pathname.includes('inventory') ? 'inventory' : location.pathname.includes('users') ? 'users' : 'tickets';
 
   useEffect(() => {
-    socket.on('receive_message', (incomingMessage) => {
-      setChatMessages((prev) => [...prev, incomingMessage]);
-    });
-    return () => { socket.off('receive_message'); };
-  }, []);
+    const handleReceiveMessage = (incomingMessage) => {
+      if (incomingMessage.ticketId === activeChatTicketId) {
+        setChatMessages((prev) => [...prev, incomingMessage]);
+      }
+    };
+    const handleChatHistory = ({ ticketId, messages: history }) => {
+      if (ticketId === activeChatTicketId) setChatMessages(history);
+    };
+    const handleChatError = ({ error }) => setChatError(error);
+
+    socket.on('receive_message', handleReceiveMessage);
+    socket.on('chat_history', handleChatHistory);
+    socket.on('chat_error', handleChatError);
+    return () => {
+      socket.off('receive_message', handleReceiveMessage);
+      socket.off('chat_history', handleChatHistory);
+      socket.off('chat_error', handleChatError);
+    };
+  }, [activeChatTicketId]);
 
   useEffect(() => {
-    if (isChatOpen) {
-      chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-    }
+    if (!activeChatTicketId) return undefined;
+    const joinChat = () => socket.emit('join_ticket_chat', { ticketId: activeChatTicketId });
+    socket.on('connect', joinChat);
+    joinChat();
+    return () => socket.off('connect', joinChat);
+  }, [activeChatTicketId]);
+
+  useEffect(() => {
+    if (isChatOpen) chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages, isChatOpen]);
+
+  const selectChatTicket = (ticketId) => {
+    setActiveChatTicketId(ticketId);
+    setChatMessages(ticketId ? [{
+      sender: 'user',
+      senderName: 'Employee',
+      text: 'Ticket chat is ready.',
+      time: new Date().toISOString()
+    }] : []);
+    setChatError('');
+  };
 
   const handleCreateAsset = async (e) => {
     e.preventDefault();
@@ -1085,24 +1163,14 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
 
   const handleSendChatMessage = (e) => {
     e.preventDefault();
+    if (!activeChatTicketId) {
+      setChatError('Select a ticket before sending a message.');
+      return;
+    }
     if (!chatInput.trim()) return;
 
-    const messagePayload = {
-      sender: 'agent',
-      senderName: user.name,
-      text: chatInput,
-      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    };
-
-    socket.emit('send_message', messagePayload);
+    socket.emit('send_message', { ticketId: activeChatTicketId, text: chatInput });
     setChatInput('');
-  };
-
-  const copyInviteLink = () => {
-    const link = `${window.location.origin}?invite=${encodeURIComponent(inviteEmail)}`;
-    navigator.clipboard.writeText(link);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
   };
 
   const agentsList = usersList.filter(u => u.role === 'agent');
@@ -1145,7 +1213,7 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
             </nav>
           </div>
           <div className="p-3 bg-slate-50 border border-slate-200 rounded text-xs text-slate-500">
-            <span className="font-medium text-slate-700 block mb-0.5">System Status</span> 
+            <span className="font-medium text-slate-700 block mb-0.5">System Status</span>
             All services operational
           </div>
         </aside>
@@ -1160,11 +1228,6 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
                 {currentTab === 'tickets' ? 'Manage, assign, and resolve incoming IT requests.' : currentTab === 'inventory' ? 'Track hardware assignments, serials, and equipment status.' : 'View registered users and invite agents or team members.'}
               </p>
             </div>
-            {currentTab === 'users' && (
-              <button onClick={() => setIsInviteModalOpen(true)} className="flex items-center gap-2 bg-[#0052CC] hover:bg-blue-700 text-white px-3.5 py-2 rounded text-xs font-medium transition shadow-sm">
-                <UserPlus className="h-4 w-4" /> Invite User
-              </button>
-            )}
             {currentTab === 'inventory' && (
               <button onClick={() => setIsAssetModalOpen(true)} className="flex items-center gap-2 bg-[#0052CC] hover:bg-blue-700 text-white px-3.5 py-2 rounded text-xs font-medium transition shadow-sm">
                 <PackagePlus className="h-4 w-4" /> Add IT Asset
@@ -1216,9 +1279,9 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
                             </span>
                           </td>
                           <td className="py-3.5 px-4">
-                            <select 
-                              value={t.status} 
-                              onChange={(e) => handleAgentUpdate(t.id, { status: e.target.value })} 
+                            <select
+                              value={t.status}
+                              onChange={(e) => handleAgentUpdate(t.id, { status: e.target.value })}
                               className={`rounded text-xs p-1 font-bold focus:outline-none border border-slate-300 ${t.status === 'Open' ? 'bg-yellow-50 text-yellow-800' : t.status === 'In Progress' ? 'bg-blue-50 text-blue-800' : t.status === 'Pending' ? 'bg-amber-50 text-amber-800' : t.status === 'Cancelled' ? 'bg-red-50 text-red-800' : 'bg-emerald-50 text-emerald-800'}`}
                             >
                               <option value="Open">Open</option>
@@ -1235,7 +1298,10 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
                               {agentsList.map(a => <option key={a.id} value={a.name}>{a.name}</option>)}
                             </select>
                           </td>
-                          <td className="py-3.5 px-4 text-right">
+                          <td className="py-3.5 px-4 text-right space-x-2 whitespace-nowrap">
+                            <button onClick={() => { selectChatTicket(t.id); setIsChatOpen(true); }} className="px-2.5 py-1 text-xs bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-300 rounded font-medium transition">
+                              Chat
+                            </button>
                             {t.status !== 'Closed' && t.status !== 'Resolved' && t.status !== 'Cancelled' && (
                               <button onClick={() => handleAgentUpdate(t.id, { status: 'Resolved' })} className="px-2.5 py-1 text-xs bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-300 rounded font-medium transition">
                                 Quick Resolve
@@ -1390,33 +1456,6 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
             </div>
           )}
 
-          {isInviteModalOpen && (
-            <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4 z-50">
-              <div className="bg-white border border-slate-200 rounded-lg shadow-xl p-6 w-full max-w-md text-slate-800">
-                <h2 className="text-base font-bold mb-4 text-slate-900 border-b border-slate-100 pb-2">Send Registration Invitation</h2>
-                <div className="space-y-4">
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-700 mb-1">Target Email</label>
-                    <input type="email" placeholder="colleague@company.com" value={inviteEmail} onChange={(e) => setInviteEmail(e.target.value)} className="w-full border border-slate-300 rounded p-2 text-xs focus:border-[#0052CC] focus:outline-none" />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-700 mb-1">Generated Invite Link</label>
-                    <div className="flex gap-2">
-                      <input readOnly value={`${window.location.origin}?invite=${encodeURIComponent(inviteEmail || 'user')}`} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs text-slate-600 focus:outline-none" />
-                      <button onClick={copyInviteLink} className="flex items-center gap-1 px-3 py-1.5 bg-[#0052CC] hover:bg-blue-700 text-white rounded text-xs font-medium transition">
-                        {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-                        {copied ? 'Copied' : 'Copy'}
-                      </button>
-                    </div>
-                  </div>
-                  <div className="flex justify-end gap-2 pt-4 border-t border-slate-100">
-                    <button type="button" onClick={() => setIsInviteModalOpen(false)} className="px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-100 rounded">Close</button>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
           {selectedImage && (
             <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50">
               <div className="bg-white border border-slate-200 rounded-lg p-4 max-w-2xl w-full flex flex-col items-center shadow-2xl">
@@ -1435,50 +1474,73 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
 
       <div className="fixed bottom-6 right-6 z-50">
         {!isChatOpen ? (
-          <button 
-            onClick={() => setIsChatOpen(type => !type)}
+          <button
+            onClick={() => setIsChatOpen(true)}
             className="bg-[#0052CC] hover:bg-blue-700 text-white p-3.5 rounded-full shadow-lg flex items-center gap-2 transition transform hover:scale-105"
           >
             <MessageSquare className="h-5 w-5" />
-            <span className="text-xs font-semibold pr-1">Live Chat Console</span>
+            <span className="text-xs font-semibold pr-1">Ticket Chat</span>
           </button>
         ) : (
-          <div className="bg-white border border-slate-200 rounded-lg shadow-2xl w-80 sm:w-96 flex flex-col h-[420px] overflow-hidden">
+          <div className="bg-white border border-slate-200 rounded-lg shadow-2xl w-80 sm:w-96 flex flex-col h-[460px] overflow-hidden">
             <div className="bg-[#0052CC] text-white px-4 py-3 flex items-center justify-between shadow-sm">
-              <div className="flex items-center gap-2">
-                <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></div>
-                <span className="text-xs font-semibold">Agent Live Response Console</span>
+              <div>
+                <div className="flex items-center gap-2">
+                  <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></div>
+                  <span className="text-xs font-semibold">Agent Ticket Chat</span>
+                </div>
+                <span className="text-[10px] text-blue-100">Only participants in the selected request can see messages</span>
               </div>
               <button onClick={() => setIsChatOpen(false)} className="text-blue-100 hover:text-white">
                 <X className="h-4 w-4" />
               </button>
             </div>
 
-            <div className="flex-1 p-3 overflow-y-auto space-y-3 bg-slate-50 text-xs">
-              {chatMessages.map((msg, index) => (
-                <div key={index} className={`flex flex-col ${msg.sender === 'agent' ? 'items-end' : 'items-start'}`}>
-                  <div className={`max-w-[85%] p-2.5 rounded-lg ${msg.sender === 'agent' ? 'bg-[#0052CC] text-white rounded-br-none' : 'bg-white border border-slate-200 text-slate-800 rounded-bl-none shadow-xs'}`}>
-                    <span className="block text-[9px] font-bold text-slate-300 mb-0.5">{msg.sender === 'agent' ? 'You (IT Agent)' : `Employee (${msg.senderName || 'User'})`}</span>
-                    {msg.text}
-                  </div>
-                  <span className="text-[10px] text-slate-400 mt-0.5 px-1">{msg.time}</span>
-                </div>
-              ))}
-              <div ref={chatBottomRef} />
+            <div className="p-3 border-b border-slate-200 bg-white">
+              <label className="block text-[10px] font-semibold text-slate-500 mb-1">Select request</label>
+              <select
+                value={activeChatTicketId}
+                onChange={(e) => selectChatTicket(e.target.value)}
+                className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:border-[#0052CC] focus:outline-none"
+              >
+                <option value="">Choose a ticket...</option>
+                {tickets.map((ticket) => <option key={ticket.id} value={ticket.id}>{ticket.title}</option>)}
+              </select>
             </div>
 
-            <form onSubmit={handleSendChatMessage} className="p-3 bg-white border-t border-slate-200 flex gap-2">
-              <input 
-                type="text" 
-                placeholder="Type reply as IT Agent..." 
-                value={chatInput} 
-                onChange={(e) => setChatInput(e.target.value)} 
-                className="flex-1 bg-slate-100 border border-slate-200 rounded px-3 py-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" 
-              />
-              <button type="submit" className="bg-[#0052CC] hover:bg-blue-700 text-white px-3 py-2 rounded transition flex items-center justify-center">
-                <Send className="h-3.5 w-3.5" />
-              </button>
-            </form>
+            {!activeChatTicketId ? (
+              <div className="flex-1 p-4 bg-slate-50 text-xs text-slate-500">
+                Choose a ticket to view its private conversation.
+              </div>
+            ) : (
+              <>
+                <div className="flex-1 p-3 overflow-y-auto space-y-3 bg-slate-50 text-xs">
+                  {chatMessages.map((msg) => (
+                    <div key={msg.id || `${msg.time}-${msg.text}`} className={`flex flex-col ${msg.sender === 'agent' ? 'items-end' : 'items-start'}`}>
+                      <div className={`max-w-[85%] p-2.5 rounded-lg ${msg.sender === 'agent' ? 'bg-[#0052CC] text-white rounded-br-none' : 'bg-white border border-slate-200 text-slate-800 rounded-bl-none shadow-xs'}`}>
+                        <span className="block text-[9px] font-bold text-slate-300 mb-0.5">{msg.sender === 'agent' ? 'You (IT Agent)' : `Employee (${msg.senderName || 'User'})`}</span>
+                        {msg.text}
+                      </div>
+                      <span className="text-[10px] text-slate-400 mt-0.5 px-1">{msg.time}</span>
+                    </div>
+                  ))}
+                  <div ref={chatBottomRef} />
+                </div>
+                {chatError && <div className="px-3 py-1 text-[10px] text-red-600 bg-red-50">{chatError}</div>}
+                <form onSubmit={handleSendChatMessage} className="p-3 bg-white border-t border-slate-200 flex gap-2">
+                  <input
+                    type="text"
+                    placeholder="Reply to this request..."
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    className="flex-1 bg-slate-100 border border-slate-200 rounded px-3 py-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none"
+                  />
+                  <button type="submit" className="bg-[#0052CC] hover:bg-blue-700 text-white px-3 py-2 rounded transition flex items-center justify-center">
+                    <Send className="h-3.5 w-3.5" />
+                  </button>
+                </form>
+              </>
+            )}
           </div>
         )}
       </div>

@@ -35,6 +35,11 @@ Thumbs.db
 .idea/
 *.swp
 
+# Runtime data and generated database files
+backend/db.json
+backend/db.json.tmp
+backend/*.db
+
 # Backend specific - if Python/Django
 __pycache__/
 *.pyc
