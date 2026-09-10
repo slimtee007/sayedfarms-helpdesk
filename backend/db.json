@@ -4,21 +4,21 @@
       "id": "1788332372742",
       "name": "aa",
       "email": "aa@sayedfarms.com",
-      "password": "bb",
+      "password": "$2b$12$fck4VA994/vFw1546r6a.ueiO9V9XE/Q7e1BhZabQ7QivxwpqsGw6",
       "role": "user"
     },
     {
       "id": "1788332401269",
       "name": "Tesleem Ishaq",
       "email": "ishaq.tesleem@sayedfarms.com",
-      "password": "aa",
+      "password": "$2b$12$aG571sf4SqdsviLEo8.UZ.cCQ8XFnCf0UNZAvdIPjxCdif5yZkZIu",
       "role": "agent"
     },
     {
       "id": "1788353122156",
       "name": "ab",
       "email": "ishaqtesleem@gmail.com",
-      "password": "ab",
+      "password": "$2b$12$DnAkCinmUF1KmycFINjek.larjEFVuWYKVT1dpF0WbjQh5ZRIcSlq",
       "role": "user"
     }
   ],

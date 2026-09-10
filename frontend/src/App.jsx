@@ -1,10 +1,10 @@
-﻿import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, Navigate, Link, useLocation } from 'react-router-dom';
 import { io } from 'socket.io-client';
 import { Activity, Plus, ShieldCheck, User, LogOut, Image as ImageIcon, X, Paperclip, Users, Ticket, UserPlus, Copy, Check, Trash2, Box, PackagePlus, ChevronRight, Search, Headphones, KeyRound, AlertCircle, Monitor, Laptop, FilePlus, ChevronDown, Filter, MessageSquare, Send } from 'lucide-react';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
-const socket = io(API_URL);
+const socket = io(API_URL, { autoConnect: false });
 
 export default function App() {
   return (
@@ -24,18 +24,34 @@ function MainRouter() {
   const navigate = useNavigate();
 
   useEffect(() => {
+    if (!token) {
+      socket.disconnect();
+      return undefined;
+    }
+
+    socket.auth = { token };
+    socket.connect();
+
+    return () => socket.disconnect();
+  }, [token]);
+
+  useEffect(() => {
     if (token) {
       fetchTickets();
       fetchUsers();
       if (user?.role === 'agent') fetchInventory();
     }
-  }, [token]);
+  }, [token, user?.role]);
 
   const fetchTickets = async () => {
     try {
       const res = await fetch(`${API_URL}/api/tickets`, {
         headers: { Authorization: `Bearer ${token}` }
       });
+      if (res.status === 401) {
+        handleLogout();
+        return;
+      }
       const data = await res.json();
       if (res.ok) setTickets(data);
     } catch (err) {
@@ -48,6 +64,10 @@ function MainRouter() {
       const res = await fetch(`${API_URL}/api/users`, {
         headers: { Authorization: `Bearer ${token}` }
       });
+      if (res.status === 401) {
+        handleLogout();
+        return;
+      }
       const data = await res.json();
       if (res.ok) setUsersList(data);
     } catch (err) {
@@ -60,6 +80,10 @@ function MainRouter() {
       const res = await fetch(`${API_URL}/api/inventory`, {
         headers: { Authorization: `Bearer ${token}` }
       });
+      if (res.status === 401) {
+        handleLogout();
+        return;
+      }
       const data = await res.json();
       if (res.ok) setInventoryList(data);
     } catch (err) {
@@ -412,10 +436,9 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
             {authMode === 'signup' && (
               <div>
                 <label className="block text-xs font-semibold text-slate-600 mb-1">Account Type</label>
-                <select value={authForm.role} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, role: e.target.value })}>
-                  <option value="user">Employee (Customer Portal)</option>
-                  <option value="agent">IT Staff (Agent Console)</option>
-                </select>
+                <div className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs text-slate-600">
+                  Employee (Customer Portal)
+                </div>
               </div>
             )}
             <button type="submit" disabled={loading} className="w-full py-2.5 bg-[#0052CC] hover:bg-blue-700 font-medium text-xs text-white rounded transition shadow-sm disabled:opacity-50">
