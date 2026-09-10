@@ -1,0 +1,59 @@
+{
+  "users": [
+    {
+      "id": "1788332372742",
+      "name": "aa",
+      "email": "aa@sayedfarms.com",
+      "password": "bb",
+      "role": "user"
+    },
+    {
+      "id": "1788332401269",
+      "name": "Tesleem Ishaq",
+      "email": "ishaq.tesleem@sayedfarms.com",
+      "password": "aa",
+      "role": "agent"
+    },
+    {
+      "id": "1788353122156",
+      "name": "ab",
+      "email": "ishaqtesleem@gmail.com",
+      "password": "ab",
+      "role": "user"
+    }
+  ],
+  "tickets": [
+    {
+      "id": "1788352634095",
+      "title": "Request new software",
+      "description": "I need VD application",
+      "category": "Software",
+      "priority": "High",
+      "status": "Closed",
+      "assigned_to": "Tesleem Ishaq",
+      "created_by_name": "User",
+      "image": ""
+    },
+    {
+      "id": "101",
+      "title": "Get IT help",
+      "description": "Printer configuration assistance needed in the main office.",
+      "category": "Hardware",
+      "priority": "Medium",
+      "status": "Cancelled",
+      "assigned_to": "Unassigned",
+      "created_by_name": "Employee User",
+      "image": ""
+    }
+  ],
+  "inventory": [
+    {
+      "id": "1",
+      "name": "MacBook Pro 16 M2",
+      "category": "Laptop",
+      "serial_number": "SN-8942-X1",
+      "assigned_to": "Unassigned",
+      "status": "In Stock"
+    }
+  ]
+}
