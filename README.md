@@ -39,7 +39,7 @@ When frontend and backend run locally, leave `VITE_API_URL` empty. Vite proxies 
 
 ## Security notes
 
-- Public signup creates employee accounts only. Agent accounts are provisioned with the `BOOTSTRAP_AGENT_*` environment variables.
+- Public signup creates employee accounts only. The first agent is provisioned with `BOOTSTRAP_AGENT_*`; existing agents can promote employees from User Management.
 - Production requires `JWT_SECRET` and `FRONTEND_ORIGINS`.
 - Existing data records without the password-reset migration marker are invalidated at startup and must be reset through the email flow.
 - Configure SMTP before enabling password reset in production.

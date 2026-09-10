@@ -53,6 +53,7 @@ const api = request(app);
 let employeeToken;
 let agentToken;
 let employeeTicketId;
+let promotedUserId;
 
 test('rejects protected requests without a token', async () => {
   const response = await api.get('/api/users');
@@ -82,6 +83,7 @@ test('public signup cannot self-promote to agent', async () => {
 
   assert.equal(response.status, 201);
   assert.equal(response.body.user.role, 'user');
+  promotedUserId = response.body.user.id;
 });
 
 test('validates ticket input and records its owner', async () => {
@@ -137,6 +139,13 @@ test('agent permissions allow ticket and inventory administration', async () => 
     .get('/api/inventory')
     .set('Authorization', `Bearer ${agentToken}`);
   assert.equal(inventoryResponse.status, 200);
+
+  const roleResponse = await api
+    .patch(`/api/users/${promotedUserId}/role`)
+    .set('Authorization', `Bearer ${agentToken}`)
+    .send({ role: 'agent' });
+  assert.equal(roleResponse.status, 200);
+  assert.equal(roleResponse.body.role, 'agent');
 });
 
 test('employees cannot modify another user ticket', async () => {

@@ -417,6 +417,28 @@ app.delete('/api/users/:id', authenticateToken, requireAgent, (req, res) => {
   return res.json({ success: true });
 });
 
+app.patch('/api/users/:id/role', authenticateToken, requireAgent, (req, res) => {
+  const { role } = req.body || {};
+  if (req.params.id === req.user.id) {
+    return res.status(400).json({ error: 'You cannot change your own role' });
+  }
+  if (role !== 'user' && role !== 'agent') {
+    return res.status(400).json({ error: 'Role must be user or agent' });
+  }
+
+  const user = findUserById(req.params.id);
+  if (!user) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+  if (user.role === 'agent' && role === 'user' && users.filter((candidate) => candidate.role === 'agent').length <= 1) {
+    return res.status(400).json({ error: 'The last agent cannot be demoted' });
+  }
+
+  user.role = role;
+  saveData();
+  return res.json(publicUser(user));
+});
+
 app.get('/api/tickets', authenticateToken, (req, res) => {
   const visibleTickets = req.user.role === 'agent'
     ? tickets

@@ -1161,6 +1161,24 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
     fetchUsers();
   };
 
+  const handleUpdateUserRole = async (id, role) => {
+    const res = await fetch(`${API_URL}/api/users/${id}/role`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify({ role })
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert(data.error || 'Could not update user role.');
+      fetchUsers();
+      return;
+    }
+    fetchUsers();
+  };
+
   const handleSendChatMessage = (e) => {
     e.preventDefault();
     if (!activeChatTicketId) {
@@ -1225,7 +1243,7 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
                 {currentTab === 'tickets' ? 'Service Desk Queues' : currentTab === 'inventory' ? 'Asset Inventory' : 'User Directory'}
               </h1>
               <p className="text-slate-500 text-xs mt-0.5">
-                {currentTab === 'tickets' ? 'Manage, assign, and resolve incoming IT requests.' : currentTab === 'inventory' ? 'Track hardware assignments, serials, and equipment status.' : 'View registered users and invite agents or team members.'}
+                {currentTab === 'tickets' ? 'Manage, assign, and resolve incoming IT requests.' : currentTab === 'inventory' ? 'Track hardware assignments, serials, and equipment status.' : 'View registered users and manage employee or agent roles.'}
               </p>
             </div>
             {currentTab === 'inventory' && (
@@ -1387,9 +1405,20 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
                         <td className="py-3.5 px-4 font-semibold text-slate-800">{u.name}</td>
                         <td className="py-3.5 px-4 text-slate-600">{u.email}</td>
                         <td className="py-3.5 px-4">
-                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${u.role === 'agent' ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-700'}`}>
-                            {u.role === 'agent' ? 'IT Agent' : 'Employee'}
-                          </span>
+                          {u.email === user.email ? (
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-100 text-blue-800">
+                              IT Agent (You)
+                            </span>
+                          ) : (
+                            <select
+                              value={u.role}
+                              onChange={(e) => handleUpdateUserRole(u.id, e.target.value)}
+                              className={`rounded text-xs p-1 font-bold border border-slate-300 ${u.role === 'agent' ? 'bg-blue-50 text-blue-800' : 'bg-slate-50 text-slate-700'}`}
+                            >
+                              <option value="user">Employee</option>
+                              <option value="agent">IT Agent</option>
+                            </select>
+                          )}
                         </td>
                         <td className="py-3.5 px-4 text-right">
                           {u.email !== user.email && (
