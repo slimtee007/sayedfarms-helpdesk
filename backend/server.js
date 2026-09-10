@@ -1,4 +1,4 @@
-﻿require('dotenv').config(); // <-- MUST BE AT THE VERY TOP
+require('dotenv').config(); // <-- MUST BE AT THE VERY TOP
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -264,4 +264,14 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
+});
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`\nPort ${PORT} is already in use — another copy of the backend is probably still running.`);
+    console.error('Stop the other process first, then start the server again:');
+    console.error('  Windows (PowerShell):  Get-Process node | Stop-Process -Force');
+    console.error('  macOS/Linux:           lsof -ti:5000 | xargs kill -9\n');
+    process.exit(1);
+  }
+  throw err;
 });
