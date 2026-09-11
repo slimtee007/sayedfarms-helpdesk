@@ -1,9 +1,12 @@
-﻿import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, Navigate, Link, useLocation } from 'react-router-dom';
 import { io } from 'socket.io-client';
 import { Activity, Plus, ShieldCheck, User, LogOut, Image as ImageIcon, X, Paperclip, Users, Ticket, UserPlus, Copy, Check, Trash2, Box, PackagePlus, ChevronRight, Search, Headphones, KeyRound, AlertCircle, Monitor, Laptop, FilePlus, ChevronDown, Filter, MessageSquare, Send } from 'lucide-react';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+// Same-origin by default: in dev, Vite proxies /api and /socket.io to the
+// backend; in production the frontend is expected to be served from the same
+// origin as the backend. Override with VITE_API_URL if hosted elsewhere.
+const API_URL = import.meta.env.VITE_API_URL || '';
 const socket = io(API_URL);
 
 export default function App() {

@@ -1,9 +1,8 @@
-﻿require('dotenv').config(); // <-- MUST BE AT THE VERY TOP
+require('dotenv').config(); // <-- MUST BE AT THE VERY TOP
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
-const nodemailer = require('nodemailer');
 const fs = require('fs');
 const path = require('path');
 
@@ -68,17 +67,62 @@ const saveData = () => {
   fs.writeFileSync(DATA_FILE, JSON.stringify({ users, tickets, inventory }, null, 2));
 };
 
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'smtp.example.com',
-  port: process.env.SMTP_PORT || 587,
-  secure: false,
-  auth: {
-    user: process.env.SMTP_USER || 'your-email@example.com',
-    pass: process.env.SMTP_PASS || 'your-email-password'
-  }
-});
+const { sendOtpEmail, isSmtpConfigured } = require('./utils/sendEmail');
 
 const otpStore = {};
+
+if (!isSmtpConfigured()) {
+  console.warn('\n[WARN] SMTP is NOT configured (backend/.env). Password reset emails will NOT be sent.');
+  console.warn('       Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS in backend/.env and restart the server.');
+  console.warn('       Until then, reset codes are only printed to this terminal / shown in the app (dev mode).\n');
+}
+
+/**
+ * Generates an OTP for `email` and delivers it.
+ * Response contract:
+ *  - { success: true, emailSent: true }                     -> email really went out
+ *  - { success: true, emailSent: false, devOtp }            -> SMTP not configured (dev mode only)
+ *  - 500 { emailSent: false, error }                        -> SMTP configured but sending failed
+ */
+const generateAndSendOtp = async (res, email, kind) => {
+  const user = users.find((u) => u.email === email);
+  if (!user) {
+    return res.status(404).json({ error: 'Email address not found in the system' });
+  }
+
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+  otpStore[email] = { otp, expiresAt };
+
+  if (!isSmtpConfigured()) {
+    console.log(`\n========================================\n [DEV ${kind.toUpperCase()} OTP CODE for ${email}]: ${otp}\n========================================\n`);
+    if (process.env.NODE_ENV === 'production') {
+      // Never leak the OTP to the client in production.
+      return res.status(500).json({
+        error: 'Email delivery is not configured on this server. Please contact the administrator.',
+        emailSent: false,
+      });
+    }
+    return res.json({
+      success: true,
+      emailSent: false,
+      devOtp: otp,
+      message: 'Email delivery is not configured on the server, so no email was sent. Use the development code shown on screen.',
+    });
+  }
+
+  try {
+    await sendOtpEmail(email, otp, kind);
+    return res.json({ success: true, emailSent: true, message: 'Verification code sent to your email address.' });
+  } catch (err) {
+    console.error(`[${kind.toUpperCase()}] Email send error:`, err && err.message ? err.message : err);
+    console.log(`\n========================================\n [DEV FALLBACK OTP CODE for ${email}]: ${otp}\n========================================\n`);
+    return res.status(500).json({
+      error: 'Failed to send the verification email. Please try again or contact the administrator.',
+      emailSent: false,
+    });
+  }
+};
 
 app.post('/api/auth/signup', (req, res) => {
   const { name, email, password, role } = req.body;
@@ -103,74 +147,34 @@ app.post('/api/auth/login', (req, res) => {
 // Step 1: Generate and Send Password Reset OTP
 app.post('/api/auth/forgot-password', async (req, res) => {
   const { email } = req.body;
-  const user = users.find(u => u.email === email);
-  if (!user) {
-    return res.status(404).json({ error: 'Email address not found in the system' });
+  if (!email) {
+    return res.status(400).json({ error: 'Email address is required' });
   }
-
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
-  const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
-  otpStore[email] = { otp, expiresAt };
-
-  console.log(`\n========================================\n [DEV OTP CODE for ${email}]: ${otp}\n========================================\n`);
-
-  try {
-    if (process.env.SMTP_HOST && !process.env.SMTP_HOST.includes('example')) {
-      await transporter.sendMail({
-        from: '"Help Desk Support" <support@sayedfarms.com>',
-        to: email,
-        subject: 'Password Reset OTP - Help Desk',
-        text: `Your One-Time Password (OTP) for password reset is: ${otp}. It is valid for 10 minutes.`,
-        html: `<p>Your One-Time Password (OTP) for password reset is: <b>${otp}</b>.</p><p>It is valid for 10 minutes.</p>`
-      });
-    }
-    res.json({ success: true, message: 'OTP generated successfully.' });
-  } catch (err) {
-    console.error('Email send error:', err);
-    res.status(500).json({ error: 'Failed to send OTP email. Check terminal for fallback code.' });
-  }
+  await generateAndSendOtp(res, email.trim().toLowerCase(), 'reset');
 });
 
 // Resend Password Reset OTP
 app.post('/api/auth/resend-otp', async (req, res) => {
   const { email } = req.body;
-  const user = users.find(u => u.email === email);
-  if (!user) {
-    return res.status(404).json({ error: 'Email address not found in the system' });
+  if (!email) {
+    return res.status(400).json({ error: 'Email address is required' });
   }
-
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
-  const expiresAt = Date.now() + 10 * 60 * 1000;
-  otpStore[email] = { otp, expiresAt };
-
-  console.log(`\n========================================\n [DEV RESEND OTP CODE for ${email}]: ${otp}\n========================================\n`);
-
-  try {
-    if (process.env.SMTP_HOST && !process.env.SMTP_HOST.includes('example')) {
-      await transporter.sendMail({
-        from: '"Help Desk Support" <support@sayedfarms.com>',
-        to: email,
-        subject: 'New Password Reset OTP - Help Desk',
-        text: `Your new One-Time Password (OTP) is: ${otp}. It is valid for 10 minutes.`,
-        html: `<p>Your new One-Time Password (OTP) is: <b>${otp}</b>.</p>`
-      });
-    }
-    res.json({ success: true, message: 'A new OTP code has been generated.' });
-  } catch (err) {
-    console.error('Email resend error:', err);
-    res.status(500).json({ error: 'Failed to send new OTP. Check terminal for fallback code.' });
-  }
+  await generateAndSendOtp(res, email.trim().toLowerCase(), 'resend');
 });
 
 // Step 2: Verify OTP and Reset Password
 app.post('/api/auth/reset-password', (req, res) => {
   const { email, otp, password } = req.body;
-  const user = users.find(u => u.email === email);
+  if (!email || !otp || !password) {
+    return res.status(400).json({ error: 'Email, verification code and new password are required' });
+  }
+  const key = email.trim().toLowerCase();
+  const user = users.find(u => u.email === key);
   if (!user) {
     return res.status(404).json({ error: 'Email address not found in the system' });
   }
 
-  const record = otpStore[email];
+  const record = otpStore[key];
   if (!record || record.otp !== otp || Date.now() > record.expiresAt) {
     return res.status(400).json({ error: 'Invalid or expired OTP code.' });
   }
