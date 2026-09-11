@@ -8,6 +8,8 @@ const ForgotPassword = ({ onBackToLogin }) => {
 
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
+  const [emailSent, setEmailSent] = useState(null); // true: emailed, false: not sent
+  const [devOtp, setDevOtp] = useState(''); // shown only when SMTP is not configured (dev mode)
   const [loading, setLoading] = useState(false);
 
   const [resendCooldown, setResendCooldown] = useState(0);
@@ -41,7 +43,16 @@ const ForgotPassword = ({ onBackToLogin }) => {
 
       if (!res.ok) throw new Error(data.error || 'Failed to send verification code.');
 
-      setMessage('Verification code sent! Check your inbox or terminal.');
+      if (data.devOtp) {
+        // SMTP is not configured on the server — no email went out.
+        setEmailSent(false);
+        setDevOtp(data.devOtp);
+        setMessage('');
+      } else {
+        setEmailSent(true);
+        setDevOtp('');
+        setMessage('Verification code sent to your email. Check your inbox (and spam folder).');
+      }
       setStep(2);
       setResendCooldown(30);
     } catch (err) {
@@ -67,7 +78,15 @@ const ForgotPassword = ({ onBackToLogin }) => {
 
       if (!res.ok) throw new Error(data.error || 'Failed to resend OTP.');
 
-      setMessage('A new verification code has been generated!');
+      if (data.devOtp) {
+        setEmailSent(false);
+        setDevOtp(data.devOtp);
+        setMessage('');
+      } else {
+        setEmailSent(true);
+        setDevOtp('');
+        setMessage('A new verification code has been sent to your email.');
+      }
       setResendCooldown(30);
     } catch (err) {
       setError(err.message);
@@ -113,6 +132,15 @@ const ForgotPassword = ({ onBackToLogin }) => {
 
       {error && <div style={styles.errorBox}>{error}</div>}
       {message && <div style={styles.successBox}>{message}</div>}
+      {devOtp && (
+        <div style={styles.devBox}>
+          <b>Email delivery is not configured on the server.</b> No email was
+          sent, so no code will arrive in your inbox. Use this development code:
+          <div style={styles.devOtpCode}>{devOtp}</div>
+          To receive codes by email, the administrator must configure SMTP in
+          the backend <code>.env</code> file (see <code>.env.example</code>).
+        </div>
+      )}
 
       {step === 1 ? (
         <form onSubmit={handleSendOtp}>
@@ -149,7 +177,9 @@ const ForgotPassword = ({ onBackToLogin }) => {
       ) : (
         <form onSubmit={handleResetPassword}>
           <p style={styles.subtitle}>
-            Enter the verification code sent to <b>{email}</b> along with your new password.
+            {emailSent
+              ? <>Enter the verification code sent to <b>{email}</b> along with your new password.</>
+              : <>Enter the verification code for <b>{email}</b> along with your new password.</>}
           </p>
 
           <div style={styles.fieldGroup}>
@@ -326,6 +356,27 @@ const styles = {
     borderRadius: '6px',
     fontSize: '13px',
     marginBottom: '16px',
+  },
+  devBox: {
+    backgroundColor: '#fffbeb',
+    color: '#b45309',
+    border: '1px solid #fde68a',
+    padding: '10px 12px',
+    borderRadius: '6px',
+    fontSize: '13px',
+    lineHeight: '1.5',
+    marginBottom: '16px',
+  },
+  devOtpCode: {
+    fontSize: '26px',
+    fontWeight: '700',
+    letterSpacing: '8px',
+    textAlign: 'center',
+    color: '#92400e',
+    backgroundColor: '#fef3c7',
+    borderRadius: '6px',
+    padding: '8px 0',
+    margin: '10px 0',
   },
 };
 
