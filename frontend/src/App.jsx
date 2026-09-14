@@ -293,7 +293,7 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
                   <input 
                     required 
                     type="email" 
-                    placeholder="name@sayedfarm.com"
+                    placeholder="name@sayedfarms.com"
                     value={authForm.email} 
                     className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" 
                     onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })} 

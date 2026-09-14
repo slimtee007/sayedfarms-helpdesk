@@ -5,6 +5,8 @@ import tailwindcss from '@tailwindcss/vite';
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
+    // Bind to all interfaces so the sandbox/preview proxy can reach the dev server
+    host: true,
     // Allow the sandbox/preview host in development
     allowedHosts: true,
     // In dev the frontend runs on its own port; proxy API calls and

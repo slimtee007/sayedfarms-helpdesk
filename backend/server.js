@@ -23,8 +23,8 @@ const DATA_FILE = path.join(__dirname, 'db.json');
 // Default initial data if db.json does not exist
 const initialData = {
   users: [
-    { id: '1', name: 'IT Admin', email: 'admin@sayedfarm.com', role: 'agent', password: 'password123' },
-    { id: '2', name: 'Employee User', email: 'user@sayedfarm.com', role: 'user', password: 'password123' }
+    { id: '1', name: 'IT Admin', email: 'admin@sayedfarms.com', role: 'agent', password: 'Admin@12345' },
+    { id: '2', name: 'Employee User', email: 'user@sayedfarms.com', role: 'user', password: 'password123' }
   ],
   tickets: [
     {
@@ -67,6 +67,10 @@ const saveData = () => {
   fs.writeFileSync(DATA_FILE, JSON.stringify({ users, tickets, inventory }, null, 2));
 };
 
+// Emails are matched case- and whitespace-insensitively across login, signup
+// and the OTP flows, so a stray space or capital letter can't break sign-in.
+const normalizeEmail = (e) => (e || '').trim().toLowerCase();
+
 const { sendOtpEmail, isSmtpConfigured } = require('./utils/sendEmail');
 
 const otpStore = {};
@@ -85,7 +89,7 @@ if (!isSmtpConfigured()) {
  *  - 500 { emailSent: false, error }                        -> SMTP configured but sending failed
  */
 const generateAndSendOtp = async (res, email, kind) => {
-  const user = users.find((u) => u.email === email);
+  const user = users.find((u) => normalizeEmail(u.email) === email);
   if (!user) {
     return res.status(404).json({ error: 'Email address not found in the system' });
   }
@@ -126,10 +130,14 @@ const generateAndSendOtp = async (res, email, kind) => {
 
 app.post('/api/auth/signup', (req, res) => {
   const { name, email, password, role } = req.body;
-  if (users.find(u => u.email === email)) {
+  const key = normalizeEmail(email);
+  if (!key) {
+    return res.status(400).json({ error: 'Email is required' });
+  }
+  if (users.find(u => normalizeEmail(u.email) === key)) {
     return res.status(400).json({ error: 'Email already registered' });
   }
-  const newUser = { id: Date.now().toString(), name, email, password, role: role || 'user' };
+  const newUser = { id: Date.now().toString(), name, email: key, password, role: role || 'user' };
   users.push(newUser);
   saveData();
   res.json({ token: 'mock-jwt-token-' + newUser.id, user: { id: newUser.id, name: newUser.name, email: newUser.email, role: newUser.role } });
@@ -137,7 +145,8 @@ app.post('/api/auth/signup', (req, res) => {
 
 app.post('/api/auth/login', (req, res) => {
   const { email, password } = req.body;
-  const user = users.find(u => u.email === email && u.password === password);
+  const key = normalizeEmail(email);
+  const user = users.find(u => normalizeEmail(u.email) === key && u.password === password);
   if (!user) {
     return res.status(400).json({ error: 'Invalid email or password' });
   }
@@ -150,7 +159,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   if (!email) {
     return res.status(400).json({ error: 'Email address is required' });
   }
-  await generateAndSendOtp(res, email.trim().toLowerCase(), 'reset');
+  await generateAndSendOtp(res, normalizeEmail(email), 'reset');
 });
 
 // Resend Password Reset OTP
@@ -159,7 +168,7 @@ app.post('/api/auth/resend-otp', async (req, res) => {
   if (!email) {
     return res.status(400).json({ error: 'Email address is required' });
   }
-  await generateAndSendOtp(res, email.trim().toLowerCase(), 'resend');
+  await generateAndSendOtp(res, normalizeEmail(email), 'resend');
 });
 
 // Step 2: Verify OTP and Reset Password
@@ -168,8 +177,8 @@ app.post('/api/auth/reset-password', (req, res) => {
   if (!email || !otp || !password) {
     return res.status(400).json({ error: 'Email, verification code and new password are required' });
   }
-  const key = email.trim().toLowerCase();
-  const user = users.find(u => u.email === key);
+  const key = normalizeEmail(email);
+  const user = users.find(u => normalizeEmail(u.email) === key);
   if (!user) {
     return res.status(404).json({ error: 'Email address not found in the system' });
   }
@@ -180,7 +189,7 @@ app.post('/api/auth/reset-password', (req, res) => {
   }
 
   user.password = password;
-  delete otpStore[email];
+  delete otpStore[key];
   saveData();
 
   res.json({ success: true, message: 'Password updated successfully' });
