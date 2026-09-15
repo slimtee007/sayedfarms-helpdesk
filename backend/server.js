@@ -23,8 +23,8 @@ const DATA_FILE = path.join(__dirname, 'db.json');
 // Default initial data if db.json does not exist
 const initialData = {
   users: [
-    { id: '1', name: 'IT Admin', email: 'admin@sayedfarm.com', role: 'agent', password: 'password123' },
-    { id: '2', name: 'Employee User', email: 'user@sayedfarm.com', role: 'user', password: 'password123' }
+    { id: '1', name: 'IT Admin', email: 'admin@sayedfarms.com', role: 'agent', password: 'Admin@12345' },
+    { id: '2', name: 'Employee User', email: 'user@sayedfarms.com', role: 'user', password: 'password123' }
   ],
   tickets: [
     {
@@ -62,10 +62,30 @@ let users = db.users || [];
 let tickets = db.tickets || [];
 let inventory = db.inventory || [];
 
+// Normalize emails (trim + lowercase) so casing or stray whitespace
+// can never block sign-in or create duplicate accounts.
+const normalizeEmail = (email) => (email || '').trim().toLowerCase();
+
 // Save state to disk
 const saveData = () => {
   fs.writeFileSync(DATA_FILE, JSON.stringify({ users, tickets, inventory }, null, 2));
 };
+
+// Ensure the default admin account exists even in databases created
+// before it was seeded (db.json persists across restarts, so the
+// seed above only runs on first boot).
+const DEFAULT_ADMIN = {
+  id: 'admin-default',
+  name: 'IT Admin',
+  email: 'admin@sayedfarms.com',
+  role: 'agent',
+  password: 'Admin@12345',
+};
+if (!users.some((u) => normalizeEmail(u.email) === DEFAULT_ADMIN.email)) {
+  users.push({ ...DEFAULT_ADMIN });
+  saveData();
+  console.log('[INIT] Default admin account created: admin@sayedfarms.com');
+}
 
 const { sendOtpEmail, isSmtpConfigured } = require('./utils/sendEmail');
 
@@ -85,7 +105,7 @@ if (!isSmtpConfigured()) {
  *  - 500 { emailSent: false, error }                        -> SMTP configured but sending failed
  */
 const generateAndSendOtp = async (res, email, kind) => {
-  const user = users.find((u) => u.email === email);
+  const user = users.find((u) => normalizeEmail(u.email) === normalizeEmail(email));
   if (!user) {
     return res.status(404).json({ error: 'Email address not found in the system' });
   }
@@ -137,7 +157,7 @@ app.post('/api/auth/signup', (req, res) => {
 
 app.post('/api/auth/login', (req, res) => {
   const { email, password } = req.body;
-  const user = users.find(u => u.email === email && u.password === password);
+  const user = users.find(u => normalizeEmail(u.email) === normalizeEmail(email) && u.password === password);
   if (!user) {
     return res.status(400).json({ error: 'Invalid email or password' });
   }
@@ -168,8 +188,8 @@ app.post('/api/auth/reset-password', (req, res) => {
   if (!email || !otp || !password) {
     return res.status(400).json({ error: 'Email, verification code and new password are required' });
   }
-  const key = email.trim().toLowerCase();
-  const user = users.find(u => u.email === key);
+  const key = normalizeEmail(email);
+  const user = users.find(u => normalizeEmail(u.email) === key);
   if (!user) {
     return res.status(404).json({ error: 'Email address not found in the system' });
   }
@@ -180,7 +200,7 @@ app.post('/api/auth/reset-password', (req, res) => {
   }
 
   user.password = password;
-  delete otpStore[email];
+  delete otpStore[key];
   saveData();
 
   res.json({ success: true, message: 'Password updated successfully' });
