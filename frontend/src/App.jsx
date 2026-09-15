@@ -52,7 +52,18 @@ function MainRouter() {
         headers: { Authorization: `Bearer ${token}` }
       });
       const data = await res.json();
-      if (res.ok) setUsersList(data);
+      if (!res.ok) return;
+      setUsersList(data);
+      // If an admin changed my own role, move to the right console immediately.
+      if (user) {
+        const me = data.find((u) => u.id === user.id);
+        if (me && me.role !== user.role) {
+          const updated = { ...user, role: me.role };
+          localStorage.setItem('user', JSON.stringify(updated));
+          setUser(updated);
+          navigate(me.role === 'agent' ? '/agent/tickets' : '/portal');
+        }
+      }
     } catch (err) {
       console.error(err);
     }
@@ -441,10 +452,111 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
   );
 }
 
+// Per-ticket chat thread between the employee and the assigned agent.
+// History is persisted on the ticket; new messages arrive in real time
+// over the ticket's socket room. `sender` is 'user' or 'agent'.
+function TicketChatModal({ ticket, sender, senderName, onClose, onMessagesChanged }) {
+  const [messages, setMessages] = useState(ticket.messages || []);
+  const [input, setInput] = useState('');
+  const bottomRef = useRef(null);
+  const otherSide = sender === 'agent' ? 'employee' : 'IT agent';
+
+  useEffect(() => {
+    setMessages(ticket.messages || []);
+  }, [ticket.id]);
+
+  useEffect(() => {
+    socket.emit('join_ticket', ticket.id);
+    const handler = (payload) => {
+      if (payload.ticketId !== ticket.id) return;
+      setMessages((prev) =>
+        prev.some((m) => m.id === payload.message.id) ? prev : [...prev, payload.message]
+      );
+      if (onMessagesChanged) onMessagesChanged();
+    };
+    socket.on('receive_ticket_message', handler);
+    return () => {
+      socket.off('receive_ticket_message', handler);
+      socket.emit('leave_ticket', ticket.id);
+    };
+  }, [ticket.id]);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  const handleSend = (e) => {
+    e.preventDefault();
+    if (!input.trim()) return;
+    socket.emit('send_ticket_message', {
+      ticketId: ticket.id,
+      sender,
+      senderName,
+      text: input.trim(),
+    });
+    setInput('');
+  };
+
+  return (
+    <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+      <div className="bg-white border border-slate-200 rounded-lg shadow-2xl w-full max-w-lg flex flex-col h-[520px] overflow-hidden">
+        <div className="bg-[#0052CC] text-white px-4 py-3 flex items-center justify-between">
+          <div>
+            <div className="text-xs font-semibold">Ticket Chat — {ticket.title}</div>
+            <div className="text-[11px] text-blue-100">
+              {ticket.status} · {ticket.category} · Assigned: {ticket.assigned_to}
+            </div>
+          </div>
+          <button onClick={onClose} className="text-blue-100 hover:text-white">
+            <X className="h-5 w-5" />
+          </button>
+        </div>
+
+        <div className="flex-1 p-3 overflow-y-auto space-y-3 bg-slate-50 text-xs">
+          {messages.length === 0 && (
+            <div className="text-center text-slate-400 py-8">
+              No messages yet. Start the conversation with the {otherSide}.
+            </div>
+          )}
+          {messages.map((msg) => {
+            const mine = msg.sender === sender;
+            return (
+              <div key={msg.id} className={`flex flex-col ${mine ? 'items-end' : 'items-start'}`}>
+                <div className={`max-w-[85%] p-2.5 rounded-lg ${mine ? 'bg-[#0052CC] text-white rounded-br-none' : 'bg-white border border-slate-200 text-slate-800 rounded-bl-none shadow-xs'}`}>
+                  <span className={`block text-[9px] font-bold mb-0.5 ${mine ? 'text-blue-100' : 'text-slate-400'}`}>
+                    {mine ? 'You' : (msg.senderName || otherSide)}
+                  </span>
+                  {msg.text}
+                </div>
+                <span className="text-[10px] text-slate-400 mt-0.5 px-1">{msg.time}</span>
+              </div>
+            );
+          })}
+          <div ref={bottomRef} />
+        </div>
+
+        <form onSubmit={handleSend} className="p-3 bg-white border-t border-slate-200 flex gap-2">
+          <input
+            type="text"
+            placeholder={`Message the ${otherSide}...`}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            className="flex-1 bg-slate-100 border border-slate-200 rounded px-3 py-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none"
+          />
+          <button type="submit" className="bg-[#0052CC] hover:bg-blue-700 text-white px-3 py-2 rounded transition flex items-center justify-center">
+            <Send className="h-3.5 w-3.5" />
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 function CustomerPortal({ user, tickets, usersList, fetchTickets, handleLogout, token }) {
   const [selectedGroup, setSelectedGroup] = useState('all');
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [chatTicketId, setChatTicketId] = useState(null);
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [chatMessages, setChatMessages] = useState([
     { sender: 'agent', senderName: 'IT Support', text: 'Hello! Welcome to SayedFarm IT support. How can I help you today?', time: 'Just now' }
@@ -837,7 +949,10 @@ function CustomerPortal({ user, tickets, usersList, fetchTickets, handleLogout, 
                             {t.status}
                           </span>
                         </td>
-                        <td className="py-3 text-right">
+                        <td className="py-3 text-right whitespace-nowrap">
+                          <button onClick={() => setChatTicketId(t.id)} className="text-[#0052CC] hover:underline mr-3">
+                            Chat{(t.messages?.length || 0) > 0 ? ` (${t.messages.length})` : ''}
+                          </button>
                           {t.status !== 'Closed' && t.status !== 'Cancelled' && (
                             <button onClick={() => handleCancelTicket(t.id)} className="text-red-600 hover:underline">Cancel Request</button>
                           )}
@@ -962,6 +1077,19 @@ function CustomerPortal({ user, tickets, usersList, fetchTickets, handleLogout, 
           </div>
         </div>
       )}
+
+      {chatTicketId && (() => {
+        const t = tickets.find((x) => x.id === chatTicketId);
+        return t ? (
+          <TicketChatModal
+            ticket={t}
+            sender="user"
+            senderName={user.name}
+            onClose={() => { setChatTicketId(null); fetchTickets(); }}
+            onMessagesChanged={fetchTickets}
+          />
+        ) : null;
+      })()}
     </div>
   );
 }
@@ -1060,6 +1188,22 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}` }
     });
+    fetchUsers();
+  };
+
+  const handleUpdateUserRole = async (id, role) => {
+    const res = await fetch(`${API_URL}/api/users/${id}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify({ role })
+    });
+    if (!res.ok) {
+      const data = await res.json();
+      return alert(data.error || 'Failed to update role');
+    }
     fetchUsers();
   };
 
@@ -1301,9 +1445,16 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
                         <td className="py-3.5 px-4 font-semibold text-slate-800">{u.name}</td>
                         <td className="py-3.5 px-4 text-slate-600">{u.email}</td>
                         <td className="py-3.5 px-4">
-                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${u.role === 'agent' ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-700'}`}>
-                            {u.role === 'agent' ? 'IT Agent' : 'Employee'}
-                          </span>
+                          {u.email === user.email ? (
+                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${u.role === 'agent' ? 'bg-blue-100 text-blue-800' : 'bg-slate-100 text-slate-700'}`}>
+                              {u.role === 'agent' ? 'IT Agent' : 'Employee'} (you)
+                            </span>
+                          ) : (
+                            <select value={u.role} onChange={(e) => handleUpdateUserRole(u.id, e.target.value)} title="Assign role" className="bg-white border border-slate-300 text-slate-700 rounded text-xs p-1 focus:outline-none focus:border-[#0052CC]">
+                              <option value="user">Employee</option>
+                              <option value="agent">IT Agent</option>
+                            </select>
+                          )}
                         </td>
                         <td className="py-3.5 px-4 text-right">
                           {u.email !== user.email && (
@@ -1410,6 +1561,19 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
               </div>
             </div>
           )}
+
+          {chatTicketId && (() => {
+            const t = tickets.find((x) => x.id === chatTicketId);
+            return t ? (
+              <TicketChatModal
+                ticket={t}
+                sender="agent"
+                senderName={user.name}
+                onClose={() => { setChatTicketId(null); fetchTickets(); }}
+                onMessagesChanged={fetchTickets}
+              />
+            ) : null;
+          })()}
         </main>
       </div>
 
