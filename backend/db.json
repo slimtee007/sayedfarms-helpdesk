@@ -20,6 +20,13 @@
       "email": "ishaqtesleem@gmail.com",
       "password": "ab",
       "role": "user"
+    },
+    {
+      "id": "admin-default",
+      "name": "IT Admin",
+      "email": "admin@sayedfarms.com",
+      "role": "agent",
+      "password": "Admin@12345"
     }
   ],
   "tickets": [
