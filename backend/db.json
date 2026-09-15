@@ -39,7 +39,8 @@
       "status": "Closed",
       "assigned_to": "Tesleem Ishaq",
       "created_by_name": "User",
-      "image": ""
+      "image": "",
+      "messages": []
     },
     {
       "id": "101",
@@ -50,7 +51,8 @@
       "status": "Cancelled",
       "assigned_to": "Unassigned",
       "created_by_name": "Employee User",
-      "image": ""
+      "image": "",
+      "messages": []
     }
   ],
   "inventory": [

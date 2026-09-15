@@ -87,6 +87,33 @@ if (!users.some((u) => normalizeEmail(u.email) === DEFAULT_ADMIN.email)) {
   console.log('[INIT] Default admin account created: admin@sayedfarms.com');
 }
 
+// Backfill per-ticket chat history for tickets created before it existed.
+let ticketsMigrated = false;
+tickets.forEach((t) => {
+  if (!Array.isArray(t.messages)) {
+    t.messages = [];
+    ticketsMigrated = true;
+  }
+});
+if (ticketsMigrated) saveData();
+
+// Append a chat message to a ticket (shared by the REST endpoint and sockets).
+const appendTicketMessage = (ticketId, sender, senderName, text) => {
+  const ticket = tickets.find((t) => t.id === String(ticketId));
+  if (!ticket || !text || !String(text).trim()) return null;
+  if (!Array.isArray(ticket.messages)) ticket.messages = [];
+  const message = {
+    id: Date.now().toString() + Math.floor(Math.random() * 1000).toString(),
+    sender: sender === 'agent' ? 'agent' : 'user',
+    senderName: senderName || (sender === 'agent' ? 'IT Agent' : 'Employee'),
+    text: String(text).trim(),
+    time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+  };
+  ticket.messages.push(message);
+  saveData();
+  return { ticket, message };
+};
+
 const { sendOtpEmail, isSmtpConfigured } = require('./utils/sendEmail');
 
 const otpStore = {};
@@ -216,6 +243,26 @@ app.delete('/api/users/:id', (req, res) => {
   res.json({ success: true });
 });
 
+// Update a user's role (agent <-> user) and/or display name.
+// Used by the admin dashboard's User Management screen.
+app.patch('/api/users/:id', (req, res) => {
+  const target = users.find(u => u.id === req.params.id);
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  const { role, name } = req.body;
+  if (role !== undefined) {
+    if (role !== 'agent' && role !== 'user') {
+      return res.status(400).json({ error: 'Role must be either "agent" or "user"' });
+    }
+    target.role = role;
+  }
+  if (name !== undefined && String(name).trim()) {
+    target.name = String(name).trim();
+  }
+  saveData();
+  const { password, ...safe } = target;
+  res.json(safe);
+});
+
 app.get('/api/tickets', (req, res) => {
   res.json(tickets);
 });
@@ -231,7 +278,8 @@ app.post('/api/tickets', (req, res) => {
     status: 'Open',
     assigned_to: assigned_to || 'Unassigned',
     created_by_name: 'User',
-    image: image || ''
+    image: image || '',
+    messages: []
   };
   tickets.unshift(newTicket);
   saveData();
@@ -244,6 +292,23 @@ app.patch('/api/tickets/:id', (req, res) => {
   Object.assign(ticket, req.body);
   saveData();
   res.json(ticket);
+});
+
+// Post a per-ticket chat message (employee <-> assigned agent).
+// History is persisted on the ticket and broadcast to the ticket room.
+app.post('/api/tickets/:id/messages', (req, res) => {
+  const { sender, senderName, text } = req.body;
+  const result = appendTicketMessage(req.params.id, sender, senderName, text);
+  if (!result) {
+    const ticket = tickets.find(t => t.id === req.params.id);
+    if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
+    return res.status(400).json({ error: 'Message text is required' });
+  }
+  io.to(`ticket_${result.ticket.id}`).emit('receive_ticket_message', {
+    ticketId: result.ticket.id,
+    message: result.message,
+  });
+  res.json(result.message);
 });
 
 app.get('/api/inventory', (req, res) => {
@@ -282,6 +347,22 @@ app.delete('/api/inventory/:id', (req, res) => {
 io.on('connection', (socket) => {
   socket.on('send_message', (data) => {
     io.emit('receive_message', data);
+  });
+
+  // Per-ticket chat rooms: ticket_<id>
+  socket.on('join_ticket', (ticketId) => {
+    socket.join(`ticket_${ticketId}`);
+  });
+  socket.on('leave_ticket', (ticketId) => {
+    socket.leave(`ticket_${ticketId}`);
+  });
+  socket.on('send_ticket_message', (data) => {
+    const result = appendTicketMessage(data.ticketId, data.sender, data.senderName, data.text);
+    if (!result) return;
+    io.to(`ticket_${result.ticket.id}`).emit('receive_ticket_message', {
+      ticketId: result.ticket.id,
+      message: result.message,
+    });
   });
 });
 
