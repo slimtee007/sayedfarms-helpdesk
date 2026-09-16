@@ -346,17 +346,23 @@ app.delete('/api/inventory/:id', (req, res) => {
 
 io.on('connection', (socket) => {
   socket.on('send_message', (data) => {
+    if (!data || typeof data !== 'object') return;
     io.emit('receive_message', data);
   });
 
   // Per-ticket chat rooms: ticket_<id>
   socket.on('join_ticket', (ticketId) => {
+    if (ticketId === undefined || ticketId === null) return;
     socket.join(`ticket_${ticketId}`);
   });
   socket.on('leave_ticket', (ticketId) => {
+    if (ticketId === undefined || ticketId === null) return;
     socket.leave(`ticket_${ticketId}`);
   });
   socket.on('send_ticket_message', (data) => {
+    // A null / non-object payload used to throw here and take the whole
+    // process down (no error middleware, no uncaughtException handler).
+    if (!data || typeof data !== 'object') return;
     const result = appendTicketMessage(data.ticketId, data.sender, data.senderName, data.text);
     if (!result) return;
     io.to(`ticket_${result.ticket.id}`).emit('receive_ticket_message', {
@@ -364,6 +370,15 @@ io.on('connection', (socket) => {
       message: result.message,
     });
   });
+});
+
+// Last line of defence: log loudly instead of letting one bad event kill the
+// whole helpdesk for every connected user.
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught exception (server kept alive):', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] Unhandled promise rejection (server kept alive):', reason);
 });
 
 const PORT = process.env.PORT || 5000;
