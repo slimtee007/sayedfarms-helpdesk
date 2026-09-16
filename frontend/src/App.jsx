@@ -9,30 +9,97 @@ import { Activity, Plus, ShieldCheck, User, LogOut, Image as ImageIcon, X, Paper
 const API_URL = import.meta.env.VITE_API_URL || '';
 const socket = io(API_URL);
 
+// Catches any render-time exception and shows a recoverable message instead of
+// unmounting the whole app into a blank page.
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  componentDidCatch(error, info) {
+    console.error('Unhandled render error:', error, info && info.componentStack);
+  }
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div className="min-h-screen bg-slate-100 text-slate-800 flex items-center justify-center p-6 font-sans">
+        <div className="bg-white border border-slate-200 rounded-lg shadow-md p-8 max-w-md w-full text-center">
+          <div className="mx-auto mb-4 p-3 bg-red-50 border border-red-200 rounded-full w-fit">
+            <AlertCircle className="h-6 w-6 text-red-600" />
+          </div>
+          <h1 className="text-base font-bold text-slate-900 mb-2">Something went wrong on this page</h1>
+          <p className="text-xs text-slate-600 mb-3">
+            Your tickets and data are safe on the server. You can try again, reload, or sign in again from a clean session.
+          </p>
+          <pre className="text-left text-[10px] text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-4 overflow-auto max-h-28">
+            {String((this.state.error && this.state.error.message) || this.state.error)}
+          </pre>
+          <div className="flex justify-center gap-2">
+            <button onClick={() => this.setState({ error: null })} className="px-3 py-1.5 bg-[#0052CC] hover:bg-blue-700 text-white text-xs font-medium rounded transition">
+              Try again
+            </button>
+            <button onClick={() => window.location.reload()} className="px-3 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 text-xs font-medium rounded transition">
+              Reload page
+            </button>
+            <button
+              onClick={() => { window.localStorage.clear(); window.location.assign('/login'); }}
+              className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 text-xs rounded transition"
+            >
+              Sign out & clear session
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+}
+
 export default function App() {
   return (
-    <BrowserRouter>
-      <MainRouter />
-    </BrowserRouter>
+    <ErrorBoundary>
+      <BrowserRouter>
+        <MainRouter />
+      </BrowserRouter>
+    </ErrorBoundary>
   );
 }
 
 function MainRouter() {
-  const [token, setToken] = useState(localStorage.getItem('token') || '');
-  const [user, setUser] = useState(JSON.parse(localStorage.getItem('user') || 'null'));
+  const [token, setToken] = useState(() => {
+    try { return localStorage.getItem('token') || ''; } catch { return ''; }
+  });
+  // A corrupt "user" value used to throw inside the useState initialiser and
+  // white-screen the app on every load until the browser storage was cleared
+  // by hand.
+  const [user, setUser] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('user') || 'null');
+    } catch {
+      try { localStorage.removeItem('user'); } catch {}
+      return null;
+    }
+  });
   const [tickets, setTickets] = useState([]);
   const [usersList, setUsersList] = useState([]);
   const [inventoryList, setInventoryList] = useState([]);
   
   const navigate = useNavigate();
 
+  // Single source of truth for "is there a usable session?". A token with a
+  // missing/corrupt/role-less user (e.g. half-cleared localStorage) used to
+  // bounce /portal -> /login -> /portal forever and render nothing at all.
+  const loggedIn = Boolean(token && user && (user.role === 'agent' || user.role === 'user'));
+
   useEffect(() => {
-    if (token) {
+    if (loggedIn) {
       fetchTickets();
       fetchUsers();
       if (user?.role === 'agent') fetchInventory();
     }
-  }, [token]);
+  }, [loggedIn]);
 
   const fetchTickets = async () => {
     try {
@@ -93,11 +160,11 @@ function MainRouter() {
       {/* Auth Routes */}
       <Route 
         path="/login" 
-        element={!token ? <AuthScreen setToken={setToken} setUser={setUser} /> : <Navigate to={user?.role === 'agent' ? '/agent/tickets' : '/portal'} />} 
+        element={!loggedIn ? <AuthScreen setToken={setToken} setUser={setUser} /> : <Navigate to={user?.role === 'agent' ? '/agent/tickets' : '/portal'} />} 
       />
       <Route 
         path="/signup" 
-        element={!token ? <AuthScreen initialMode="signup" setToken={setToken} setUser={setUser} /> : <Navigate to={user?.role === 'agent' ? '/agent/tickets' : '/portal'} />} 
+        element={!loggedIn ? <AuthScreen initialMode="signup" setToken={setToken} setUser={setUser} /> : <Navigate to={user?.role === 'agent' ? '/agent/tickets' : '/portal'} />} 
       />
       <Route 
         path="/forgot-password" 
@@ -108,7 +175,7 @@ function MainRouter() {
       <Route 
         path="/portal/*" 
         element={
-          token && user?.role === 'user' ? (
+          loggedIn && user?.role === 'user' ? (
             <CustomerPortal 
               user={user} 
               tickets={tickets} 
@@ -127,7 +194,7 @@ function MainRouter() {
       <Route 
         path="/agent/*" 
         element={
-          token && user?.role === 'agent' ? (
+          loggedIn && user?.role === 'agent' ? (
             <AgentConsole 
               user={user} 
               tickets={tickets} 
@@ -148,7 +215,7 @@ function MainRouter() {
       {/* Default Fallback */}
       <Route 
         path="*" 
-        element={<Navigate to={!token ? '/login' : user?.role === 'agent' ? '/agent/tickets' : '/portal'} />} 
+        element={<Navigate to={!loggedIn ? '/login' : user?.role === 'agent' ? '/agent/tickets' : '/portal'} />} 
       />
     </Routes>
   );
@@ -455,9 +522,10 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
 // Per-ticket chat thread between the employee and the assigned agent.
 // History is persisted on the ticket; new messages arrive in real time
 // over the ticket's socket room. `sender` is 'user' or 'agent'.
-function TicketChatModal({ ticket, sender, senderName, onClose, onMessagesChanged }) {
+function TicketChatModal({ ticket, sender, senderName, onClose, onMessagesChanged, token }) {
   const [messages, setMessages] = useState(ticket.messages || []);
   const [input, setInput] = useState('');
+  const [sendError, setSendError] = useState('');
   const bottomRef = useRef(null);
   const otherSide = sender === 'agent' ? 'employee' : 'IT agent';
 
@@ -485,16 +553,33 @@ function TicketChatModal({ ticket, sender, senderName, onClose, onMessagesChange
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const handleSend = (e) => {
+  // Send through the REST endpoint so a message is persisted (and broadcast to
+  // the ticket room by the server) even if the socket is still connecting or
+  // has dropped. The socket remains the live *receive* path; echoes are
+  // de-duplicated by message id.
+  const handleSend = async (e) => {
     e.preventDefault();
-    if (!input.trim()) return;
-    socket.emit('send_ticket_message', {
-      ticketId: ticket.id,
-      sender,
-      senderName,
-      text: input.trim(),
-    });
+    const text = input.trim();
+    if (!text) return;
     setInput('');
+    setSendError('');
+    try {
+      const res = await fetch(`${API_URL}/api/tickets/${ticket.id}/messages`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ sender, senderName, text }),
+      });
+      if (!res.ok) throw new Error('send failed');
+      const message = await res.json();
+      setMessages((prev) => (prev.some((m) => m.id === message.id) ? prev : [...prev, message]));
+      if (onMessagesChanged) onMessagesChanged();
+    } catch {
+      setInput(text);
+      setSendError('Could not send your message. Check your connection and try again.');
+    }
   };
 
   return (
@@ -535,6 +620,9 @@ function TicketChatModal({ ticket, sender, senderName, onClose, onMessagesChange
           <div ref={bottomRef} />
         </div>
 
+        {sendError && (
+          <div className="px-3 py-2 bg-red-50 border-t border-red-200 text-red-600 text-[11px]">{sendError}</div>
+        )}
         <form onSubmit={handleSend} className="p-3 bg-white border-t border-slate-200 flex gap-2">
           <input
             type="text"
@@ -1087,6 +1175,7 @@ function CustomerPortal({ user, tickets, usersList, fetchTickets, handleLogout, 
             senderName={user.name}
             onClose={() => { setChatTicketId(null); fetchTickets(); }}
             onMessagesChanged={fetchTickets}
+            token={token}
           />
         ) : null;
       })()}
@@ -1100,6 +1189,10 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
   const [inviteEmail, setInviteEmail] = useState('');
   const [copied, setCopied] = useState(false);
   const [selectedImage, setSelectedImage] = useState(null);
+  // Id of the ticket whose per-ticket chat thread is open (null = closed).
+  // Without this declaration the console threw `chatTicketId is not defined`
+  // on every render and the whole Agent Console was a blank page.
+  const [chatTicketId, setChatTicketId] = useState(null);
   
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [chatMessages, setChatMessages] = useState([
@@ -1359,7 +1452,14 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
                               {agentsList.map(a => <option key={a.id} value={a.name}>{a.name}</option>)}
                             </select>
                           </td>
-                          <td className="py-3.5 px-4 text-right">
+                          <td className="py-3.5 px-4 text-right whitespace-nowrap">
+                            <button
+                              onClick={() => setChatTicketId(t.id)}
+                              title="Open the chat thread with the reporter"
+                              className="px-2.5 py-1 text-xs bg-blue-50 hover:bg-blue-100 text-[#0052CC] border border-blue-300 rounded font-medium transition mr-2"
+                            >
+                              Chat{(t.messages?.length || 0) > 0 ? ` (${t.messages.length})` : ''}
+                            </button>
                             {t.status !== 'Closed' && t.status !== 'Resolved' && t.status !== 'Cancelled' && (
                               <button onClick={() => handleAgentUpdate(t.id, { status: 'Resolved' })} className="px-2.5 py-1 text-xs bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-300 rounded font-medium transition">
                                 Quick Resolve
@@ -1571,6 +1671,7 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
                 senderName={user.name}
                 onClose={() => { setChatTicketId(null); fetchTickets(); }}
                 onMessagesChanged={fetchTickets}
+                token={token}
               />
             ) : null;
           })()}
