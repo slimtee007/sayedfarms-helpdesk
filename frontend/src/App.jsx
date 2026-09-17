@@ -7,7 +7,9 @@ import { Activity, Plus, ShieldCheck, User, LogOut, Image as ImageIcon, X, Paper
 // backend; in production the frontend is expected to be served from the same
 // origin as the backend. Override with VITE_API_URL if hosted elsewhere.
 const API_URL = import.meta.env.VITE_API_URL || '';
-const socket = io(API_URL);
+// Connected explicitly once a session exists (see MainRouter): the server
+// ignores chat/join emits from unauthenticated sockets.
+const socket = io(API_URL, { autoConnect: false });
 
 // Catches any render-time exception and shows a recoverable message instead of
 // unmounting the whole app into a blank page.
@@ -84,6 +86,7 @@ function MainRouter() {
   });
   const [tickets, setTickets] = useState([]);
   const [usersList, setUsersList] = useState([]);
+  const [agentsList, setAgentsList] = useState([]);
   const [inventoryList, setInventoryList] = useState([]);
   
   const navigate = useNavigate();
@@ -96,16 +99,45 @@ function MainRouter() {
   useEffect(() => {
     if (loggedIn) {
       fetchTickets();
-      fetchUsers();
-      if (user?.role === 'agent') fetchInventory();
+      // The full user directory is agent-only; employees get the trimmed
+      // agent picker for the "direct request" dropdown.
+      if (user?.role === 'agent') {
+        fetchUsers();
+        fetchInventory();
+      } else {
+        fetchAgents();
+      }
     }
   }, [loggedIn]);
+
+  // Authenticate the shared socket with the current session token so chat
+  // emits carry a verified identity. Reconnects when the session changes and
+  // disconnects on sign-out (registered listeners survive reconnects).
+  useEffect(() => {
+    if (loggedIn && token) {
+      socket.auth = { token };
+      socket.disconnect();
+      socket.connect();
+    } else {
+      socket.disconnect();
+    }
+  }, [loggedIn, token]);
+
+  // A 401 means the session is invalid or expired — drop it and bounce to login.
+  const handleUnauthorized = (res) => {
+    if (res.status === 401) {
+      handleLogout();
+      return true;
+    }
+    return false;
+  };
 
   const fetchTickets = async () => {
     try {
       const res = await fetch(`${API_URL}/api/tickets`, {
         headers: { Authorization: `Bearer ${token}` }
       });
+      if (handleUnauthorized(res)) return;
       const data = await res.json();
       if (res.ok) setTickets(data);
     } catch (err) {
@@ -118,6 +150,7 @@ function MainRouter() {
       const res = await fetch(`${API_URL}/api/users`, {
         headers: { Authorization: `Bearer ${token}` }
       });
+      if (handleUnauthorized(res)) return;
       const data = await res.json();
       if (!res.ok) return;
       setUsersList(data);
@@ -136,11 +169,25 @@ function MainRouter() {
     }
   };
 
+  const fetchAgents = async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/agents`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (handleUnauthorized(res)) return;
+      const data = await res.json();
+      if (res.ok) setAgentsList(data);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
   const fetchInventory = async () => {
     try {
       const res = await fetch(`${API_URL}/api/inventory`, {
         headers: { Authorization: `Bearer ${token}` }
       });
+      if (handleUnauthorized(res)) return;
       const data = await res.json();
       if (res.ok) setInventoryList(data);
     } catch (err) {
@@ -176,13 +223,13 @@ function MainRouter() {
         path="/portal/*" 
         element={
           loggedIn && user?.role === 'user' ? (
-            <CustomerPortal 
-              user={user} 
-              tickets={tickets} 
-              usersList={usersList} 
-              fetchTickets={fetchTickets} 
-              handleLogout={handleLogout} 
-              token={token} 
+            <CustomerPortal
+              user={user}
+              tickets={tickets}
+              agentsList={agentsList}
+              fetchTickets={fetchTickets}
+              handleLogout={handleLogout}
+              token={token}
             />
           ) : (
             <Navigate to="/login" />
@@ -223,7 +270,7 @@ function MainRouter() {
 
 function AuthScreen({ initialMode = 'login', setToken, setUser }) {
   const [authMode, setAuthMode] = useState(initialMode);
-  const [authForm, setAuthForm] = useState({ name: '', email: '', password: '', role: 'user', otp: '' });
+  const [authForm, setAuthForm] = useState({ name: '', email: '', password: '', otp: '' });
   const [resetStep, setResetStep] = useState('step1'); // 'step1' for email input/OTP request, 'step2' for OTP verification & new password
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
@@ -252,10 +299,15 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
 
     try {
       const endpoint = authMode === 'login' ? '/api/auth/login' : '/api/auth/signup';
+      // Public signups are always employee accounts — agent access is granted
+      // by an existing agent from the console. No `role` is ever sent.
+      const payload = authMode === 'login'
+        ? { email: authForm.email, password: authForm.password }
+        : { name: authForm.name, email: authForm.email, password: authForm.password };
       const res = await fetch(`${API_URL}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(authForm)
+        body: JSON.stringify(payload)
       });
       const data = await res.json();
       if (!res.ok) return setError(data.error || 'Authentication failed');
@@ -338,7 +390,7 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
       alert('Password updated successfully! Please sign in with your new password.');
       setAuthMode('login');
       setResetStep('step1');
-      setAuthForm({ name: '', email: '', password: '', role: 'user', otp: '' });
+      setAuthForm({ name: '', email: '', password: '', otp: '' });
     } catch (err) {
       setError('Failed to reset password. Please try again.');
     } finally {
@@ -388,7 +440,7 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
                       setResetStep('step1'); 
                       setError('');
                       setMessage('');
-                      setAuthForm({ name: '', email: '', password: '', role: 'user', otp: '' }); 
+                      setAuthForm({ name: '', email: '', password: '', otp: '' }); 
                     }} 
                     className="text-[#0052CC] font-semibold hover:underline"
                   >
@@ -459,7 +511,7 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
                       setResetStep('step1'); 
                       setError('');
                       setMessage('');
-                      setAuthForm({ name: '', email: '', password: '', role: 'user', otp: '' }); 
+                      setAuthForm({ name: '', email: '', password: '', otp: '' }); 
                     }} 
                     className="text-slate-500 hover:underline"
                   >
@@ -490,15 +542,6 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
               </div>
               <input required type="password" value={authForm.password} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} />
             </div>
-            {authMode === 'signup' && (
-              <div>
-                <label className="block text-xs font-semibold text-slate-600 mb-1">Account Type</label>
-                <select value={authForm.role} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, role: e.target.value })}>
-                  <option value="user">Employee (Customer Portal)</option>
-                  <option value="agent">IT Staff (Agent Console)</option>
-                </select>
-              </div>
-            )}
             <button type="submit" disabled={loading} className="w-full py-2.5 bg-[#0052CC] hover:bg-blue-700 font-medium text-xs text-white rounded transition shadow-sm disabled:opacity-50">
               {loading ? (authMode === 'login' ? 'Signing in...' : 'Creating Account...') : (authMode === 'login' ? 'Sign In' : 'Create Account')}
             </button>
@@ -640,7 +683,7 @@ function TicketChatModal({ ticket, sender, senderName, onClose, onMessagesChange
   );
 }
 
-function CustomerPortal({ user, tickets, usersList, fetchTickets, handleLogout, token }) {
+function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLogout, token }) {
   const [selectedGroup, setSelectedGroup] = useState('all');
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -750,7 +793,6 @@ function CustomerPortal({ user, tickets, usersList, fetchTickets, handleLogout, 
     setChatInput('');
   };
 
-  const agentsList = usersList.filter(u => u.role === 'agent');
   const navigate = useNavigate();
 
   return (
