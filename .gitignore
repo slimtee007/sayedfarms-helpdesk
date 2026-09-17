@@ -42,9 +42,5 @@ venv/
 .venv/
 db.sqlite3
 
-# Helpdesk JSON store — local-only, contains password hashes. It is
-# auto-created with seed data on first boot. NEVER commit it.
-backend/db.json
-
 # Frontend specific
 .cache/
