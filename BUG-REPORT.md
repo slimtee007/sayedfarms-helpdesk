@@ -53,38 +53,78 @@ loudly instead of exiting. Verified: null, string, and partial payloads now leav
 receive path, echoes are de-duplicated by message id, and a failed send restores the draft and shows an
 inline error instead of swallowing it.
 
+### 4. No authentication or authorization anywhere — FIXED (branch `arena/01a0ae1d-sayedfarms-helpdesk`)
+`backend/server.js` now issues real signed JWTs (`jsonwebtoken`, 12 h expiry, `JWT_SECRET` from env —
+refuses to boot in production without one) and verifies them in `requireAuth` / `requireAgent`
+middleware on every non-public endpoint. Passwords are bcrypt hashes (`bcryptjs`, 10 rounds) with a
+boot-time migration that hashes any plaintext leftovers in place. Role is looked up fresh from the DB
+on each request, so demotions and deletions take effect immediately. Every attack in the original
+evidence row now fails closed: anonymous `GET /api/users`, user delete/promote, asset destroy,
+ticket close/reassign, and posting as `"Fake IT Admin"` return 401/403 (sender identity for chat is
+derived from the verified session on both REST and sockets). Socket.IO carries the session token in
+`socket.handshake.auth`; unauthenticated emits and ticket-room joins for tickets you don't own are
+ignored. CORS is allow-listable via `CORS_ORIGIN` (Bearer tokens are not ambient credentials, so a
+foreign origin can't ride a session even with the permissive dev default).
+
+Also fixed along the way: **#13** (employees' `GET /api/tickets` is server-side scoped to their own;
+agents see all), **#14** (`created_by` id + `created_by_name` stamped from the session, legacy tickets
+backfilled by reporter name), **#16** (signup/login/forgot-password all compare normalised emails).
+Partials: **#11** (admin seed is env-overridable via `ADMIN_EMAIL`/`ADMIN_PASSWORD` and only fires
+when *no* agent exists), **#17** (deleting a user re-homes their ticket/asset assignments to
+`Unassigned`), **#24** (`DELETE` on a missing user/asset id is now 404; OTP compared as strings so a
+JSON-number code is accepted).
+
+Verified: black-box suite against the live backend covering signup/login hashing + JWT shape,
+anonymous access (401 everywhere), employee scoping (own tickets only, cancel-own-only, chat-own-only,
+`GET /api/agents` names-only), agent powers (promote/demote, self-role-change + self-delete + last-agent
+refusals), case-insensitive duplicate signup rejection, reset-password re-hashing, and socket auth.
+
+### 5. Plaintext passwords committed to git — FIXED (tracking) + ACTION REQUIRED (history)
+`backend/db.json` is removed from git tracking and covered by `.gitignore`; fresh checkouts auto-seed
+a local copy on first boot, and all stored passwords are bcrypt hashes. The leaked values are rotated
+(the committed accounts' passwords no longer exist anywhere — seeds are env-overridable and the old
+file is not shipped). **Still required:** the old `db.json` contents live on in main's history —
+purge with `git filter-repo --path backend/db.json --invert-paths` (and rotate any reused
+credentials) before real deployment. Documented in `README.md`.
+
+### 6. Anyone can self-register as an IT Agent — FIXED
+`role` from the signup body is ignored server-side (every public signup is `role: 'user'`), the
+"IT Staff (Agent Console)" option and the whole Account Type dropdown are removed from the signup
+form, and the client no longer sends `role` at all. Promotion is agent-only via `PATCH /api/users/:id`
+(which itself now requires an agent session, blocks self-role-change, and blocks demoting the last agent).
+
 ---
 
 ## OPEN — security (fix before any real deployment)
 
 | # | Finding | Evidence |
 |---|---|---|
-| 4 | **No authentication or authorization anywhere.** Login returns `'mock-jwt-token-'+id` and nothing validates it; `jsonwebtoken`/`bcryptjs` are installed but unused. Anonymous curl listed all users, deleted an account, destroyed an asset, promoted a user to agent, closed/reassigned tickets, and posted into a ticket thread as `"Fake IT Admin"`. `app.use(cors())` + socket.io `origin:'*'` make it drivable from any website. | `server.js:10,16,182,191,236-345` |
-| 5 | **Plaintext passwords committed to git.** `backend/db.json` is tracked and contains live-looking accounts with readable passwords (`…@sayedfarms.com` / `"aa"`). `.gitignore` covers `.env` but not `db.json`. Rotate these credentials and purge the file from history. | `backend/db.json`, `server.js:187` |
-| 6 | **Anyone can self-register as an IT Agent.** `role` is taken from the signup request body, and the public signup form offers "IT Staff (Agent Console)" in a dropdown. | `server.js:179`, `App.jsx:429-432` |
+| 4 | ~~No authentication or authorization anywhere~~ — **FIXED**, see FIXED §4. | — |
+| 5 | ~~Plaintext passwords committed to git~~ — **tracking FIXED**, see FIXED §5; **history purge still required.** | — |
+| 6 | ~~Anyone can self-register as an IT Agent~~ — **FIXED**, see FIXED §6. | — |
 | 7 | **Password reset / login are brute-forceable.** 200 wrong OTPs → all HTTP 400, no lockout or delay (10⁶ keyspace, 10-minute validity); 40 wrong admin passwords → all HTTP 400. No rate limiter installed. | `server.js:224-227` |
 | 8 | **Mass assignment.** `Object.assign(ticket, req.body)` let a client rewrite a ticket's primary key to `"hijacked"`, orphaning the record; same pattern on inventory. | `server.js:292,336` |
 | 9 | **Live chat broadcasts every conversation to every connected client** (`io.emit`), and nothing is persisted. | `server.js:349` |
 | 10 | **Account enumeration** on forgot-password (404 vs 200). | `server.js:137` |
-| 11 | **Default admin credentials hard-coded and re-seeded on every boot** (`admin@sayedfarms.com` / `Admin@12345`), even if deleted. | `server.js:77-88` |
+| 11 | **Default admin credentials hard-coded and re-seeded on every boot** (`admin@sayedfarms.com` / `Admin@12345`), even if deleted. **PARTIAL:** seed is now env-overridable (`ADMIN_EMAIL`/`ADMIN_PASSWORD`, bcrypt-hashed) and only fires when *no* agent exists; the documented dev default remains for local first boot. | `server.js` ensure-admin block |
 
 ## OPEN — functional
 
 | # | Finding | Evidence |
 |---|---|---|
 | 12 | **Forgot-password is a dead end as shipped.** With no `backend/.env` the backend honestly returns `emailSent:false` + `devOtp`, but the live UI reads neither and always says "Verification code sent! Check your inbox." The README promises the opposite, and a correct implementation already exists in the **unused** `src/pages/ForgotPassword.jsx`. Wire that component up and delete the inline duplicate. | `App.jsx:208-231` vs `src/pages/ForgotPassword.jsx` |
-| 13 | **No per-user ticket scoping.** "My Submitted Requests" lists every ticket in the system with working Cancel buttons; one employee rendered all 38. | `server.js:266`, `App.jsx:677-678` |
-| 14 | **Reporter identity lost** — every ticket is stamped `created_by_name: "User"` and no `created_by` field exists. | `server.js:280` |
+| 13 | ~~No per-user ticket scoping~~ — **FIXED** with §4 (server-side scoping; employees see own tickets only). | — |
+| 14 | ~~Reporter identity lost~~ — **FIXED** with §4 (`created_by` + `created_by_name` from session; legacy backfilled). | — |
 | 15 | **No input validation**: empty signup/ticket/asset bodies all return 200; 1-character passwords accepted on signup and reset. | `server.js:174-183,270-287,318-331` |
-| 16 | **Duplicate-email guard bypassable by case**: signup compares raw, login compares normalised → two live accounts for one address (the second took `role:"agent"` in testing). | `server.js:176` vs `:187` |
-| 17 | **Assignments keyed by display name**, not id: renaming a user orphans every ticket/asset assignment; duplicate names are indistinguishable. Deleting a user strands their tickets/assets with a blank `<select>`. | `server.js:279`, `App.jsx:1357,1404` |
+| 16 | ~~Duplicate-email guard bypassable by case~~ — **FIXED** with §4 (all comparisons normalised; signup rejects case variants). | — |
+| 17 | **Assignments keyed by display name**, not id: renaming a user orphans every ticket/asset assignment; duplicate names are indistinguishable. **PARTIAL:** deleting a user now re-homes their assignments to `Unassigned` instead of stranding them; id-keyed assignments still open. | `server.js` DELETE user |
 | 18 | **`Date.now()` primary keys collide** (6 concurrent signups → 5 unique ids); `DELETE /api/users/:id` uses `filter`, so a collision deletes both accounts. | `server.js:179,241,273,321` |
 | 19 | **Ticket creation swallows failures** — `handleCreateTicket` never checks `res.ok`, then closes the modal and clears the form, so a failed POST looks like success. `handleCreateAsset` does `alert(data.error)` with no fallback → literal "undefined" dialog. | `App.jsx:611-624,1146` |
 | 20 | **Invite link goes nowhere**: `${origin}?invite=email` is copied but the query string is never parsed and no email is sent. | `App.jsx:1226,1536` |
 | 21 | **Fabricated chat history**: both chat widgets are pre-seeded with invented messages styled as real correspondence; not persisted, reappears on every reload. | `App.jsx:562,1106` |
 | 22 | **`socket.off('receive_message')` with no handler** detaches *all* listeners for that event on the shared module-level socket. | `App.jsx:591,1126` |
 | 23 | **Attachments base64-inlined into `db.json`**, which is rewritten in full (synchronous `writeFileSync`) on every chat message: 10 messages grew it 490 KB; one small screenshot added 196 KB that is re-sent to every client on every `GET /api/tickets`. | `server.js:70-72,113`, `App.jsx:600-609` |
-| 24 | **No 404 handler / error middleware**: `GET /api/nope` → HTML 404 that the frontend's `res.json()` chokes on. Issued reset codes live only in memory, so any restart voids them. Duplicate serial numbers accepted; `DELETE` on a missing id reports success; OTP compared with `!==` so a JSON-number code is rejected. | `server.js` |
+| 24 | **No 404 handler / error middleware**: `GET /api/nope` → HTML 404 that the frontend's `res.json()` chokes on. Issued reset codes live only in memory, so any restart voids them. Duplicate serial numbers accepted. **PARTIAL:** `DELETE` on a missing user/asset id is now 404; OTP compared as strings so a JSON-number code is accepted. | `server.js` |
 
 ## OPEN — dead code & repo hygiene
 
@@ -100,9 +140,7 @@ inline error instead of swallowing it.
 
 ## Suggested order for the remaining work
 
-1. **#4 + #6 + #5** — real JWT verification and `bcryptjs` hashing (both already in `package.json`),
-   `requireAuth`/`requireAgent` middleware, server-side ticket scoping, reject `role` from signup,
-   rotate the leaked passwords and purge `db.json` from history.
+1. ~~**#4 + #6 + #5**~~ — **DONE** (plus #13, #14, #16; partials on #11, #17, #24). Remaining: purge `db.json` from main's history (see FIXED §5).
 2. **#12** — route `/forgot-password` to the existing `src/pages/ForgotPassword.jsx`.
 3. **#7, #8** — rate limiting and an allow-list of patchable fields.
 4. Then the remaining functional and hygiene items; #25-#28 are pure deletions.
