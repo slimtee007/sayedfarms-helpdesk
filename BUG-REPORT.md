@@ -93,6 +93,20 @@ credentials) before real deployment. Documented in `README.md`.
 form, and the client no longer sends `role` at all. Promotion is agent-only via `PATCH /api/users/:id`
 (which itself now requires an agent session, blocks self-role-change, and blocks demoting the last agent).
 
+### 12. Forgot-password is a dead end as shipped — FIXED (branch `arena/01a0ae1d-sayedfarms-helpdesk`)
+`/forgot-password` now renders the existing `src/pages/ForgotPassword.jsx` (via a `ForgotPasswordRoute`
+wrapper that navigates back to `/login`), and the ~150-line inline duplicate was deleted from
+`AuthScreen`, which is login/signup only again. The wired-up component honours the server's response
+contract: `devOtp` renders the development-code box when SMTP isn't configured, `emailSent` drives the
+step-2 copy, and success auto-redirects to sign-in. Small consistency pass on the revived component:
+API base comes from an `apiBase` prop (same `VITE_API_URL || ''` value as the rest of the app),
+accent colour aligned to the app's `#0052CC`, email placeholder typo fixed. The login form's
+"Forgot password?" link routes to `/forgot-password`.
+
+Verified: `vite build` + `oxlint` clean; `ForgotPassword` rendered in jsdom — a mocked SMTP-down
+response shows the dev code box, a mocked SMTP-up response shows the inbox message with no dev code,
+reset success auto-redirects, and no `resetStep`/`handleRequestOtp` remnants remain in `App.jsx`.
+
 ---
 
 ## OPEN — security (fix before any real deployment)
@@ -112,7 +126,7 @@ form, and the client no longer sends `role` at all. Promotion is agent-only via 
 
 | # | Finding | Evidence |
 |---|---|---|
-| 12 | **Forgot-password is a dead end as shipped.** With no `backend/.env` the backend honestly returns `emailSent:false` + `devOtp`, but the live UI reads neither and always says "Verification code sent! Check your inbox." The README promises the opposite, and a correct implementation already exists in the **unused** `src/pages/ForgotPassword.jsx`. Wire that component up and delete the inline duplicate. | `App.jsx:208-231` vs `src/pages/ForgotPassword.jsx` |
+| 12 | ~~Forgot-password is a dead end as shipped~~ — **FIXED**, see FIXED §12. | — |
 | 13 | ~~No per-user ticket scoping~~ — **FIXED** with §4 (server-side scoping; employees see own tickets only). | — |
 | 14 | ~~Reporter identity lost~~ — **FIXED** with §4 (`created_by` + `created_by_name` from session; legacy backfilled). | — |
 | 15 | **No input validation**: empty signup/ticket/asset bodies all return 200; 1-character passwords accepted on signup and reset. | `server.js:174-183,270-287,318-331` |
@@ -141,6 +155,6 @@ form, and the client no longer sends `role` at all. Promotion is agent-only via 
 ## Suggested order for the remaining work
 
 1. ~~**#4 + #6 + #5**~~ — **DONE** (plus #13, #14, #16; partials on #11, #17, #24). Remaining: purge `db.json` from main's history (see FIXED §5).
-2. **#12** — route `/forgot-password` to the existing `src/pages/ForgotPassword.jsx`.
+2. ~~**#12**~~ — **DONE** (see FIXED §12).
 3. **#7, #8** — rate limiting and an allow-list of patchable fields.
 4. Then the remaining functional and hygiene items; #25-#28 are pure deletions.

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 
-const ForgotPassword = ({ onBackToLogin }) => {
+const ForgotPassword = ({ onBackToLogin, apiBase = '' }) => {
   const [step, setStep] = useState(1); // 1: Send OTP, 2: Verify OTP & Reset
   const [email, setEmail] = useState('');
   const [otp, setOtp] = useState('');
@@ -34,7 +34,7 @@ const ForgotPassword = ({ onBackToLogin }) => {
     setLoading(true);
 
     try {
-      const res = await fetch('/api/auth/forgot-password', {
+      const res = await fetch(`${apiBase}/api/auth/forgot-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email }),
@@ -69,7 +69,7 @@ const ForgotPassword = ({ onBackToLogin }) => {
     setIsResending(true);
 
     try {
-      const res = await fetch('/api/auth/resend-otp', {
+      const res = await fetch(`${apiBase}/api/auth/resend-otp`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email }),
@@ -103,7 +103,7 @@ const ForgotPassword = ({ onBackToLogin }) => {
     setLoading(true);
 
     try {
-      const res = await fetch('/api/auth/reset-password', {
+      const res = await fetch(`${apiBase}/api/auth/reset-password`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, otp, password: newPassword }),
@@ -152,7 +152,7 @@ const ForgotPassword = ({ onBackToLogin }) => {
             <label style={styles.label}>Email Address</label>
             <input
               type="email"
-              placeholder="name@sayedfarm.com"
+              placeholder="name@sayedfarms.com"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
               style={styles.input}
@@ -231,7 +231,7 @@ const ForgotPassword = ({ onBackToLogin }) => {
               disabled={resendCooldown > 0 || isResending}
               style={{
                 ...styles.linkButton,
-                color: resendCooldown > 0 ? '#94a3b8' : '#0284c7',
+                color: resendCooldown > 0 ? '#94a3b8' : '#0052CC',
                 cursor: resendCooldown > 0 ? 'not-allowed' : 'pointer',
                 fontWeight: '600',
               }}
@@ -276,7 +276,7 @@ const styles = {
     marginBottom: '20px',
   },
   logoBadge: {
-    backgroundColor: '#0284c7',
+    backgroundColor: '#0052CC',
     color: '#fff',
     width: '36px',
     height: '36px',
@@ -321,7 +321,7 @@ const styles = {
   primaryButton: {
     width: '100%',
     padding: '12px',
-    backgroundColor: '#0284c7',
+    backgroundColor: '#0052CC',
     color: '#ffffff',
     border: 'none',
     borderRadius: '6px',
@@ -333,7 +333,7 @@ const styles = {
   linkButton: {
     background: 'none',
     border: 'none',
-    color: '#0284c7',
+    color: '#0052CC',
     fontSize: '13px',
     fontWeight: '500',
     cursor: 'pointer',

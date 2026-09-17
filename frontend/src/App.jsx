@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, Navigate, Link, useLocation } from 'react-router-dom';
 import { io } from 'socket.io-client';
 import { Activity, Plus, ShieldCheck, User, LogOut, Image as ImageIcon, X, Paperclip, Users, Ticket, UserPlus, Copy, Check, Trash2, Box, PackagePlus, ChevronRight, Search, Headphones, KeyRound, AlertCircle, Monitor, Laptop, FilePlus, ChevronDown, Filter, MessageSquare, Send } from 'lucide-react';
+import ForgotPassword from './pages/ForgotPassword.jsx';
 
 // Same-origin by default: in dev, Vite proxies /api and /socket.io to the
 // backend; in production the frontend is expected to be served from the same
@@ -213,9 +214,9 @@ function MainRouter() {
         path="/signup" 
         element={!loggedIn ? <AuthScreen initialMode="signup" setToken={setToken} setUser={setUser} /> : <Navigate to={user?.role === 'agent' ? '/agent/tickets' : '/portal'} />} 
       />
-      <Route 
-        path="/forgot-password" 
-        element={<AuthScreen initialMode="forgot" setToken={setToken} setUser={setUser} />} 
+      <Route
+        path="/forgot-password"
+        element={<ForgotPasswordRoute />}
       />
 
       {/* Customer / Employee Portal Routes */}
@@ -268,33 +269,28 @@ function MainRouter() {
   );
 }
 
+// Standalone password-reset page. ForgotPassword honours the server's
+// emailSent/devOtp response contract, unlike the old inline form it replaces.
+function ForgotPasswordRoute() {
+  const navigate = useNavigate();
+  return (
+    <div className="min-h-screen bg-slate-100 text-slate-800 flex items-center justify-center p-4 font-sans">
+      <ForgotPassword onBackToLogin={() => navigate('/login')} apiBase={API_URL} />
+    </div>
+  );
+}
+
 function AuthScreen({ initialMode = 'login', setToken, setUser }) {
   const [authMode, setAuthMode] = useState(initialMode);
-  const [authForm, setAuthForm] = useState({ name: '', email: '', password: '', otp: '' });
-  const [resetStep, setResetStep] = useState('step1'); // 'step1' for email input/OTP request, 'step2' for OTP verification & new password
+  const [authForm, setAuthForm] = useState({ name: '', email: '', password: '' });
   const [error, setError] = useState('');
-  const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
-  const [resendCooldown, setResendCooldown] = useState(0);
-  const [isResending, setIsResending] = useState(false);
-  
-  const navigate = useNavigate();
 
-  // Countdown timer for resend OTP cooldown
-  useEffect(() => {
-    let timer;
-    if (resendCooldown > 0) {
-      timer = setInterval(() => {
-        setResendCooldown((prev) => prev - 1);
-      }, 1000);
-    }
-    return () => clearInterval(timer);
-  }, [resendCooldown]);
+  const navigate = useNavigate();
 
   const handleAuth = async (e) => {
     e.preventDefault();
     setError('');
-    setMessage('');
     setLoading(true);
 
     try {
@@ -324,80 +320,6 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
     }
   };
 
-  const handleRequestOtp = async (e) => {
-    e.preventDefault();
-    setError('');
-    setMessage('');
-    setLoading(true);
-
-    try {
-      const res = await fetch(`${API_URL}/api/auth/forgot-password`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: authForm.email })
-      });
-      const data = await res.json();
-      if (!res.ok) return setError(data.error || 'Failed to send verification code.');
-
-      setMessage('Verification code sent! Check your inbox.');
-      setResetStep('step2');
-      setResendCooldown(30);
-    } catch (err) {
-      setError('Failed to send verification code. Please try again.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleResendOtp = async () => {
-    setError('');
-    setMessage('');
-    setIsResending(true);
-
-    try {
-      const res = await fetch(`${API_URL}/api/auth/resend-otp`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: authForm.email })
-      });
-      const data = await res.json();
-      if (!res.ok) return setError(data.error || 'Failed to resend OTP.');
-
-      setMessage('A new verification code has been generated!');
-      setResendCooldown(30);
-    } catch (err) {
-      setError('Failed to resend OTP. Please try again.');
-    } finally {
-      setIsResending(false);
-    }
-  };
-
-  const handleResetPassword = async (e) => {
-    e.preventDefault();
-    setError('');
-    setMessage('');
-    setLoading(true);
-
-    try {
-      const res = await fetch(`${API_URL}/api/auth/reset-password`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: authForm.email, otp: authForm.otp, password: authForm.password })
-      });
-      const data = await res.json();
-      if (!res.ok) return setError(data.error || 'Failed to reset password.');
-
-      alert('Password updated successfully! Please sign in with your new password.');
-      setAuthMode('login');
-      setResetStep('step1');
-      setAuthForm({ name: '', email: '', password: '', otp: '' });
-    } catch (err) {
-      setError('Failed to reset password. Please try again.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
   return (
     <div className="min-h-screen bg-slate-100 text-slate-800 flex items-center justify-center p-4 font-sans">
       <div className="bg-white border border-slate-200 p-8 rounded-lg w-full max-w-md shadow-md">
@@ -409,154 +331,39 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
         </div>
 
         {error && <div className="mb-4 p-3 bg-red-50 border border-red-200 text-red-600 text-xs rounded">{error}</div>}
-        {message && <div className="mb-4 p-3 bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs rounded">{message}</div>}
-        
-        {authMode === 'forgot' ? (
+
+        <form onSubmit={handleAuth} className="space-y-4">
+          {authMode === 'signup' && (
+            <div>
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Full Name</label>
+              <input required type="text" value={authForm.name} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })} />
+            </div>
+          )}
           <div>
-            {resetStep === 'step1' ? (
-              <form onSubmit={handleRequestOtp} className="space-y-4">
-                <div className="text-xs text-slate-600 mb-2">
-                  Enter your registered work email address. We will send a verification OTP code to your email to reset your account access.
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-600 mb-1">Email Address</label>
-                  <input 
-                    required 
-                    type="email" 
-                    placeholder="name@sayedfarms.com"
-                    value={authForm.email} 
-                    className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" 
-                    onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })} 
-                  />
-                </div>
-                <button type="submit" disabled={loading} className="w-full py-2.5 bg-[#0052CC] hover:bg-blue-700 font-medium text-xs text-white rounded transition shadow-sm disabled:opacity-50">
-                  {loading ? 'Sending Code...' : 'Send Verification Code'}
-                </button>
-                <div className="text-center text-xs text-slate-500 pt-2">
-                  <button 
-                    type="button" 
-                    onClick={() => { 
-                      setAuthMode('login'); 
-                      setResetStep('step1'); 
-                      setError('');
-                      setMessage('');
-                      setAuthForm({ name: '', email: '', password: '', otp: '' }); 
-                    }} 
-                    className="text-[#0052CC] font-semibold hover:underline"
-                  >
-                    Back to Sign In
-                  </button>
-                </div>
-              </form>
-            ) : (
-              <form onSubmit={handleResetPassword} className="space-y-4">
-                <div className="text-xs text-slate-600 mb-2">
-                  Enter the verification code sent to <span className="font-semibold text-slate-800">{authForm.email}</span> along with your new password.
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-600 mb-1">Verification Code (OTP)</label>
-                  <input 
-                    required 
-                    type="text" 
-                    placeholder="Enter 6-digit OTP" 
-                    maxLength="6"
-                    value={authForm.otp} 
-                    className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs font-mono tracking-wider focus:bg-white focus:border-[#0052CC] focus:outline-none" 
-                    onChange={(e) => setAuthForm({ ...authForm, otp: e.target.value })} 
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-600 mb-1">New Password</label>
-                  <input 
-                    required 
-                    type="password" 
-                    placeholder="Enter new password"
-                    value={authForm.password} 
-                    className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" 
-                    onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} 
-                  />
-                </div>
-                <button type="submit" disabled={loading} className="w-full py-2.5 bg-[#0052CC] hover:bg-blue-700 font-medium text-xs text-white rounded transition shadow-sm disabled:opacity-50">
-                  {loading ? 'Resetting Password...' : 'Reset Password'}
-                </button>
-
-                {/* Side-by-Side Action Bar: Change Email & Resend OTP */}
-                <div className="text-xs text-slate-500 pt-2 flex justify-between items-center">
-                  <button 
-                    type="button" 
-                    onClick={() => { setResetStep('step1'); setError(''); setMessage(''); }} 
-                    className="text-slate-600 hover:underline"
-                  >
-                    Change Email
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleResendOtp}
-                    disabled={resendCooldown > 0 || isResending}
-                    className={`font-semibold hover:underline ${resendCooldown > 0 ? 'text-slate-400 cursor-not-allowed' : 'text-[#0052CC]'}`}
-                  >
-                    {resendCooldown > 0
-                      ? `Resend OTP in ${resendCooldown}s`
-                      : isResending
-                      ? 'Resending...'
-                      : 'Resend OTP'}
-                  </button>
-                </div>
-
-                <div className="text-center text-xs text-slate-500 pt-2">
-                  <button 
-                    type="button" 
-                    onClick={() => { 
-                      setAuthMode('login'); 
-                      setResetStep('step1'); 
-                      setError('');
-                      setMessage('');
-                      setAuthForm({ name: '', email: '', password: '', otp: '' }); 
-                    }} 
-                    className="text-slate-500 hover:underline"
-                  >
-                    Back to Sign In
-                  </button>
-                </div>
-              </form>
-            )}
+            <label className="block text-xs font-semibold text-slate-600 mb-1">Email Address</label>
+            <input required type="email" value={authForm.email} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })} />
           </div>
-        ) : (
-          <form onSubmit={handleAuth} className="space-y-4">
-            {authMode === 'signup' && (
-              <div>
-                <label className="block text-xs font-semibold text-slate-600 mb-1">Full Name</label>
-                <input required type="text" value={authForm.name} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })} />
-              </div>
-            )}
-            <div>
-              <label className="block text-xs font-semibold text-slate-600 mb-1">Email Address</label>
-              <input required type="email" value={authForm.email} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })} />
+          <div>
+            <div className="flex justify-between items-center mb-1">
+              <label className="block text-xs font-semibold text-slate-600">Password</label>
+              {authMode === 'login' && (
+                <Link to="/forgot-password" className="text-[11px] text-[#0052CC] hover:underline">Forgot password?</Link>
+              )}
             </div>
-            <div>
-              <div className="flex justify-between items-center mb-1">
-                <label className="block text-xs font-semibold text-slate-600">Password</label>
-                {authMode === 'login' && (
-                  <button type="button" onClick={() => { setAuthMode('forgot'); setResetStep('step1'); setError(''); setMessage(''); }} className="text-[11px] text-[#0052CC] hover:underline">Forgot password?</button>
-                )}
-              </div>
-              <input required type="password" value={authForm.password} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} />
-            </div>
-            <button type="submit" disabled={loading} className="w-full py-2.5 bg-[#0052CC] hover:bg-blue-700 font-medium text-xs text-white rounded transition shadow-sm disabled:opacity-50">
-              {loading ? (authMode === 'login' ? 'Signing in...' : 'Creating Account...') : (authMode === 'login' ? 'Sign In' : 'Create Account')}
-            </button>
-          </form>
-        )}
-
-        {authMode !== 'forgot' && (
-          <div className="mt-6 text-center text-xs text-slate-500">
-            {authMode === 'login' ? (
-              <p>Need an account? <button onClick={() => { setAuthMode('signup'); setError(''); setMessage(''); }} className="text-[#0052CC] font-semibold hover:underline">Sign up</button></p>
-            ) : (
-              <p>Already registered? <button onClick={() => { setAuthMode('login'); setError(''); setMessage(''); }} className="text-[#0052CC] font-semibold hover:underline">Log in</button></p>
-            )}
+            <input required type="password" value={authForm.password} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} />
           </div>
-        )}
+          <button type="submit" disabled={loading} className="w-full py-2.5 bg-[#0052CC] hover:bg-blue-700 font-medium text-xs text-white rounded transition shadow-sm disabled:opacity-50">
+            {loading ? (authMode === 'login' ? 'Signing in...' : 'Creating Account...') : (authMode === 'login' ? 'Sign In' : 'Create Account')}
+          </button>
+        </form>
+
+        <div className="mt-6 text-center text-xs text-slate-500">
+          {authMode === 'login' ? (
+            <p>Need an account? <button onClick={() => { setAuthMode('signup'); setError(''); }} className="text-[#0052CC] font-semibold hover:underline">Sign up</button></p>
+          ) : (
+            <p>Already registered? <button onClick={() => { setAuthMode('login'); setError(''); }} className="text-[#0052CC] font-semibold hover:underline">Log in</button></p>
+          )}
+        </div>
       </div>
     </div>
   );
