@@ -281,8 +281,18 @@ function ForgotPasswordRoute() {
 }
 
 function AuthScreen({ initialMode = 'login', setToken, setUser }) {
-  const [authMode, setAuthMode] = useState(initialMode);
-  const [authForm, setAuthForm] = useState({ name: '', email: '', password: '' });
+  // #20: the Agent Console's "Invite" button copies `${origin}?invite=<email>`
+  // — honour it. Landing on the app with that query switches this screen to
+  // signup and pre-fills the invited email. Read once at mount; navigating
+  // within the app never carries an invite.
+  const [invitedBy] = useState(() => {
+    const invite = new URLSearchParams(window.location.search).get('invite');
+    return invite && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(invite) ? invite : null;
+  });
+  const [authMode, setAuthMode] = useState(invitedBy ? 'signup' : initialMode);
+  const [authForm, setAuthForm] = useState(() => (invitedBy
+    ? { name: '', email: invitedBy, password: '' }
+    : { name: '', email: '', password: '' }));
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -331,6 +341,11 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
         </div>
 
         {error && <div className="mb-4 p-3 bg-red-50 border border-red-200 text-red-600 text-xs rounded">{error}</div>}
+        {invitedBy && authMode === 'signup' && (
+          <div className="mb-4 p-3 bg-blue-50 border border-blue-200 text-[#0052CC] text-xs rounded">
+            You were invited by <span className="font-semibold">{invitedBy}</span> — create your account to get started.
+          </div>
+        )}
 
         <form onSubmit={handleAuth} className="space-y-4">
           {authMode === 'signup' && (
@@ -494,11 +509,13 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
   const [selectedGroup, setSelectedGroup] = useState('all');
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  // Shown inside the create-request modal when the POST fails (#19).
+  const [ticketError, setTicketError] = useState('');
   const [chatTicketId, setChatTicketId] = useState(null);
   const [isChatOpen, setIsChatOpen] = useState(false);
-  const [chatMessages, setChatMessages] = useState([
-    { sender: 'agent', senderName: 'IT Support', text: 'Hello! Welcome to SayedFarm IT support. How can I help you today?', time: 'Just now' }
-  ]);
+  // No fabricated chat history (#21): the widget starts empty and only ever
+  // shows messages that were really sent.
+  const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
   const chatBottomRef = useRef(null);
   const location = useLocation();
@@ -523,10 +540,14 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
   });
 
   useEffect(() => {
-    socket.on('receive_message', (incomingMessage) => {
+    // Named handler so cleanup detaches only THIS listener (#22). The old
+    // socket.off('receive_message') with no handler detached every
+    // component's listener on the shared module-level socket.
+    const handler = (incomingMessage) => {
       setChatMessages((prev) => [...prev, incomingMessage]);
-    });
-    return () => { socket.off('receive_message'); };
+    };
+    socket.on('receive_message', handler);
+    return () => { socket.off('receive_message', handler); };
   }, []);
 
   useEffect(() => {
@@ -548,17 +569,33 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
 
   const handleCreateTicket = async (e) => {
     e.preventDefault();
-    await fetch(`${API_URL}/api/tickets`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
-      },
-      body: JSON.stringify(newTicket)
-    });
+    setTicketError('');
+    try {
+      const res = await fetch(`${API_URL}/api/tickets`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(newTicket)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // Keep the modal open and the draft intact so nothing is lost (#19).
+        return setTicketError(data.error || `Could not create the request (HTTP ${res.status}). Please try again.`);
+      }
+      setIsModalOpen(false);
+      setTicketError('');
+      setNewTicket({ title: '', description: '', category: 'Hardware', priority: 'Medium', assigned_to: 'Unassigned', image: '' });
+      fetchTickets();
+    } catch (err) {
+      setTicketError('Network error — could not reach the server. Check your connection and try again.');
+    }
+  };
+
+  const closeTicketModal = () => {
     setIsModalOpen(false);
-    setNewTicket({ title: '', description: '', category: 'Hardware', priority: 'Medium', assigned_to: 'Unassigned', image: '' });
-    fetchTickets();
+    setTicketError('');
   };
 
   const openSpecificModal = (requestTypeTitle, defaultCategory) => {
@@ -570,6 +607,7 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
       assigned_to: 'Unassigned',
       image: ''
     });
+    setTicketError('');
     setIsModalOpen(true);
   };
 
@@ -926,6 +964,11 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
             </div>
 
             <div className="flex-1 p-3 overflow-y-auto space-y-3 bg-slate-50 text-xs">
+              {chatMessages.length === 0 && (
+                <div className="h-full flex items-center justify-center text-slate-400 text-[11px] text-center px-4">
+                  No messages yet — say hello and an available IT agent will reply here.
+                </div>
+              )}
               {chatMessages.map((msg, index) => (
                 <div key={index} className={`flex flex-col ${msg.sender === 'user' ? 'items-end' : 'items-start'}`}>
                   <div className={`max-w-[85%] p-2.5 rounded-lg ${msg.sender === 'user' ? 'bg-[#0052CC] text-white rounded-br-none' : 'bg-white border border-slate-200 text-slate-800 rounded-bl-none shadow-xs'}`}>
@@ -963,11 +1006,12 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
           <div className="bg-white border border-slate-200 rounded-lg shadow-2xl p-6 w-full max-w-lg text-slate-800">
             <div className="flex justify-between items-center mb-4 border-b border-slate-100 pb-3">
               <h2 className="text-base font-bold text-slate-900">{newTicket.title}</h2>
-              <button onClick={() => setIsModalOpen(false)} className="text-slate-400 hover:text-slate-600">
+              <button onClick={closeTicketModal} className="text-slate-400 hover:text-slate-600">
                 <X className="h-5 w-5" />
               </button>
             </div>
             <form onSubmit={handleCreateTicket} className="space-y-4">
+              {ticketError && <div className="p-3 bg-red-50 border border-red-200 text-red-600 text-xs rounded">{ticketError}</div>}
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1">Summary / Issue Title *</label>
                 <input required type="text" value={newTicket.title} onChange={(e) => setNewTicket({ ...newTicket, title: e.target.value })} className="w-full border border-slate-300 rounded p-2 text-xs focus:border-[#0052CC] focus:outline-none" />
@@ -1007,7 +1051,7 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
                 <input type="file" accept="image/*" className="text-xs text-slate-500" onChange={handleImageUpload} />
               </div>
               <div className="flex justify-end gap-2 pt-4 border-t border-slate-100">
-                <button type="button" onClick={() => setIsModalOpen(false)} className="px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-100 rounded">Cancel</button>
+                <button type="button" onClick={closeTicketModal} className="px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-100 rounded">Cancel</button>
                 <button type="submit" className="px-4 py-1.5 bg-[#0052CC] hover:bg-blue-700 text-white font-medium text-xs rounded shadow-sm">Create Request</button>
               </div>
             </form>
@@ -1044,9 +1088,8 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
   const [chatTicketId, setChatTicketId] = useState(null);
   
   const [isChatOpen, setIsChatOpen] = useState(false);
-  const [chatMessages, setChatMessages] = useState([
-    { sender: 'user', senderName: 'Employee', text: 'Hello! I need assistance with my workstation setup.', time: 'Just now' }
-  ]);
+  // No fabricated chat history (#21): starts empty, shows only real messages.
+  const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
   const chatBottomRef = useRef(null);
 
@@ -1062,10 +1105,14 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
   const currentTab = location.pathname.includes('inventory') ? 'inventory' : location.pathname.includes('users') ? 'users' : 'tickets';
 
   useEffect(() => {
-    socket.on('receive_message', (incomingMessage) => {
+    // Named handler so cleanup detaches only THIS listener (#22) — the socket
+    // is shared at module level, so a bare socket.off() nuked every
+    // component's listener for the event.
+    const handler = (incomingMessage) => {
       setChatMessages((prev) => [...prev, incomingMessage]);
-    });
-    return () => { socket.off('receive_message'); };
+    };
+    socket.on('receive_message', handler);
+    return () => { socket.off('receive_message', handler); };
   }, []);
 
   useEffect(() => {
@@ -1076,19 +1123,27 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
 
   const handleCreateAsset = async (e) => {
     e.preventDefault();
-    const res = await fetch(`${API_URL}/api/inventory`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
-      },
-      body: JSON.stringify(newAsset)
-    });
-    const data = await res.json();
-    if (!res.ok) return alert(data.error);
-    setIsAssetModalOpen(false);
-    setNewAsset({ name: '', category: 'Laptop', serial_number: '', assigned_to: 'Unassigned', status: 'In Stock' });
-    fetchInventory();
+    try {
+      const res = await fetch(`${API_URL}/api/inventory`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(newAsset)
+      });
+      // Never render a literal "undefined" dialog (#19): fall back to a real
+      // message when the error body isn't JSON or has no `error` field.
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        return alert(data.error || `Could not create the asset (HTTP ${res.status}). Please try again.`);
+      }
+      setIsAssetModalOpen(false);
+      setNewAsset({ name: '', category: 'Laptop', serial_number: '', assigned_to: 'Unassigned', status: 'In Stock' });
+      fetchInventory();
+    } catch (err) {
+      alert('Network error — could not reach the server. Please try again.');
+    }
   };
 
   const handleUpdateAsset = async (id, updates) => {
@@ -1549,6 +1604,11 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
             </div>
 
             <div className="flex-1 p-3 overflow-y-auto space-y-3 bg-slate-50 text-xs">
+              {chatMessages.length === 0 && (
+                <div className="h-full flex items-center justify-center text-slate-400 text-[11px] text-center px-4">
+                  No live messages yet. Messages from employees appear here in real time.
+                </div>
+              )}
               {chatMessages.map((msg, index) => (
                 <div key={index} className={`flex flex-col ${msg.sender === 'agent' ? 'items-end' : 'items-start'}`}>
                   <div className={`max-w-[85%] p-2.5 rounded-lg ${msg.sender === 'agent' ? 'bg-[#0052CC] text-white rounded-br-none' : 'bg-white border border-slate-200 text-slate-800 rounded-bl-none shadow-xs'}`}>

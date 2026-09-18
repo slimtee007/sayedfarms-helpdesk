@@ -310,7 +310,8 @@ const requireStrings = (obj, fields) => {
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const VALID_TICKET_STATUS = new Set(['Open', 'In Progress', 'Resolved', 'Cancelled']);
 const VALID_TICKET_PRIORITY = new Set(['Low', 'Medium', 'High', 'Urgent']);
-const VALID_TICKET_CATEGORY = new Set(['Hardware', 'Software', 'Network', 'Account', 'Other']);
+// Matches the options the portal form actually offers (incl. 'Access/Security').
+const VALID_TICKET_CATEGORY = new Set(['Hardware', 'Software', 'Network', 'Access/Security', 'Account', 'Other']);
 const VALID_USER_ROLE = new Set(['agent', 'user']);
 const VALID_INVENTORY_STATUS = new Set(['In Stock', 'Assigned', 'In Repair', 'Retired']);
 
