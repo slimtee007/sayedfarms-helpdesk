@@ -42,6 +42,25 @@ Default admin sign-in (development only — override via `ADMIN_EMAIL` /
   emits from unauthenticated sockets and ticket-room joins for tickets you
   don't own are ignored.
 
+## Hardening notes
+
+- **Rate limits (in-memory):** sign-in / password-reset endpoints allow
+  10 attempts per 15 minutes per IP+email; destructive endpoints 30/15 min;
+  general writes 60/min; socket chat 20 messages / 10 s per connection.
+  Exceeding a limit returns `429` with `X-RateLimit-*` headers. For
+  multi-instance deployments, put a shared limiter (e.g. at the reverse
+  proxy) in front — these counters are per-process.
+- **Field allow-lists:** every POST/PATCH only accepts known fields
+  (`id`, `password`, `created_by` etc. can never be rewritten by a client),
+  and enums (ticket status/priority/category, user role, asset status) are
+  validated server-side.
+- The global "Live IT Chat" widget is an ephemeral, all-agents broadcast —
+  nothing is stored. Use a ticket's per-ticket chat for a persisted,
+  room-scoped conversation.
+- `backend/db.json` is the local data store (auto-seeded on first boot,
+  git-ignored). Attachments are currently stored inline as base64 with a
+  ~2 MB cap — move them to file/object storage before real scale.
+
 Required env (see `backend/.env.example`): `JWT_SECRET` (the server refuses
 to boot in production without it), `ADMIN_EMAIL`, `ADMIN_PASSWORD`,
 `CORS_ORIGIN`, `JWT_EXPIRES_IN`.

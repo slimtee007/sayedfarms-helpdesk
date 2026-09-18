@@ -1,6 +1,6 @@
 # SayedFarms Helpdesk — Bug Report & Fix Log
 
-**Branch:** `arena/01a0a90e-sayedfarms-helpdesk` · **Base commit:** `41ae40b`
+**Branch:** `arena/01a0af05-sayedfarms-helpdesk` · **Base:** PR #6 head (`2770f8a`)
 
 Everything below was **reproduced**, not guessed:
 
@@ -9,11 +9,11 @@ Everything below was **reproduced**, not guessed:
 - An AST scope analysis (acorn + acorn-jsx) of every JSX file
 - `node --check` on every backend file, `vite build`, and `oxlint`
 
-Status legend: **FIXED** = fixed in this branch and regression-tested · **OPEN** = diagnosed, not yet fixed.
+Status legend: **FIXED** = fixed in this branch and regression-tested · **OPEN** = diagnosed, not yet fixed · **PARTIAL** = the worst of it is fixed, work remains.
 
 ---
 
-## FIXED in this branch
+## FIXED
 
 ### 1. Blank page on the entire Agent Console (`ReferenceError: chatTicketId is not defined`) — FIXED
 The per-ticket chat feature (merged in PR #4) copied the chat-modal block from `CustomerPortal` into
@@ -53,7 +53,7 @@ loudly instead of exiting. Verified: null, string, and partial payloads now leav
 receive path, echoes are de-duplicated by message id, and a failed send restores the draft and shows an
 inline error instead of swallowing it.
 
-### 4. No authentication or authorization anywhere — FIXED (branch `arena/01a0ae1d-sayedfarms-helpdesk`)
+### 4. No authentication or authorization anywhere — FIXED
 `backend/server.js` now issues real signed JWTs (`jsonwebtoken`, 12 h expiry, `JWT_SECRET` from env —
 refuses to boot in production without one) and verifies them in `requireAuth` / `requireAgent`
 middleware on every non-public endpoint. Passwords are bcrypt hashes (`bcryptjs`, 10 rounds) with a
@@ -63,16 +63,11 @@ evidence row now fails closed: anonymous `GET /api/users`, user delete/promote, 
 ticket close/reassign, and posting as `"Fake IT Admin"` return 401/403 (sender identity for chat is
 derived from the verified session on both REST and sockets). Socket.IO carries the session token in
 `socket.handshake.auth`; unauthenticated emits and ticket-room joins for tickets you don't own are
-ignored. CORS is allow-listable via `CORS_ORIGIN` (Bearer tokens are not ambient credentials, so a
-foreign origin can't ride a session even with the permissive dev default).
+ignored. CORS is allow-listable via `CORS_ORIGIN`.
 
 Also fixed along the way: **#13** (employees' `GET /api/tickets` is server-side scoped to their own;
 agents see all), **#14** (`created_by` id + `created_by_name` stamped from the session, legacy tickets
 backfilled by reporter name), **#16** (signup/login/forgot-password all compare normalised emails).
-Partials: **#11** (admin seed is env-overridable via `ADMIN_EMAIL`/`ADMIN_PASSWORD` and only fires
-when *no* agent exists), **#17** (deleting a user re-homes their ticket/asset assignments to
-`Unassigned`), **#24** (`DELETE` on a missing user/asset id is now 404; OTP compared as strings so a
-JSON-number code is accepted).
 
 Verified: black-box suite against the live backend covering signup/login hashing + JWT shape,
 anonymous access (401 everywhere), employee scoping (own tickets only, cancel-own-only, chat-own-only,
@@ -93,6 +88,97 @@ credentials) before real deployment. Documented in `README.md`.
 form, and the client no longer sends `role` at all. Promotion is agent-only via `PATCH /api/users/:id`
 (which itself now requires an agent session, blocks self-role-change, and blocks demoting the last agent).
 
+### 7. Password reset / login brute-forceable + mass assignment — FIXED (step 3)
+**#7 Rate limiting.** A tiny in-memory sliding-window limiter (no new deps) now sits in front of the
+dangerous endpoints, keyed sensibly per surface:
+
+| surface | limit | key |
+|---|---|---|
+| `login`, `forgot-password`, `resend-otp`, `reset-password` | 10 / 15 min | IP + normalised email |
+| user/asset deletes | 30 / 15 min | IP |
+| all other writes (signup, ticket/asset PATCH/POST, chat) | 60 / min | IP |
+| socket chat emits | 20 msgs / 10 s | connection |
+
+429 responses carry `X-RateLimit-Limit/Remaining/Reset` and a `retryAfter` hint. Buckets are GC'd so
+they can't grow forever. Verified: the 11th bad password in a row returns 429, not 400 ×200.
+
+**#8 Mass assignment.** `Object.assign(record, req.body)` is gone from the codebase. Every POST/PATCH
+reads its body through `pick(body, [allowed fields])`: ticket patches can only touch
+`title/description/category/priority/status/assigned_to/image`; user patches only `role/name`;
+inventory only `name/category/serial_number/assigned_to/status`. `id`, `password`, `created_by`,
+`created_by_name`, `messages` can never be overwritten from a client. Verified: `PATCH /api/tickets/101`
+with `{"id":"hijacked"}` leaves the id intact (previously it orphaned the record). Employees can no
+longer set `assigned_to` on ticket creation either.
+
+### 8. Dead, broken and orphaned code removed — FIXED (step 4a)
+- `backend/controllers/authController.js`, `backend/routes/authRoutes.js`, `backend/models/user.js`
+  (#25): never mounted, wrong-case `require('../models/User')`, called `sendOtpEmail` as a function
+  while the module exports `{ sendOtpEmail, isSmtpConfigured }`, and `models/user.js` was a bare
+  Mongoose fragment (syntax error). Deleted.
+- `frontend/src/const express = require('express');.js` (#26): a 247-line second SQLite backend
+  committed inside `frontend/src/` under a filename that is a line of code. Deleted.
+- `frontend/src/assets/Appbackup.jsx` (#27): 966-line UTF-8-BOM backup imported by nothing. Deleted.
+- `backend/helpdesk.db` (#28): orphaned 28 KB SQLite binary; `sqlite3` was never a dependency. Deleted.
+- `frontend/frontend.env.txt` (#29): setting it as `.env` pointed the browser at the server's
+  localhost, breaking every proxied/preview deployment. Deleted (the `''` default in `App.jsx` is correct).
+- Frontend deps (#30): server-only `nodemailer` and `socket.io` removed (`socket.io-client` is what
+  the browser imports); unused `autoprefixer`/`postcss` removed; stale CJS `tailwind.config.js`
+  (ignored by Tailwind v4) deleted; `index.html` title changed from "frontend" to "SayedFarms Help Desk".
+- `.oxlintrc.json` (#31) now enables `no-undef` with `env: { browser: true }` — the exact rule that
+  would have caught finding #1 — and lint still reports 0 errors.
+
+### 9. Frontend "honesty" fixes — FIXED (step 4b)
+- **#19** `handleCreateTicket` never checked `res.ok` — a failed POST closed the modal, wiped the form
+  and looked like success. It now shows the server's error inside the modal, keeps the draft and the
+  modal open, and catches network errors. `handleCreateAsset`'s `alert(data.error)` rendered a literal
+  "undefined" dialog on non-JSON bodies; it now falls back to a real message.
+- **#20** The invite link went nowhere: `${origin}?invite=email` was copied but never parsed. The
+  auth screen now honours it — switches to signup, pre-fills the invited email, shows an
+  "invited by" banner; plain logins are unaffected.
+- **#21** Fabricated chat history removed: both chat widgets seeded invented messages styled as real
+  correspondence and replayed them on every reload. Both start empty now, with an honest empty-state hint.
+- **#22** `socket.off('receive_message')` with no handler detached **every** component's listener on
+  the shared module-level socket (mounting the console silently killed the portal's chat and vice
+  versa). Both widgets now register/unregister a named handler.
+- Also fixed a step-3 regression found during verification: the server's category allow-list had
+  `Account` while the form offers `Access/Security` (used by 4 portal cards), silently coercing those
+  tickets to `Hardware`. Validator now matches the form.
+
+Verified in jsdom (fresh DOM per scenario, 15/15 checks green): invite prefill + banner, plain login
+unaffected, chat opens empty with hint, no fabricated greeting, portal's listener registered and
+unmount removes only its own while a foreign listener survives, failed create shows the inline error,
+modal stays open and the draft is preserved.
+
+### 10. Input validation + id collisions + JSON 404s — FIXED (step 3, with #8)
+- **#15** Empty/garbage bodies now fail with 400: title/description required on tickets (length caps
+  on title/name/password), asset `name/category/serial_number` required, enum validation for ticket
+  status/priority/category, user role, inventory status. `1-character passwords` were already rejected
+  in step 1; signup now also caps name/password length.
+- **#18** `Date.now()` primary keys collided under concurrency (6 concurrent signups → 5 unique ids;
+  `DELETE` used `filter` so a collision deleted both accounts). All ids now come from a monotonic
+  `genId(prefix)` (ms timestamp + always-advancing counter).
+- **#24 (most)** `GET /api/nope` returns JSON 404 (was an HTML page the frontend's `res.json()`
+  choked on); a JSON error middleware ensures thrown errors never leak stack traces; duplicate asset
+  serial numbers are rejected on create and update; OTP codes are compared as strings; missing
+  user/asset/ticket ids return 404. *Still open:* reset codes live in memory only.
+- **#10** Account enumeration: `forgot-password`/`resend-otp` return the same generic response
+  whether the email exists or not (when SMTP is configured), and `reset-password` no longer 404s on
+  unknown emails. Login was already uniform.
+
+### 12. Forgot-password is a dead end as shipped — FIXED
+`/forgot-password` now renders the existing `src/pages/ForgotPassword.jsx` (via a `ForgotPasswordRoute`
+wrapper that navigates back to `/login`), and the ~150-line inline duplicate was deleted from
+`AuthScreen`, which is login/signup only again. The wired-up component honours the server's response
+contract: `devOtp` renders the development-code box when SMTP isn't configured, `emailSent` drives the
+step-2 copy, and success auto-redirects to sign-in. Small consistency pass on the revived component:
+API base comes from an `apiBase` prop (same `VITE_API_URL || ''` value as the rest of the app),
+accent colour aligned to the app's `#0052CC`, email placeholder typo fixed. The login form's
+"Forgot password?" link routes to `/forgot-password`.
+
+Verified: `vite build` + `oxlint` clean; `ForgotPassword` rendered in jsdom — a mocked SMTP-down
+response shows the dev code box, a mocked SMTP-up response shows the inbox message with no dev code,
+reset success auto-redirects, and no `resetStep`/`handleRequestOtp` remnants remain in `App.jsx`.
+
 ---
 
 ## OPEN — security (fix before any real deployment)
@@ -102,45 +188,41 @@ form, and the client no longer sends `role` at all. Promotion is agent-only via 
 | 4 | ~~No authentication or authorization anywhere~~ — **FIXED**, see FIXED §4. | — |
 | 5 | ~~Plaintext passwords committed to git~~ — **tracking FIXED**, see FIXED §5; **history purge still required.** | — |
 | 6 | ~~Anyone can self-register as an IT Agent~~ — **FIXED**, see FIXED §6. | — |
-| 7 | **Password reset / login are brute-forceable.** 200 wrong OTPs → all HTTP 400, no lockout or delay (10⁶ keyspace, 10-minute validity); 40 wrong admin passwords → all HTTP 400. No rate limiter installed. | `server.js:224-227` |
-| 8 | **Mass assignment.** `Object.assign(ticket, req.body)` let a client rewrite a ticket's primary key to `"hijacked"`, orphaning the record; same pattern on inventory. | `server.js:292,336` |
-| 9 | **Live chat broadcasts every conversation to every connected client** (`io.emit`), and nothing is persisted. | `server.js:349` |
-| 10 | **Account enumeration** on forgot-password (404 vs 200). | `server.js:137` |
-| 11 | **Default admin credentials hard-coded and re-seeded on every boot** (`admin@sayedfarms.com` / `Admin@12345`), even if deleted. **PARTIAL:** seed is now env-overridable (`ADMIN_EMAIL`/`ADMIN_PASSWORD`, bcrypt-hashed) and only fires when *no* agent exists; the documented dev default remains for local first boot. | `server.js` ensure-admin block |
+| 7 | ~~Password reset / login are brute-forceable~~ — **FIXED**, see FIXED §7 (in-memory limiter; put a reverse-proxy limiter in front for multi-instance deployments). | — |
+| 8 | ~~Mass assignment~~ — **FIXED**, see FIXED §7 (`pick()` allow-lists everywhere). | — |
+| 9 | **Global chat broadcasts to every connected client and persists nothing.** PARTIAL: per-ticket chat is persisted and room-scoped (§4); the global "live chat" widget is still an ephemeral broadcast by design — now only reachable by verified sessions and rate-limited, but conversations are not stored. Decide: persist + scope it, or remove the widget. | `server.js` `send_message` |
+| 10 | ~~Account enumeration on forgot-password~~ — **FIXED**, see FIXED §10. | — |
+| 11 | **Default admin credentials hard-coded and re-seeded on every boot**. PARTIAL: seed is env-overridable (`ADMIN_EMAIL`/`ADMIN_PASSWORD`, bcrypt-hashed) and only fires when *no* agent exists; the documented dev default remains for local first boot. | `server.js` ensure-admin block |
 
 ## OPEN — functional
 
 | # | Finding | Evidence |
 |---|---|---|
-| 12 | **Forgot-password is a dead end as shipped.** With no `backend/.env` the backend honestly returns `emailSent:false` + `devOtp`, but the live UI reads neither and always says "Verification code sent! Check your inbox." The README promises the opposite, and a correct implementation already exists in the **unused** `src/pages/ForgotPassword.jsx`. Wire that component up and delete the inline duplicate. | `App.jsx:208-231` vs `src/pages/ForgotPassword.jsx` |
+| 12 | ~~Forgot-password is a dead end as shipped~~ — **FIXED**, see FIXED §12. | — |
 | 13 | ~~No per-user ticket scoping~~ — **FIXED** with §4 (server-side scoping; employees see own tickets only). | — |
 | 14 | ~~Reporter identity lost~~ — **FIXED** with §4 (`created_by` + `created_by_name` from session; legacy backfilled). | — |
-| 15 | **No input validation**: empty signup/ticket/asset bodies all return 200; 1-character passwords accepted on signup and reset. | `server.js:174-183,270-287,318-331` |
+| 15 | ~~No input validation~~ — **FIXED**, see FIXED §10 (required fields, enums, length caps). | — |
 | 16 | ~~Duplicate-email guard bypassable by case~~ — **FIXED** with §4 (all comparisons normalised; signup rejects case variants). | — |
-| 17 | **Assignments keyed by display name**, not id: renaming a user orphans every ticket/asset assignment; duplicate names are indistinguishable. **PARTIAL:** deleting a user now re-homes their assignments to `Unassigned` instead of stranding them; id-keyed assignments still open. | `server.js` DELETE user |
-| 18 | **`Date.now()` primary keys collide** (6 concurrent signups → 5 unique ids); `DELETE /api/users/:id` uses `filter`, so a collision deletes both accounts. | `server.js:179,241,273,321` |
-| 19 | **Ticket creation swallows failures** — `handleCreateTicket` never checks `res.ok`, then closes the modal and clears the form, so a failed POST looks like success. `handleCreateAsset` does `alert(data.error)` with no fallback → literal "undefined" dialog. | `App.jsx:611-624,1146` |
-| 20 | **Invite link goes nowhere**: `${origin}?invite=email` is copied but the query string is never parsed and no email is sent. | `App.jsx:1226,1536` |
-| 21 | **Fabricated chat history**: both chat widgets are pre-seeded with invented messages styled as real correspondence; not persisted, reappears on every reload. | `App.jsx:562,1106` |
-| 22 | **`socket.off('receive_message')` with no handler** detaches *all* listeners for that event on the shared module-level socket. | `App.jsx:591,1126` |
-| 23 | **Attachments base64-inlined into `db.json`**, which is rewritten in full (synchronous `writeFileSync`) on every chat message: 10 messages grew it 490 KB; one small screenshot added 196 KB that is re-sent to every client on every `GET /api/tickets`. | `server.js:70-72,113`, `App.jsx:600-609` |
-| 24 | **No 404 handler / error middleware**: `GET /api/nope` → HTML 404 that the frontend's `res.json()` chokes on. Issued reset codes live only in memory, so any restart voids them. Duplicate serial numbers accepted. **PARTIAL:** `DELETE` on a missing user/asset id is now 404; OTP compared as strings so a JSON-number code is accepted. | `server.js` |
+| 17 | **Assignments still keyed by display name**, not id: renaming a user orphans every ticket/asset assignment; duplicate names are indistinguishable. PARTIAL: deleting a user re-homes their assignments to `Unassigned` (by id or name); id-keyed assignments still open. | `server.js` PATCH user |
+| 18 | ~~`Date.now()` primary keys collide~~ — **FIXED**, see FIXED §10 (monotonic `genId`). | — |
+| 19 | ~~Ticket creation swallows failures~~ — **FIXED**, see FIXED §9. | — |
+| 20 | ~~Invite link goes nowhere~~ — **FIXED**, see FIXED §9. | — |
+| 21 | ~~Fabricated chat history~~ — **FIXED**, see FIXED §9. | — |
+| 22 | ~~`socket.off` with no handler detaches all listeners~~ — **FIXED**, see FIXED §9. | — |
+| 23 | **Attachments base64-inlined into `db.json`**, which is rewritten in full on every chat message. PARTIAL: new ticket images are capped (~2 MB) so the worst bloat is bounded; the inline-base64 storage design remains. Move attachments to files/object storage with a size limit. | `server.js`, `App.jsx` |
+| 24 | **Fragments remaining**: reset codes live only in memory, so any restart voids them (move to the DB or accept the UX). Everything else in the original finding is fixed — JSON 404s, error middleware, duplicate serial rejection, string OTP compare. | `otpStore` |
 
-## OPEN — dead code & repo hygiene
+## OPEN — repo hygiene
 
 | # | Finding |
 |---|---|
-| 25 | **Three backend modules cannot load**: `models/user.js` is a syntax error (bare Mongoose fragment); `controllers/authController.js` + `routes/authRoutes.js` `require('../models/User')` (wrong case → fails on Linux) and would call `sendOtpEmail` as a function when the module exports `{ sendOtpEmail, isSmtpConfigured }`. None are mounted in `server.js`. |
-| 26 | **`frontend/src/const express = require('express');.js`** — a complete second SQLite backend (247 lines) committed inside `frontend/src/` under a filename that is a line of code. |
-| 27 | **`frontend/src/assets/Appbackup.jsx`** (966 lines, UTF-8 BOM) and `frontend/src/pages/{AuthScreen,ForgotPassword}.jsx` are imported by nothing — except #12, which *should* use ForgotPassword.jsx. |
-| 28 | **`backend/helpdesk.db`** — orphaned 28 KB SQLite binary in git; `sqlite3` is not a dependency of anything. |
-| 29 | **`frontend/frontend.env.txt`** committed; renaming it to `.env` sets `VITE_API_URL=http://localhost:5000`, which breaks every proxied/preview deployment (the browser can't reach the server's localhost). The `''` default in `App.jsx:9` is correct. |
-| 30 | **Server-only packages in frontend deps** (`nodemailer`, `socket.io`); **`tailwind.config.js`** is CommonJS in a `"type":"module"` package and ignored by Tailwind v4; `postcss`/`autoprefixer` unused; **`index.html` title is "frontend"**; **no tests/CI** (`npm test` exits 1 by design). |
-| 31 | **`oxlint` runs clean-ish but never enables `no-undef`** — which is exactly why finding #1 shipped. Verified: adding `"env": {"browser": true}` + `"rules": {"no-undef": "error"}` to `frontend/.oxlintrc.json` reports the three offending lines as errors. Wiring `npm run lint` into CI is the cheapest guard against this class of bug. |
+| 25–29 | ~~Dead/broken/orphaned files~~ — **FIXED**, see FIXED §8 (all deleted). |
+| 30 | ~~Server-only deps, dead tailwind config, "frontend" title~~ — **FIXED** (§8). **Remaining:** there is still no test suite / CI wiring (`npm test` is a stub). |
+| 31 | ~~`no-undef` never enabled~~ — **FIXED** (§8: enabled with `browser:true`, 0 errors). **Remaining:** no CI job runs the linter/build yet. |
 
 ## Suggested order for the remaining work
 
-1. ~~**#4 + #6 + #5**~~ — **DONE** (plus #13, #14, #16; partials on #11, #17, #24). Remaining: purge `db.json` from main's history (see FIXED §5).
-2. **#12** — route `/forgot-password` to the existing `src/pages/ForgotPassword.jsx`.
-3. **#7, #8** — rate limiting and an allow-list of patchable fields.
-4. Then the remaining functional and hygiene items; #25-#28 are pure deletions.
+1. ~~#4 + #6 + #5~~ — **DONE** (plus #13, #14, #16; partials on #11, #17, #24). Remaining: purge `db.json` from main's history (see FIXED §5).
+2. ~~#12~~ — **DONE** (see FIXED §12).
+3. ~~#7, #8~~ — **DONE** (plus #15, #18, #10, most of #24; see FIXED §7/§10).
+4. ~~Remaining functional + hygiene~~ — **DONE** for #19–#22, #25–#29, #30/#31 cleanups (see FIXED §8/§9). Still open: #9 (global chat design), #11 (admin seed policy), #17 (id-keyed assignments), #23 (attachment storage), #24 (persist reset codes), test/CI wiring, and the history purge from #5.

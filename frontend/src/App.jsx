@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, Navigate, Link, useLocation } from 'react-router-dom';
 import { io } from 'socket.io-client';
 import { Activity, Plus, ShieldCheck, User, LogOut, Image as ImageIcon, X, Paperclip, Users, Ticket, UserPlus, Copy, Check, Trash2, Box, PackagePlus, ChevronRight, Search, Headphones, KeyRound, AlertCircle, Monitor, Laptop, FilePlus, ChevronDown, Filter, MessageSquare, Send } from 'lucide-react';
+import ForgotPassword from './pages/ForgotPassword.jsx';
 
 // Same-origin by default: in dev, Vite proxies /api and /socket.io to the
 // backend; in production the frontend is expected to be served from the same
@@ -213,9 +214,9 @@ function MainRouter() {
         path="/signup" 
         element={!loggedIn ? <AuthScreen initialMode="signup" setToken={setToken} setUser={setUser} /> : <Navigate to={user?.role === 'agent' ? '/agent/tickets' : '/portal'} />} 
       />
-      <Route 
-        path="/forgot-password" 
-        element={<AuthScreen initialMode="forgot" setToken={setToken} setUser={setUser} />} 
+      <Route
+        path="/forgot-password"
+        element={<ForgotPasswordRoute />}
       />
 
       {/* Customer / Employee Portal Routes */}
@@ -268,33 +269,38 @@ function MainRouter() {
   );
 }
 
-function AuthScreen({ initialMode = 'login', setToken, setUser }) {
-  const [authMode, setAuthMode] = useState(initialMode);
-  const [authForm, setAuthForm] = useState({ name: '', email: '', password: '', otp: '' });
-  const [resetStep, setResetStep] = useState('step1'); // 'step1' for email input/OTP request, 'step2' for OTP verification & new password
-  const [error, setError] = useState('');
-  const [message, setMessage] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [resendCooldown, setResendCooldown] = useState(0);
-  const [isResending, setIsResending] = useState(false);
-  
+// Standalone password-reset page. ForgotPassword honours the server's
+// emailSent/devOtp response contract, unlike the old inline form it replaces.
+function ForgotPasswordRoute() {
   const navigate = useNavigate();
+  return (
+    <div className="min-h-screen bg-slate-100 text-slate-800 flex items-center justify-center p-4 font-sans">
+      <ForgotPassword onBackToLogin={() => navigate('/login')} apiBase={API_URL} />
+    </div>
+  );
+}
 
-  // Countdown timer for resend OTP cooldown
-  useEffect(() => {
-    let timer;
-    if (resendCooldown > 0) {
-      timer = setInterval(() => {
-        setResendCooldown((prev) => prev - 1);
-      }, 1000);
-    }
-    return () => clearInterval(timer);
-  }, [resendCooldown]);
+function AuthScreen({ initialMode = 'login', setToken, setUser }) {
+  // #20: the Agent Console's "Invite" button copies `${origin}?invite=<email>`
+  // — honour it. Landing on the app with that query switches this screen to
+  // signup and pre-fills the invited email. Read once at mount; navigating
+  // within the app never carries an invite.
+  const [invitedBy] = useState(() => {
+    const invite = new URLSearchParams(window.location.search).get('invite');
+    return invite && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(invite) ? invite : null;
+  });
+  const [authMode, setAuthMode] = useState(invitedBy ? 'signup' : initialMode);
+  const [authForm, setAuthForm] = useState(() => (invitedBy
+    ? { name: '', email: invitedBy, password: '' }
+    : { name: '', email: '', password: '' }));
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const navigate = useNavigate();
 
   const handleAuth = async (e) => {
     e.preventDefault();
     setError('');
-    setMessage('');
     setLoading(true);
 
     try {
@@ -324,80 +330,6 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
     }
   };
 
-  const handleRequestOtp = async (e) => {
-    e.preventDefault();
-    setError('');
-    setMessage('');
-    setLoading(true);
-
-    try {
-      const res = await fetch(`${API_URL}/api/auth/forgot-password`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: authForm.email })
-      });
-      const data = await res.json();
-      if (!res.ok) return setError(data.error || 'Failed to send verification code.');
-
-      setMessage('Verification code sent! Check your inbox.');
-      setResetStep('step2');
-      setResendCooldown(30);
-    } catch (err) {
-      setError('Failed to send verification code. Please try again.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleResendOtp = async () => {
-    setError('');
-    setMessage('');
-    setIsResending(true);
-
-    try {
-      const res = await fetch(`${API_URL}/api/auth/resend-otp`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: authForm.email })
-      });
-      const data = await res.json();
-      if (!res.ok) return setError(data.error || 'Failed to resend OTP.');
-
-      setMessage('A new verification code has been generated!');
-      setResendCooldown(30);
-    } catch (err) {
-      setError('Failed to resend OTP. Please try again.');
-    } finally {
-      setIsResending(false);
-    }
-  };
-
-  const handleResetPassword = async (e) => {
-    e.preventDefault();
-    setError('');
-    setMessage('');
-    setLoading(true);
-
-    try {
-      const res = await fetch(`${API_URL}/api/auth/reset-password`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: authForm.email, otp: authForm.otp, password: authForm.password })
-      });
-      const data = await res.json();
-      if (!res.ok) return setError(data.error || 'Failed to reset password.');
-
-      alert('Password updated successfully! Please sign in with your new password.');
-      setAuthMode('login');
-      setResetStep('step1');
-      setAuthForm({ name: '', email: '', password: '', otp: '' });
-    } catch (err) {
-      setError('Failed to reset password. Please try again.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
   return (
     <div className="min-h-screen bg-slate-100 text-slate-800 flex items-center justify-center p-4 font-sans">
       <div className="bg-white border border-slate-200 p-8 rounded-lg w-full max-w-md shadow-md">
@@ -409,154 +341,44 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
         </div>
 
         {error && <div className="mb-4 p-3 bg-red-50 border border-red-200 text-red-600 text-xs rounded">{error}</div>}
-        {message && <div className="mb-4 p-3 bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs rounded">{message}</div>}
-        
-        {authMode === 'forgot' ? (
+        {invitedBy && authMode === 'signup' && (
+          <div className="mb-4 p-3 bg-blue-50 border border-blue-200 text-[#0052CC] text-xs rounded">
+            You were invited by <span className="font-semibold">{invitedBy}</span> — create your account to get started.
+          </div>
+        )}
+
+        <form onSubmit={handleAuth} className="space-y-4">
+          {authMode === 'signup' && (
+            <div>
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Full Name</label>
+              <input required type="text" value={authForm.name} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })} />
+            </div>
+          )}
           <div>
-            {resetStep === 'step1' ? (
-              <form onSubmit={handleRequestOtp} className="space-y-4">
-                <div className="text-xs text-slate-600 mb-2">
-                  Enter your registered work email address. We will send a verification OTP code to your email to reset your account access.
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-600 mb-1">Email Address</label>
-                  <input 
-                    required 
-                    type="email" 
-                    placeholder="name@sayedfarms.com"
-                    value={authForm.email} 
-                    className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" 
-                    onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })} 
-                  />
-                </div>
-                <button type="submit" disabled={loading} className="w-full py-2.5 bg-[#0052CC] hover:bg-blue-700 font-medium text-xs text-white rounded transition shadow-sm disabled:opacity-50">
-                  {loading ? 'Sending Code...' : 'Send Verification Code'}
-                </button>
-                <div className="text-center text-xs text-slate-500 pt-2">
-                  <button 
-                    type="button" 
-                    onClick={() => { 
-                      setAuthMode('login'); 
-                      setResetStep('step1'); 
-                      setError('');
-                      setMessage('');
-                      setAuthForm({ name: '', email: '', password: '', otp: '' }); 
-                    }} 
-                    className="text-[#0052CC] font-semibold hover:underline"
-                  >
-                    Back to Sign In
-                  </button>
-                </div>
-              </form>
-            ) : (
-              <form onSubmit={handleResetPassword} className="space-y-4">
-                <div className="text-xs text-slate-600 mb-2">
-                  Enter the verification code sent to <span className="font-semibold text-slate-800">{authForm.email}</span> along with your new password.
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-600 mb-1">Verification Code (OTP)</label>
-                  <input 
-                    required 
-                    type="text" 
-                    placeholder="Enter 6-digit OTP" 
-                    maxLength="6"
-                    value={authForm.otp} 
-                    className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs font-mono tracking-wider focus:bg-white focus:border-[#0052CC] focus:outline-none" 
-                    onChange={(e) => setAuthForm({ ...authForm, otp: e.target.value })} 
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-600 mb-1">New Password</label>
-                  <input 
-                    required 
-                    type="password" 
-                    placeholder="Enter new password"
-                    value={authForm.password} 
-                    className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" 
-                    onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} 
-                  />
-                </div>
-                <button type="submit" disabled={loading} className="w-full py-2.5 bg-[#0052CC] hover:bg-blue-700 font-medium text-xs text-white rounded transition shadow-sm disabled:opacity-50">
-                  {loading ? 'Resetting Password...' : 'Reset Password'}
-                </button>
-
-                {/* Side-by-Side Action Bar: Change Email & Resend OTP */}
-                <div className="text-xs text-slate-500 pt-2 flex justify-between items-center">
-                  <button 
-                    type="button" 
-                    onClick={() => { setResetStep('step1'); setError(''); setMessage(''); }} 
-                    className="text-slate-600 hover:underline"
-                  >
-                    Change Email
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleResendOtp}
-                    disabled={resendCooldown > 0 || isResending}
-                    className={`font-semibold hover:underline ${resendCooldown > 0 ? 'text-slate-400 cursor-not-allowed' : 'text-[#0052CC]'}`}
-                  >
-                    {resendCooldown > 0
-                      ? `Resend OTP in ${resendCooldown}s`
-                      : isResending
-                      ? 'Resending...'
-                      : 'Resend OTP'}
-                  </button>
-                </div>
-
-                <div className="text-center text-xs text-slate-500 pt-2">
-                  <button 
-                    type="button" 
-                    onClick={() => { 
-                      setAuthMode('login'); 
-                      setResetStep('step1'); 
-                      setError('');
-                      setMessage('');
-                      setAuthForm({ name: '', email: '', password: '', otp: '' }); 
-                    }} 
-                    className="text-slate-500 hover:underline"
-                  >
-                    Back to Sign In
-                  </button>
-                </div>
-              </form>
-            )}
+            <label className="block text-xs font-semibold text-slate-600 mb-1">Email Address</label>
+            <input required type="email" value={authForm.email} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })} />
           </div>
-        ) : (
-          <form onSubmit={handleAuth} className="space-y-4">
-            {authMode === 'signup' && (
-              <div>
-                <label className="block text-xs font-semibold text-slate-600 mb-1">Full Name</label>
-                <input required type="text" value={authForm.name} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })} />
-              </div>
-            )}
-            <div>
-              <label className="block text-xs font-semibold text-slate-600 mb-1">Email Address</label>
-              <input required type="email" value={authForm.email} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })} />
+          <div>
+            <div className="flex justify-between items-center mb-1">
+              <label className="block text-xs font-semibold text-slate-600">Password</label>
+              {authMode === 'login' && (
+                <Link to="/forgot-password" className="text-[11px] text-[#0052CC] hover:underline">Forgot password?</Link>
+              )}
             </div>
-            <div>
-              <div className="flex justify-between items-center mb-1">
-                <label className="block text-xs font-semibold text-slate-600">Password</label>
-                {authMode === 'login' && (
-                  <button type="button" onClick={() => { setAuthMode('forgot'); setResetStep('step1'); setError(''); setMessage(''); }} className="text-[11px] text-[#0052CC] hover:underline">Forgot password?</button>
-                )}
-              </div>
-              <input required type="password" value={authForm.password} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} />
-            </div>
-            <button type="submit" disabled={loading} className="w-full py-2.5 bg-[#0052CC] hover:bg-blue-700 font-medium text-xs text-white rounded transition shadow-sm disabled:opacity-50">
-              {loading ? (authMode === 'login' ? 'Signing in...' : 'Creating Account...') : (authMode === 'login' ? 'Sign In' : 'Create Account')}
-            </button>
-          </form>
-        )}
-
-        {authMode !== 'forgot' && (
-          <div className="mt-6 text-center text-xs text-slate-500">
-            {authMode === 'login' ? (
-              <p>Need an account? <button onClick={() => { setAuthMode('signup'); setError(''); setMessage(''); }} className="text-[#0052CC] font-semibold hover:underline">Sign up</button></p>
-            ) : (
-              <p>Already registered? <button onClick={() => { setAuthMode('login'); setError(''); setMessage(''); }} className="text-[#0052CC] font-semibold hover:underline">Log in</button></p>
-            )}
+            <input required type="password" value={authForm.password} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} />
           </div>
-        )}
+          <button type="submit" disabled={loading} className="w-full py-2.5 bg-[#0052CC] hover:bg-blue-700 font-medium text-xs text-white rounded transition shadow-sm disabled:opacity-50">
+            {loading ? (authMode === 'login' ? 'Signing in...' : 'Creating Account...') : (authMode === 'login' ? 'Sign In' : 'Create Account')}
+          </button>
+        </form>
+
+        <div className="mt-6 text-center text-xs text-slate-500">
+          {authMode === 'login' ? (
+            <p>Need an account? <button onClick={() => { setAuthMode('signup'); setError(''); }} className="text-[#0052CC] font-semibold hover:underline">Sign up</button></p>
+          ) : (
+            <p>Already registered? <button onClick={() => { setAuthMode('login'); setError(''); }} className="text-[#0052CC] font-semibold hover:underline">Log in</button></p>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -687,11 +509,13 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
   const [selectedGroup, setSelectedGroup] = useState('all');
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  // Shown inside the create-request modal when the POST fails (#19).
+  const [ticketError, setTicketError] = useState('');
   const [chatTicketId, setChatTicketId] = useState(null);
   const [isChatOpen, setIsChatOpen] = useState(false);
-  const [chatMessages, setChatMessages] = useState([
-    { sender: 'agent', senderName: 'IT Support', text: 'Hello! Welcome to SayedFarm IT support. How can I help you today?', time: 'Just now' }
-  ]);
+  // No fabricated chat history (#21): the widget starts empty and only ever
+  // shows messages that were really sent.
+  const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
   const chatBottomRef = useRef(null);
   const location = useLocation();
@@ -716,10 +540,14 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
   });
 
   useEffect(() => {
-    socket.on('receive_message', (incomingMessage) => {
+    // Named handler so cleanup detaches only THIS listener (#22). The old
+    // socket.off('receive_message') with no handler detached every
+    // component's listener on the shared module-level socket.
+    const handler = (incomingMessage) => {
       setChatMessages((prev) => [...prev, incomingMessage]);
-    });
-    return () => { socket.off('receive_message'); };
+    };
+    socket.on('receive_message', handler);
+    return () => { socket.off('receive_message', handler); };
   }, []);
 
   useEffect(() => {
@@ -741,17 +569,33 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
 
   const handleCreateTicket = async (e) => {
     e.preventDefault();
-    await fetch(`${API_URL}/api/tickets`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
-      },
-      body: JSON.stringify(newTicket)
-    });
+    setTicketError('');
+    try {
+      const res = await fetch(`${API_URL}/api/tickets`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(newTicket)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // Keep the modal open and the draft intact so nothing is lost (#19).
+        return setTicketError(data.error || `Could not create the request (HTTP ${res.status}). Please try again.`);
+      }
+      setIsModalOpen(false);
+      setTicketError('');
+      setNewTicket({ title: '', description: '', category: 'Hardware', priority: 'Medium', assigned_to: 'Unassigned', image: '' });
+      fetchTickets();
+    } catch (err) {
+      setTicketError('Network error — could not reach the server. Check your connection and try again.');
+    }
+  };
+
+  const closeTicketModal = () => {
     setIsModalOpen(false);
-    setNewTicket({ title: '', description: '', category: 'Hardware', priority: 'Medium', assigned_to: 'Unassigned', image: '' });
-    fetchTickets();
+    setTicketError('');
   };
 
   const openSpecificModal = (requestTypeTitle, defaultCategory) => {
@@ -763,6 +607,7 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
       assigned_to: 'Unassigned',
       image: ''
     });
+    setTicketError('');
     setIsModalOpen(true);
   };
 
@@ -1119,6 +964,11 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
             </div>
 
             <div className="flex-1 p-3 overflow-y-auto space-y-3 bg-slate-50 text-xs">
+              {chatMessages.length === 0 && (
+                <div className="h-full flex items-center justify-center text-slate-400 text-[11px] text-center px-4">
+                  No messages yet — say hello and an available IT agent will reply here.
+                </div>
+              )}
               {chatMessages.map((msg, index) => (
                 <div key={index} className={`flex flex-col ${msg.sender === 'user' ? 'items-end' : 'items-start'}`}>
                   <div className={`max-w-[85%] p-2.5 rounded-lg ${msg.sender === 'user' ? 'bg-[#0052CC] text-white rounded-br-none' : 'bg-white border border-slate-200 text-slate-800 rounded-bl-none shadow-xs'}`}>
@@ -1156,11 +1006,12 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
           <div className="bg-white border border-slate-200 rounded-lg shadow-2xl p-6 w-full max-w-lg text-slate-800">
             <div className="flex justify-between items-center mb-4 border-b border-slate-100 pb-3">
               <h2 className="text-base font-bold text-slate-900">{newTicket.title}</h2>
-              <button onClick={() => setIsModalOpen(false)} className="text-slate-400 hover:text-slate-600">
+              <button onClick={closeTicketModal} className="text-slate-400 hover:text-slate-600">
                 <X className="h-5 w-5" />
               </button>
             </div>
             <form onSubmit={handleCreateTicket} className="space-y-4">
+              {ticketError && <div className="p-3 bg-red-50 border border-red-200 text-red-600 text-xs rounded">{ticketError}</div>}
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1">Summary / Issue Title *</label>
                 <input required type="text" value={newTicket.title} onChange={(e) => setNewTicket({ ...newTicket, title: e.target.value })} className="w-full border border-slate-300 rounded p-2 text-xs focus:border-[#0052CC] focus:outline-none" />
@@ -1200,7 +1051,7 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
                 <input type="file" accept="image/*" className="text-xs text-slate-500" onChange={handleImageUpload} />
               </div>
               <div className="flex justify-end gap-2 pt-4 border-t border-slate-100">
-                <button type="button" onClick={() => setIsModalOpen(false)} className="px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-100 rounded">Cancel</button>
+                <button type="button" onClick={closeTicketModal} className="px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-100 rounded">Cancel</button>
                 <button type="submit" className="px-4 py-1.5 bg-[#0052CC] hover:bg-blue-700 text-white font-medium text-xs rounded shadow-sm">Create Request</button>
               </div>
             </form>
@@ -1237,9 +1088,8 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
   const [chatTicketId, setChatTicketId] = useState(null);
   
   const [isChatOpen, setIsChatOpen] = useState(false);
-  const [chatMessages, setChatMessages] = useState([
-    { sender: 'user', senderName: 'Employee', text: 'Hello! I need assistance with my workstation setup.', time: 'Just now' }
-  ]);
+  // No fabricated chat history (#21): starts empty, shows only real messages.
+  const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
   const chatBottomRef = useRef(null);
 
@@ -1255,10 +1105,14 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
   const currentTab = location.pathname.includes('inventory') ? 'inventory' : location.pathname.includes('users') ? 'users' : 'tickets';
 
   useEffect(() => {
-    socket.on('receive_message', (incomingMessage) => {
+    // Named handler so cleanup detaches only THIS listener (#22) — the socket
+    // is shared at module level, so a bare socket.off() nuked every
+    // component's listener for the event.
+    const handler = (incomingMessage) => {
       setChatMessages((prev) => [...prev, incomingMessage]);
-    });
-    return () => { socket.off('receive_message'); };
+    };
+    socket.on('receive_message', handler);
+    return () => { socket.off('receive_message', handler); };
   }, []);
 
   useEffect(() => {
@@ -1269,19 +1123,27 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
 
   const handleCreateAsset = async (e) => {
     e.preventDefault();
-    const res = await fetch(`${API_URL}/api/inventory`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`
-      },
-      body: JSON.stringify(newAsset)
-    });
-    const data = await res.json();
-    if (!res.ok) return alert(data.error);
-    setIsAssetModalOpen(false);
-    setNewAsset({ name: '', category: 'Laptop', serial_number: '', assigned_to: 'Unassigned', status: 'In Stock' });
-    fetchInventory();
+    try {
+      const res = await fetch(`${API_URL}/api/inventory`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(newAsset)
+      });
+      // Never render a literal "undefined" dialog (#19): fall back to a real
+      // message when the error body isn't JSON or has no `error` field.
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        return alert(data.error || `Could not create the asset (HTTP ${res.status}). Please try again.`);
+      }
+      setIsAssetModalOpen(false);
+      setNewAsset({ name: '', category: 'Laptop', serial_number: '', assigned_to: 'Unassigned', status: 'In Stock' });
+      fetchInventory();
+    } catch (err) {
+      alert('Network error — could not reach the server. Please try again.');
+    }
   };
 
   const handleUpdateAsset = async (id, updates) => {
@@ -1742,6 +1604,11 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
             </div>
 
             <div className="flex-1 p-3 overflow-y-auto space-y-3 bg-slate-50 text-xs">
+              {chatMessages.length === 0 && (
+                <div className="h-full flex items-center justify-center text-slate-400 text-[11px] text-center px-4">
+                  No live messages yet. Messages from employees appear here in real time.
+                </div>
+              )}
               {chatMessages.map((msg, index) => (
                 <div key={index} className={`flex flex-col ${msg.sender === 'agent' ? 'items-end' : 'items-start'}`}>
                   <div className={`max-w-[85%] p-2.5 rounded-lg ${msg.sender === 'agent' ? 'bg-[#0052CC] text-white rounded-br-none' : 'bg-white border border-slate-200 text-slate-800 rounded-bl-none shadow-xs'}`}>

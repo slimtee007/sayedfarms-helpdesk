@@ -42,6 +42,11 @@ venv/
 .venv/
 db.sqlite3
 
+# Stray database binaries — never commit these (see BUG-REPORT #28)
+*.db
+*.sqlite
+*.sqlite3
+
 # Helpdesk JSON store — local-only, contains password hashes. It is
 # auto-created with seed data on first boot. NEVER commit it.
 backend/db.json

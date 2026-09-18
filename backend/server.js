@@ -94,6 +94,16 @@ let users = db.users || [];
 let tickets = db.tickets || [];
 let inventory = db.inventory || [];
 
+// Monotonic id generator (#18). Date.now() primary keys collided under
+// concurrent writes: 6 simultaneous signups produced the same id, and
+// Array.filter then deleted every matching row. We suffix a counter that
+// always advances within the millisecond so ids are unique even under load.
+let idCounter = 0;
+const genId = (prefix) => {
+  idCounter = (idCounter + 1) % 1000000;
+  return `${prefix || ''}${Date.now()}-${idCounter}`;
+};
+
 // Normalize emails (trim + lowercase) so casing or stray whitespace
 // can never block sign-in or create duplicate accounts.
 const normalizeEmail = (email) => (email || '').trim().toLowerCase();
@@ -134,7 +144,7 @@ const ADMIN_EMAIL = normalizeEmail(process.env.ADMIN_EMAIL || 'admin@sayedfarms.
 if (!users.some((u) => u.role === 'agent')) {
   const adminPassword = process.env.ADMIN_PASSWORD || 'Admin@12345';
   users.push({
-    id: `admin-${Date.now().toString()}`,
+    id: genId('admin-'),
     name: 'IT Admin',
     email: ADMIN_EMAIL,
     role: 'agent',
@@ -149,8 +159,6 @@ if (!users.some((u) => u.role === 'agent')) {
 
 // Backfill per-ticket chat history for tickets created before it existed, plus
 // ownership for tickets created before reporter identity was stamped (#14).
-// Ownership is matched by reporter name where possible; unmatched legacy
-// tickets stay visible to agents only.
 let ticketsMigrated = false;
 tickets.forEach((t) => {
   if (!Array.isArray(t.messages)) {
@@ -173,7 +181,7 @@ const appendTicketMessage = (ticketId, sender, senderName, text) => {
   if (!ticket || !text || !String(text).trim()) return null;
   if (!Array.isArray(ticket.messages)) ticket.messages = [];
   const message = {
-    id: Date.now().toString() + Math.floor(Math.random() * 1000).toString(),
+    id: genId('msg-'),
     sender: sender === 'agent' ? 'agent' : 'user',
     senderName: senderName || (sender === 'agent' ? 'IT Agent' : 'Employee'),
     text: String(text).trim(),
@@ -184,7 +192,7 @@ const appendTicketMessage = (ticketId, sender, senderName, text) => {
   return { ticket, message };
 };
 
-// True when `user` (a socket or request identity) may see/post in a ticket.
+// True when `user` may see/post in a ticket.
 const canAccessTicket = (user, ticketId) => {
   if (!user) return false;
   if (user.role === 'agent') return true;
@@ -192,8 +200,7 @@ const canAccessTicket = (user, ticketId) => {
   return !!ticket && ticket.created_by === user.id;
 };
 
-// Verify the Bearer token and attach the CURRENT user record (so role changes
-// and deletions take effect immediately, not at token expiry).
+// Verify the Bearer token and attach the CURRENT user record.
 const requireAuth = (req, res, next) => {
   const header = req.headers.authorization || '';
   const match = header.match(/^Bearer\s+(.+)$/i);
@@ -223,6 +230,91 @@ const requireAgent = (req, res, next) => {
   });
 };
 
+// ------------------------------------------------------------------
+// Rate limiting (#7) — tiny in-memory sliding window, zero new deps.
+// Blunts brute-force on login/OTP endpoints; production can put a real
+// reverse-proxy limiter in front. Configurable via RATE_LIMIT_* env.
+// ------------------------------------------------------------------
+const rateBuckets = new Map();
+const rateLimit = (opts) => {
+  const { windowMs, max, keyFn, message } = {
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+    keyFn: (req) => req.ip,
+    message: 'Too many requests. Please slow down and try again in a few minutes.',
+    ...opts,
+  };
+  return (req, res, next) => {
+    const key = keyFn(req);
+    const now = Date.now();
+    let entry = rateBuckets.get(key);
+    if (!entry || now - entry.start > windowMs) {
+      entry = { count: 0, start: now };
+      rateBuckets.set(key, entry);
+    }
+    entry.count += 1;
+    res.set('X-RateLimit-Limit', String(max));
+    res.set('X-RateLimit-Remaining', String(Math.max(0, max - entry.count)));
+    const resetSec = Math.max(1, Math.ceil((entry.start + windowMs - now) / 1000));
+    res.set('X-RateLimit-Reset', String(resetSec));
+    if (entry.count > max) {
+      return res.status(429).json({ error: message, retryAfter: resetSec });
+    }
+    next();
+  };
+};
+// GC old buckets so an attacker can't fill memory forever.
+setInterval(() => {
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  for (const [k, v] of rateBuckets) if (v.start < cutoff) rateBuckets.delete(k);
+}, 60 * 1000).unref?.();
+
+// Login + password-reset endpoints get TIGHT limits (keyed by IP+email so one
+// IP can't brute-force the whole userbase, and one email can't be hammered).
+const authRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  keyFn: (req) => `${req.ip}:${normalizeEmail(req.body && req.body.email)}`,
+  message: 'Too many sign-in / reset attempts for this account. Try again in a few minutes.',
+});
+const sensitiveRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: 'Too many sensitive actions from this address. Try again later.',
+});
+const writeRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  message: 'Too many requests. Slow down.',
+});
+
+// ------------------------------------------------------------------
+// Mass-assignment protection (#8): pick only allowed fields from req.body.
+// id/role/password/created_by/messages/etc. can never be overwritten by a
+// PATCH/POST no matter what the client sends.
+// ------------------------------------------------------------------
+const pick = (body, fields) => {
+  const out = {};
+  if (!body || typeof body !== 'object') return out;
+  for (const f of fields) if (body[f] !== undefined) out[f] = body[f];
+  return out;
+};
+const requireStrings = (obj, fields) => {
+  for (const f of fields) {
+    if (!obj || typeof obj[f] !== 'string' || !obj[f].trim()) return f;
+  }
+  return null;
+};
+
+// Validators for #15 input validation
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const VALID_TICKET_STATUS = new Set(['Open', 'In Progress', 'Resolved', 'Cancelled']);
+const VALID_TICKET_PRIORITY = new Set(['Low', 'Medium', 'High', 'Urgent']);
+// Matches the options the portal form actually offers (incl. 'Access/Security').
+const VALID_TICKET_CATEGORY = new Set(['Hardware', 'Software', 'Network', 'Access/Security', 'Account', 'Other']);
+const VALID_USER_ROLE = new Set(['agent', 'user']);
+const VALID_INVENTORY_STATUS = new Set(['In Stock', 'Assigned', 'In Repair', 'Retired']);
+
 const { sendOtpEmail, isSmtpConfigured } = require('./utils/sendEmail');
 
 const otpStore = {};
@@ -235,25 +327,29 @@ if (!isSmtpConfigured()) {
 
 /**
  * Generates an OTP for `email` and delivers it.
- * Response contract:
- *  - { success: true, emailSent: true }                     -> email really went out
- *  - { success: true, emailSent: false, devOtp }            -> SMTP not configured (dev mode only)
- *  - 500 { emailSent: false, error }                        -> SMTP configured but sending failed
+ *
+ * #10 account-enumeration fix: when SMTP is configured, we return the same
+ * generic success response whether the email exists or not, so an attacker
+ * cannot probe the user directory. OTP is only generated/sent when real.
  */
 const generateAndSendOtp = async (res, email, kind) => {
-  const user = users.find((u) => normalizeEmail(u.email) === normalizeEmail(email));
-  if (!user) {
-    return res.status(404).json({ error: 'Email address not found in the system' });
-  }
+  const key = normalizeEmail(email);
+  const user = users.find((u) => normalizeEmail(u.email) === key);
+
+  const genericSuccess = () =>
+    res.json({ success: true, emailSent: true, message: 'If an account matches that email, a verification code has been sent.' });
 
   const otp = Math.floor(100000 + Math.random() * 900000).toString();
   const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
-  otpStore[email] = { otp, expiresAt };
+
+  if (user) otpStore[key] = { otp, expiresAt };
 
   if (!isSmtpConfigured()) {
-    console.log(`\n========================================\n [DEV ${kind.toUpperCase()} OTP CODE for ${email}]: ${otp}\n========================================\n`);
-    if (process.env.NODE_ENV === 'production') {
-      // Never leak the OTP to the client in production.
+    if (!user) {
+      return res.status(400).json({ error: 'If this email exists, a code would be sent. (Dev: address not found.)' });
+    }
+    console.log(`\n========================================\n [DEV ${kind.toUpperCase()} OTP CODE for ${key}]: ${otp}\n========================================\n`);
+    if (isProduction) {
       return res.status(500).json({
         error: 'Email delivery is not configured on this server. Please contact the administrator.',
         emailSent: false,
@@ -263,16 +359,18 @@ const generateAndSendOtp = async (res, email, kind) => {
       success: true,
       emailSent: false,
       devOtp: otp,
-      message: 'Email delivery is not configured on the server, so no email was sent. Use the development code shown on screen.',
+      message: 'Email delivery is not configured on the server; use the development code shown on screen.',
     });
   }
 
+  if (!user) return genericSuccess();
+
   try {
-    await sendOtpEmail(email, otp, kind);
-    return res.json({ success: true, emailSent: true, message: 'Verification code sent to your email address.' });
+    await sendOtpEmail(key, otp, kind);
+    return genericSuccess();
   } catch (err) {
     console.error(`[${kind.toUpperCase()}] Email send error:`, err && err.message ? err.message : err);
-    console.log(`\n========================================\n [DEV FALLBACK OTP CODE for ${email}]: ${otp}\n========================================\n`);
+    console.log(`\n========================================\n [DEV FALLBACK OTP CODE for ${key}]: ${otp}\n========================================\n`);
     return res.status(500).json({
       error: 'Failed to send the verification email. Please try again or contact the administrator.',
       emailSent: false,
@@ -280,33 +378,29 @@ const generateAndSendOtp = async (res, email, kind) => {
   }
 };
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-app.post('/api/auth/signup', async (req, res) => {
+app.post('/api/auth/signup', writeRateLimit, async (req, res) => {
   try {
-    const { name, email, password } = req.body || {};
-    const cleanName = String(name || '').trim();
-    const cleanEmail = normalizeEmail(email);
-    if (!cleanName) {
-      return res.status(400).json({ error: 'Full name is required' });
-    }
+    const body = pick(req.body, ['name', 'email', 'password']);
+    const cleanName = String(body.name || '').trim();
+    const cleanEmail = normalizeEmail(body.email);
+    if (!cleanName) return res.status(400).json({ error: 'Full name is required' });
+    if (cleanName.length > 100) return res.status(400).json({ error: 'Name is too long (max 100 characters)' });
     if (!cleanEmail || !EMAIL_RE.test(cleanEmail)) {
       return res.status(400).json({ error: 'A valid email address is required' });
     }
-    if (typeof password !== 'string' || password.length < 8) {
+    if (typeof body.password !== 'string' || body.password.length < 8) {
       return res.status(400).json({ error: 'Password must be at least 8 characters long' });
     }
+    if (body.password.length > 200) return res.status(400).json({ error: 'Password is too long' });
     if (users.some((u) => normalizeEmail(u.email) === cleanEmail)) {
       return res.status(400).json({ error: 'Email already registered' });
     }
-    // NOTE: any `role` sent by the client is deliberately ignored — every
-    // public signup is an employee account. Agents are promoted by an existing
-    // agent from the console (#6).
+    // Any `role` sent by the client is deliberately ignored (#6).
     const newUser = {
-      id: Date.now().toString(),
+      id: genId('user-'),
       name: cleanName,
       email: cleanEmail,
-      password: await bcrypt.hash(password, BCRYPT_ROUNDS),
+      password: await bcrypt.hash(body.password, BCRYPT_ROUNDS),
       role: 'user',
     };
     users.push(newUser);
@@ -318,75 +412,63 @@ app.post('/api/auth/signup', async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body || {};
-  const user = users.find((u) => normalizeEmail(u.email) === normalizeEmail(email));
-  const ok = user && typeof password === 'string' && await bcrypt.compare(password, user.password || '');
+app.post('/api/auth/login', authRateLimit, async (req, res) => {
+  const body = pick(req.body, ['email', 'password']);
+  const user = users.find((u) => normalizeEmail(u.email) === normalizeEmail(body.email));
+  const ok = user && typeof body.password === 'string' && await bcrypt.compare(body.password, user.password || '');
   if (!ok) {
+    // Same message for unknown email and bad password — prevents enumeration.
     return res.status(400).json({ error: 'Invalid email or password' });
   }
   res.json({ token: signToken(user), user: safeUser(user) });
 });
 
-// Step 1: Generate and Send Password Reset OTP
-app.post('/api/auth/forgot-password', async (req, res) => {
-  const { email } = req.body || {};
-  if (!email) {
+app.post('/api/auth/forgot-password', authRateLimit, async (req, res) => {
+  const body = pick(req.body, ['email']);
+  if (!body.email || !normalizeEmail(body.email)) {
     return res.status(400).json({ error: 'Email address is required' });
   }
-  await generateAndSendOtp(res, normalizeEmail(email), 'reset');
+  await generateAndSendOtp(res, normalizeEmail(body.email), 'reset');
 });
 
-// Resend Password Reset OTP
-app.post('/api/auth/resend-otp', async (req, res) => {
-  const { email } = req.body || {};
-  if (!email) {
+app.post('/api/auth/resend-otp', authRateLimit, async (req, res) => {
+  const body = pick(req.body, ['email']);
+  if (!body.email || !normalizeEmail(body.email)) {
     return res.status(400).json({ error: 'Email address is required' });
   }
-  await generateAndSendOtp(res, normalizeEmail(email), 'resend');
+  await generateAndSendOtp(res, normalizeEmail(body.email), 'resend');
 });
 
-// Step 2: Verify OTP and Reset Password
-app.post('/api/auth/reset-password', async (req, res) => {
-  const { email, otp, password } = req.body || {};
-  if (!email || otp === undefined || otp === null || otp === '' || !password) {
+app.post('/api/auth/reset-password', authRateLimit, async (req, res) => {
+  const body = pick(req.body, ['email', 'otp', 'password']);
+  if (!body.email || body.otp === undefined || body.otp === null || body.otp === '' || !body.password) {
     return res.status(400).json({ error: 'Email, verification code and new password are required' });
   }
-  const key = normalizeEmail(email);
+  const key = normalizeEmail(body.email);
   const user = users.find((u) => normalizeEmail(u.email) === key);
-  if (!user) {
-    return res.status(404).json({ error: 'Email address not found in the system' });
-  }
-
+  if (!user) return res.status(400).json({ error: 'Invalid or expired OTP code.' });
   const record = otpStore[key];
-  // Compare as strings so a JSON-number code is accepted, not rejected.
-  if (!record || String(record.otp) !== String(otp) || Date.now() > record.expiresAt) {
+  if (!record || String(record.otp) !== String(body.otp) || Date.now() > record.expiresAt) {
     return res.status(400).json({ error: 'Invalid or expired OTP code.' });
   }
-  if (typeof password !== 'string' || password.length < 8) {
+  if (typeof body.password !== 'string' || body.password.length < 8) {
     return res.status(400).json({ error: 'Password must be at least 8 characters long' });
   }
-
-  user.password = await bcrypt.hash(password, BCRYPT_ROUNDS);
+  user.password = await bcrypt.hash(body.password, BCRYPT_ROUNDS);
   delete otpStore[key];
   saveData();
-
   res.json({ success: true, message: 'Password updated successfully' });
 });
 
-// User directory — agents only. Employees get the trimmed agent picker below.
 app.get('/api/users', requireAgent, (req, res) => {
   res.json(users.map(({ password, ...u }) => u));
 });
 
-// Agent picker for the employee portal's "direct request" dropdown: names only,
-// no emails or password hashes, so employees can address an agent without
-// being able to enumerate the user directory.
 app.get('/api/agents', requireAuth, (req, res) => {
   res.json(users.filter((u) => u.role === 'agent').map((u) => ({ id: u.id, name: u.name })));
 });
 
-app.delete('/api/users/:id', requireAgent, (req, res) => {
+app.delete('/api/users/:id', requireAgent, sensitiveRateLimit, (req, res) => {
   const target = users.find((u) => u.id === req.params.id);
   if (!target) return res.status(404).json({ error: 'User not found' });
   if (target.id === req.user.id) {
@@ -395,13 +477,12 @@ app.delete('/api/users/:id', requireAgent, (req, res) => {
   if (target.role === 'agent' && users.filter((u) => u.role === 'agent').length <= 1) {
     return res.status(400).json({ error: 'Cannot delete the last IT agent account' });
   }
-  // Re-home anything assigned to the deleted user so queues don't strand
-  // tickets/assets against a name that no longer exists (#17, partial).
+  // Re-home assignments keyed by id OR name (#17 partial extension).
   tickets.forEach((t) => {
-    if (t.assigned_to === target.name) t.assigned_to = 'Unassigned';
+    if (t.assigned_to === target.id || t.assigned_to === target.name) t.assigned_to = 'Unassigned';
   });
   inventory.forEach((i) => {
-    if (i.assigned_to === target.name) {
+    if (i.assigned_to === target.id || i.assigned_to === target.name) {
       i.assigned_to = 'Unassigned';
       if (i.status === 'Assigned') i.status = 'In Stock';
     }
@@ -411,70 +492,79 @@ app.delete('/api/users/:id', requireAgent, (req, res) => {
   res.json({ success: true });
 });
 
-// Update a user's role (agent <-> user) and/or display name.
-// Used by the admin dashboard's User Management screen.
-app.patch('/api/users/:id', requireAgent, (req, res) => {
+app.patch('/api/users/:id', requireAgent, writeRateLimit, (req, res) => {
   const target = users.find((u) => u.id === req.params.id);
   if (!target) return res.status(404).json({ error: 'User not found' });
-  const { role, name } = req.body || {};
-  if (role !== undefined) {
-    if (role !== 'agent' && role !== 'user') {
+  // #8: explicit field allow-list — id/email/password can never be rewritten.
+  const body = pick(req.body, ['role', 'name']);
+  if (body.role !== undefined) {
+    if (!VALID_USER_ROLE.has(body.role)) {
       return res.status(400).json({ error: 'Role must be either "agent" or "user"' });
     }
-    if (target.id === req.user.id && role !== target.role) {
+    if (target.id === req.user.id && body.role !== target.role) {
       return res.status(403).json({ error: 'You cannot change your own role' });
     }
-    if (target.role === 'agent' && role === 'user' && users.filter((u) => u.role === 'agent').length <= 1) {
+    if (target.role === 'agent' && body.role === 'user' && users.filter((u) => u.role === 'agent').length <= 1) {
       return res.status(400).json({ error: 'Cannot demote the last IT agent account' });
     }
-    target.role = role;
+    target.role = body.role;
   }
-  if (name !== undefined && String(name).trim()) {
-    target.name = String(name).trim();
+  if (body.name !== undefined) {
+    const trimmed = String(body.name).trim();
+    if (!trimmed) return res.status(400).json({ error: 'Name cannot be empty' });
+    if (trimmed.length > 100) return res.status(400).json({ error: 'Name is too long' });
+    target.name = trimmed;
   }
   saveData();
   res.json(safeUser(target));
 });
 
-// Agents see every ticket; employees see only their own (#13).
 app.get('/api/tickets', requireAuth, (req, res) => {
   if (req.user.role === 'agent') return res.json(tickets);
   res.json(tickets.filter((t) => t.created_by === req.user.id));
 });
 
-app.post('/api/tickets', requireAuth, (req, res) => {
-  const { title, description, category, priority, assigned_to, image } = req.body || {};
-  if (!String(title || '').trim() || !String(description || '').trim()) {
+app.post('/api/tickets', requireAuth, writeRateLimit, (req, res) => {
+  const body = pick(req.body, ['title', 'description', 'category', 'priority', 'assigned_to', 'image']);
+  if (!String(body.title || '').trim() || !String(body.description || '').trim()) {
     return res.status(400).json({ error: 'Title and description are required' });
   }
+  if (String(body.title).trim().length > 200) {
+    return res.status(400).json({ error: 'Title is too long (max 200 characters)' });
+  }
+  const category = body.category && VALID_TICKET_CATEGORY.has(body.category) ? body.category : 'Hardware';
+  const priority = body.priority && VALID_TICKET_PRIORITY.has(body.priority) ? body.priority : 'Medium';
+  // Employees can't assign tickets to arbitrary people (#8): only agents may.
+  const assignedTo = req.user.role === 'agent' && body.assigned_to ? String(body.assigned_to) : 'Unassigned';
+  const image = typeof body.image === 'string' && body.image.length < 2_000_000 ? body.image : '';
   const newTicket = {
-    id: Date.now().toString(),
-    title: String(title).trim(),
-    description: String(description).trim(),
-    category: category || 'Hardware',
-    priority: priority || 'Medium',
+    id: genId('ticket-'),
+    title: String(body.title).trim(),
+    description: String(body.description).trim(),
+    category,
+    priority,
     status: 'Open',
-    assigned_to: assigned_to || 'Unassigned',
-    // Reporter identity comes from the verified session, never the client (#14).
+    assigned_to: assignedTo,
     created_by: req.user.id,
     created_by_name: req.user.name,
-    image: image || '',
-    messages: []
+    image,
+    messages: [],
+    created_at: new Date().toISOString(),
   };
   tickets.unshift(newTicket);
   saveData();
   res.json(newTicket);
 });
 
-app.patch('/api/tickets/:id', requireAuth, (req, res) => {
+app.patch('/api/tickets/:id', requireAuth, writeRateLimit, (req, res) => {
   const ticket = tickets.find((t) => t.id === req.params.id);
   if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
   if (req.user.role !== 'agent') {
-    // Employees may only cancel their own requests — nothing else.
     if (ticket.created_by !== req.user.id) {
       return res.status(403).json({ error: 'You can only update your own requests' });
     }
-    const body = req.body || {};
+    // #8: strict allow-list for employees — only {status:'Cancelled'}.
+    const body = pick(req.body, ['status']);
     if (Object.keys(body).length !== 1 || body.status !== 'Cancelled') {
       return res.status(403).json({ error: 'You can only cancel your own requests' });
     }
@@ -482,34 +572,62 @@ app.patch('/api/tickets/:id', requireAuth, (req, res) => {
     saveData();
     return res.json(ticket);
   }
-  // Agents: identity/history fields can never be overwritten from the client
-  // (the full per-field allow-list lands with #8).
-  const { id, created_by, created_by_name, messages, ...updates } = req.body || {};
-  Object.assign(ticket, updates);
+  // #8 mass-assignment fix: explicit allow-list for agents — id/created_by/
+  // created_by_name/messages/created_at can never be overwritten from PATCH.
+  const body = pick(req.body, ['title', 'description', 'category', 'priority', 'status', 'assigned_to', 'image']);
+  if (body.title !== undefined) {
+    const t = String(body.title).trim();
+    if (!t) return res.status(400).json({ error: 'Title cannot be empty' });
+    if (t.length > 200) return res.status(400).json({ error: 'Title is too long' });
+    ticket.title = t;
+  }
+  if (body.description !== undefined) {
+    const d = String(body.description).trim();
+    if (!d) return res.status(400).json({ error: 'Description cannot be empty' });
+    ticket.description = d;
+  }
+  if (body.category !== undefined) {
+    if (!VALID_TICKET_CATEGORY.has(body.category)) {
+      return res.status(400).json({ error: `Category must be one of: ${[...VALID_TICKET_CATEGORY].join(', ')}` });
+    }
+    ticket.category = body.category;
+  }
+  if (body.priority !== undefined) {
+    if (!VALID_TICKET_PRIORITY.has(body.priority)) {
+      return res.status(400).json({ error: `Priority must be one of: ${[...VALID_TICKET_PRIORITY].join(', ')}` });
+    }
+    ticket.priority = body.priority;
+  }
+  if (body.status !== undefined) {
+    if (!VALID_TICKET_STATUS.has(body.status)) {
+      return res.status(400).json({ error: `Status must be one of: ${[...VALID_TICKET_STATUS].join(', ')}` });
+    }
+    ticket.status = body.status;
+  }
+  if (body.assigned_to !== undefined) {
+    ticket.assigned_to = String(body.assigned_to || 'Unassigned');
+  }
+  if (body.image !== undefined) {
+    ticket.image = typeof body.image === 'string' ? body.image : '';
+  }
   saveData();
   res.json(ticket);
 });
 
-// Post a per-ticket chat message (employee <-> assigned agent).
-// History is persisted on the ticket and broadcast to the ticket room.
-// Only the reporter and agents may post; sender identity comes from the
-// verified session so nobody can post as "Fake IT Admin".
-app.post('/api/tickets/:id/messages', requireAuth, (req, res) => {
+app.post('/api/tickets/:id/messages', requireAuth, writeRateLimit, (req, res) => {
   const ticket = tickets.find((t) => t.id === req.params.id);
   if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
   if (req.user.role !== 'agent' && ticket.created_by !== req.user.id) {
     return res.status(403).json({ error: 'You can only chat on your own requests' });
   }
-  const { text } = req.body || {};
+  const body = pick(req.body, ['text']);
   const result = appendTicketMessage(
     ticket.id,
     req.user.role === 'agent' ? 'agent' : 'user',
     req.user.name,
-    text
+    body.text
   );
-  if (!result) {
-    return res.status(400).json({ error: 'Message text is required' });
-  }
+  if (!result) return res.status(400).json({ error: 'Message text is required' });
   io.to(`ticket_${result.ticket.id}`).emit('receive_ticket_message', {
     ticketId: result.ticket.id,
     message: result.message,
@@ -521,31 +639,63 @@ app.get('/api/inventory', requireAgent, (req, res) => {
   res.json(inventory);
 });
 
-app.post('/api/inventory', requireAgent, (req, res) => {
-  const { name, category, serial_number, assigned_to, status } = req.body || {};
+app.post('/api/inventory', requireAgent, writeRateLimit, (req, res) => {
+  const body = pick(req.body, ['name', 'category', 'serial_number', 'assigned_to', 'status']);
+  const missing = requireStrings(body, ['name', 'category', 'serial_number']);
+  if (missing) return res.status(400).json({ error: `${missing} is required` });
+  const serial = String(body.serial_number).trim();
+  if (inventory.some((i) => String(i.serial_number).toLowerCase() === serial.toLowerCase())) {
+    return res.status(400).json({ error: 'An asset with this serial number already exists' });
+  }
+  const status = body.status && VALID_INVENTORY_STATUS.has(body.status) ? body.status : 'In Stock';
   const newItem = {
-    id: Date.now().toString(),
-    name,
-    category,
-    serial_number,
-    assigned_to: assigned_to || 'Unassigned',
-    status: status || 'In Stock'
+    id: genId('asset-'),
+    name: String(body.name).trim(),
+    category: String(body.category).trim(),
+    serial_number: serial,
+    assigned_to: body.assigned_to ? String(body.assigned_to) : 'Unassigned',
+    status,
   };
   inventory.unshift(newItem);
   saveData();
   res.json(newItem);
 });
 
-app.patch('/api/inventory/:id', requireAgent, (req, res) => {
+app.patch('/api/inventory/:id', requireAgent, writeRateLimit, (req, res) => {
   const item = inventory.find((i) => i.id === req.params.id);
   if (!item) return res.status(404).json({ error: 'Asset not found' });
-  const { id, ...updates } = req.body || {};
-  Object.assign(item, updates);
+  // #8 mass-assignment fix: explicit allow-list — id can never be overwritten.
+  const body = pick(req.body, ['name', 'category', 'serial_number', 'assigned_to', 'status']);
+  if (body.name !== undefined) {
+    const n = String(body.name).trim();
+    if (!n) return res.status(400).json({ error: 'Name cannot be empty' });
+    item.name = n;
+  }
+  if (body.category !== undefined) item.category = String(body.category).trim();
+  if (body.serial_number !== undefined) {
+    const s = String(body.serial_number).trim();
+    if (!s) return res.status(400).json({ error: 'Serial number cannot be empty' });
+    if (s.toLowerCase() !== String(item.serial_number).toLowerCase()
+        && inventory.some((i) => i.id !== item.id && String(i.serial_number).toLowerCase() === s.toLowerCase())) {
+      return res.status(400).json({ error: 'An asset with this serial number already exists' });
+    }
+    item.serial_number = s;
+  }
+  if (body.status !== undefined) {
+    if (!VALID_INVENTORY_STATUS.has(body.status)) {
+      return res.status(400).json({ error: `Status must be one of: ${[...VALID_INVENTORY_STATUS].join(', ')}` });
+    }
+    item.status = body.status;
+    if (body.status !== 'Assigned') item.assigned_to = 'Unassigned';
+  }
+  if (body.assigned_to !== undefined) {
+    item.assigned_to = body.assigned_to ? String(body.assigned_to) : 'Unassigned';
+  }
   saveData();
   res.json(item);
 });
 
-app.delete('/api/inventory/:id', requireAgent, (req, res) => {
+app.delete('/api/inventory/:id', requireAgent, sensitiveRateLimit, (req, res) => {
   const item = inventory.find((i) => i.id === req.params.id);
   if (!item) return res.status(404).json({ error: 'Asset not found' });
   inventory = inventory.filter((i) => i.id !== req.params.id);
@@ -553,8 +703,19 @@ app.delete('/api/inventory/:id', requireAgent, (req, res) => {
   res.json({ success: true });
 });
 
-// Attach the verified session user to each socket (null when no/invalid token
-// was supplied). Emits from unauthenticated sockets are ignored below.
+// 404 JSON handler for any unmatched /api route (#24).
+app.use('/api', (req, res) => {
+  res.status(404).json({ error: `Unknown API endpoint: ${req.method} ${req.path}` });
+});
+
+// Error middleware — never leak stack traces, always send JSON.
+app.use((err, req, res, _next) => {
+  console.error('[ERROR]', err);
+  if (res.headersSent) return;
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// Attach the verified session user to each socket.
 io.use((socket, next) => {
   socket.user = null;
   const token = socket.handshake.auth && socket.handshake.auth.token;
@@ -571,11 +732,23 @@ io.use((socket, next) => {
 });
 
 io.on('connection', (socket) => {
+  // Per-socket message rate-limit (#7) so one client can't spam everyone.
+  let socketMsgCount = 0;
+  let socketMsgWindow = Date.now();
+  const socketAllowed = () => {
+    const now = Date.now();
+    if (now - socketMsgWindow > 10_000) { socketMsgWindow = now; socketMsgCount = 0; }
+    socketMsgCount += 1;
+    return socketMsgCount <= 20; // 20 messages / 10s per socket
+  };
+
   socket.on('send_message', (data) => {
     if (!socket.user) return;
+    if (!socketAllowed()) return;
     if (!data || typeof data !== 'object' || !String(data.text || '').trim()) return;
-    // Sender identity comes from the verified session, never the client.
+    if (String(data.text).length > 2000) return;
     io.emit('receive_message', {
+      id: genId('msg-'),
       sender: socket.user.role === 'agent' ? 'agent' : 'user',
       senderName: socket.user.name,
       text: String(data.text).trim(),
@@ -583,7 +756,6 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Per-ticket chat rooms: ticket_<id>
   socket.on('join_ticket', (ticketId) => {
     if (ticketId === undefined || ticketId === null) return;
     if (!canAccessTicket(socket.user, ticketId)) return;
@@ -594,9 +766,9 @@ io.on('connection', (socket) => {
     socket.leave(`ticket_${ticketId}`);
   });
   socket.on('send_ticket_message', (data) => {
-    // A null / non-object payload used to throw here and take the whole
-    // process down (no error middleware, no uncaughtException handler).
     if (!data || typeof data !== 'object') return;
+    if (!socket.user) return;
+    if (!socketAllowed()) return;
     if (!canAccessTicket(socket.user, data.ticketId)) return;
     const result = appendTicketMessage(
       data.ticketId,
@@ -612,8 +784,6 @@ io.on('connection', (socket) => {
   });
 });
 
-// Last line of defence: log loudly instead of letting one bad event kill the
-// whole helpdesk for every connected user.
 process.on('uncaughtException', (err) => {
   console.error('[FATAL] Uncaught exception (server kept alive):', err);
 });
