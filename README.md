@@ -36,11 +36,33 @@ Default admin sign-in (development only — override via `ADMIN_EMAIL` /
   self-register as an agent: agent access is granted by an existing agent
   from User Management in the Agent Console.
 - Employees only ever see their own tickets (list, updates, chat). The user
-  directory and inventory are agent-only; employees get a names-only agent
-  picker (`GET /api/agents`) for the "direct request" dropdown.
+  directory and inventory are agent-only; employees get an id/name agent
+  picker (`GET /api/agents`) for the "direct request" dropdown — picking an
+  agent there really does assign them.
+- **Assignments are keyed by user id.** Tickets and assets carry
+  `assigned_to_id` (canonical) plus `assigned_to` (a denormalized display name
+  kept in sync), so renaming a user never orphans their work and two accounts
+  with the same name stay distinguishable. Writes accept either field;
+  `assigned_to_id` wins. Legacy name-only rows are migrated on boot.
 - Socket.IO chat carries the session token (`socket.auth = { token }`);
   emits from unauthenticated sockets and ticket-room joins for tickets you
   don't own are ignored.
+
+## Tests & CI
+
+```bash
+cd backend && npm test     # boots the real server on a scratch db.json and drives the API
+cd frontend && npm run lint && npm run build
+```
+
+`backend/tests/api.test.js` covers the authz guards, the UI/API status contracts,
+id-keyed assignments (rename/duplicate-name/delete/legacy migration), the
+persisted reset codes and the rate limiter. `.github/workflows/ci.yml` runs all
+of it on every push and pull request.
+
+Set `DATA_FILE` to point the server at a different store, and
+`RATE_LIMIT_SCALE` to raise (never disable) every rate-limit budget — useful in
+tests, or behind a reverse proxy that already limits traffic.
 
 ## Hardening notes
 
@@ -53,7 +75,14 @@ Default admin sign-in (development only — override via `ADMIN_EMAIL` /
 - **Field allow-lists:** every POST/PATCH only accepts known fields
   (`id`, `password`, `created_by` etc. can never be rewritten by a client),
   and enums (ticket status/priority/category, user role, asset status) are
-  validated server-side.
+  validated server-side. An unknown value is rejected with `400` — it is never
+  silently replaced by a default.
+- **One source of truth for dropdown values:** the frontend renders its status
+  dropdowns from `GET /api/meta/enums`, so the UI can't offer a value the API
+  rejects (or one it quietly rewrites).
+- **Password-reset codes** are persisted in `db.json` as SHA-256 digests
+  (never plaintext), expire after 10 minutes, and are burned after 5 wrong
+  attempts. They survive server restarts.
 - The global "Live IT Chat" widget is an ephemeral, all-agents broadcast —
   nothing is stored. Use a ticket's per-ticket chat for a persisted,
   room-scoped conversation.

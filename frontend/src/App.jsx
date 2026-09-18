@@ -12,6 +12,58 @@ const API_URL = import.meta.env.VITE_API_URL || '';
 // ignores chat/join emits from unauthenticated sockets.
 const socket = io(API_URL, { autoConnect: false });
 
+// Fallback dropdown values. The live list comes from GET /api/meta/enums
+// (#32/#33): the server used to reject or silently rewrite options the UI
+// offered, so the UI now renders whatever the API actually accepts. These
+// defaults keep the forms usable if that call fails.
+const FALLBACK_ENUMS = {
+  ticketStatus: ['Open', 'In Progress', 'Pending', 'Resolved', 'Closed', 'Cancelled'],
+  ticketPriority: ['Low', 'Medium', 'High', 'Urgent'],
+  ticketCategory: ['Hardware', 'Software', 'Network', 'Access/Security', 'Account', 'Other'],
+  inventoryStatus: ['In Stock', 'Assigned', 'In Repair', 'Retired', 'Under Maintenance', 'Decommissioned'],
+};
+
+// Human labels for values whose API name is terse.
+const STATUS_LABELS = {
+  Pending: 'Pending / On Hold',
+  'In Repair': 'In Repair',
+};
+
+const statusLabel = (value) => STATUS_LABELS[value] || value;
+
+// Assignments are keyed by user id (#17) so two people with the same display
+// name stay distinguishable and renaming someone never orphans their tickets.
+// These literals are sentinel option values, never real ids.
+const UNASSIGNED = 'Unassigned';
+const LEGACY_ASSIGNEE = '__legacy_assignee__';
+
+/**
+ * Options for an assignee <select>. `current` is the row being edited
+ * ({ assigned_to_id, assigned_to }) and `people` the candidates.
+ */
+const assigneeOptions = (people, current) => {
+  const opts = [{ value: UNASSIGNED, label: 'Unassigned' }];
+  (people || []).forEach((p) => opts.push({ value: p.id, label: p.name }));
+  const currentId = current && current.assigned_to_id;
+  const currentName = current && current.assigned_to;
+  const known = currentId && opts.some((o) => o.value === currentId);
+  if (currentId && !known) {
+    // Assigned to someone outside this list (e.g. an employee on a ticket).
+    opts.push({ value: currentId, label: `${currentName || 'Current assignee'} (not in this list)` });
+  } else if (!currentId && currentName && currentName !== UNASSIGNED) {
+    // A legacy/unresolvable name: keep it visible instead of pretending the
+    // row is unassigned.
+    opts.push({ value: LEGACY_ASSIGNEE, label: `${currentName} (account no longer exists)` });
+  }
+  return opts;
+};
+
+// Turn a chosen option value into the payload the API expects.
+const assigneePayload = (value) => {
+  if (!value || value === UNASSIGNED || value === LEGACY_ASSIGNEE) return { assigned_to_id: null };
+  return { assigned_to_id: value };
+};
+
 // Catches any render-time exception and shows a recoverable message instead of
 // unmounting the whole app into a blank page.
 class ErrorBoundary extends React.Component {
@@ -89,6 +141,9 @@ function MainRouter() {
   const [usersList, setUsersList] = useState([]);
   const [agentsList, setAgentsList] = useState([]);
   const [inventoryList, setInventoryList] = useState([]);
+  // Status/category/priority lists come from the API so the dropdowns can only
+  // ever offer values the server accepts (#32/#33).
+  const [enums, setEnums] = useState(FALLBACK_ENUMS);
   
   const navigate = useNavigate();
 
@@ -96,20 +151,6 @@ function MainRouter() {
   // missing/corrupt/role-less user (e.g. half-cleared localStorage) used to
   // bounce /portal -> /login -> /portal forever and render nothing at all.
   const loggedIn = Boolean(token && user && (user.role === 'agent' || user.role === 'user'));
-
-  useEffect(() => {
-    if (loggedIn) {
-      fetchTickets();
-      // The full user directory is agent-only; employees get the trimmed
-      // agent picker for the "direct request" dropdown.
-      if (user?.role === 'agent') {
-        fetchUsers();
-        fetchInventory();
-      } else {
-        fetchAgents();
-      }
-    }
-  }, [loggedIn]);
 
   // Authenticate the shared socket with the current session token so chat
   // emits carry a verified identity. Reconnects when the session changes and
@@ -132,6 +173,22 @@ function MainRouter() {
     }
     return false;
   };
+
+  // Declared as a function (not a const arrow) so the effect above can call it
+  // without tripping the "used before initialised" lint rule.
+  async function fetchEnums() {
+    try {
+      const res = await fetch(`${API_URL}/api/meta/enums`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (handleUnauthorized(res)) return;
+      const data = await res.json();
+      // Merge over the fallback so a partial response can't blank a dropdown.
+      if (res.ok && data && typeof data === 'object') setEnums({ ...FALLBACK_ENUMS, ...data });
+    } catch (err) {
+      console.error('Could not load dropdown options; using built-in defaults.', err);
+    }
+  }
 
   const fetchTickets = async () => {
     try {
@@ -196,6 +253,22 @@ function MainRouter() {
     }
   };
 
+  useEffect(() => {
+    if (loggedIn) {
+      fetchEnums();
+      fetchTickets();
+      // The full user directory is agent-only; employees get the trimmed
+      // agent picker for the "direct request" dropdown.
+      if (user?.role === 'agent') {
+        fetchUsers();
+        fetchInventory();
+      } else {
+        fetchAgents();
+      }
+    }
+  }, [loggedIn]);
+
+
   const handleLogout = () => {
     localStorage.clear();
     setToken('');
@@ -228,6 +301,7 @@ function MainRouter() {
               user={user}
               tickets={tickets}
               agentsList={agentsList}
+              enums={enums}
               fetchTickets={fetchTickets}
               handleLogout={handleLogout}
               token={token}
@@ -248,6 +322,7 @@ function MainRouter() {
               tickets={tickets} 
               usersList={usersList} 
               inventoryList={inventoryList || []} 
+              enums={enums} 
               fetchTickets={fetchTickets} 
               fetchUsers={fetchUsers} 
               fetchInventory={fetchInventory} 
@@ -505,7 +580,7 @@ function TicketChatModal({ ticket, sender, senderName, onClose, onMessagesChange
   );
 }
 
-function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLogout, token }) {
+function CustomerPortal({ user, tickets, agentsList = [], enums = FALLBACK_ENUMS, fetchTickets, handleLogout, token }) {
   const [selectedGroup, setSelectedGroup] = useState('all');
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -535,7 +610,7 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
     description: '',
     category: 'Hardware',
     priority: 'Medium',
-    assigned_to: 'Unassigned',
+    assigned_to_id: UNASSIGNED,
     image: ''
   });
 
@@ -556,15 +631,25 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
     }
   }, [chatMessages, isChatOpen]);
 
+  // The API stores attachments inline and rejects anything over ~2 MB of
+  // base64, which used to happen silently *after* the user pressed submit.
+  // Refuse it up front, with a real message.
+  const MAX_IMAGE_BYTES = 1_500_000;
+
   const handleImageUpload = (e) => {
     const file = e.target.files[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setNewTicket({ ...newTicket, image: reader.result });
-      };
-      reader.readAsDataURL(file);
+    if (!file) return;
+    if (file.size > MAX_IMAGE_BYTES) {
+      setTicketError(`That image is ${(file.size / 1024 / 1024).toFixed(1)} MB — the limit is ${(MAX_IMAGE_BYTES / 1024 / 1024).toFixed(1)} MB. Please attach a smaller screenshot.`);
+      e.target.value = '';
+      return;
     }
+    setTicketError('');
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      setNewTicket({ ...newTicket, image: reader.result });
+    };
+    reader.readAsDataURL(file);
   };
 
   const handleCreateTicket = async (e) => {
@@ -577,7 +662,9 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
         },
-        body: JSON.stringify(newTicket)
+        // The modal holds the ID (or the 'Unassigned' sentinel) — the API keys
+        // assignments by user id (#17), so translate before sending.
+        body: JSON.stringify({ ...newTicket, ...assigneePayload(newTicket.assigned_to_id) })
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -586,7 +673,7 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
       }
       setIsModalOpen(false);
       setTicketError('');
-      setNewTicket({ title: '', description: '', category: 'Hardware', priority: 'Medium', assigned_to: 'Unassigned', image: '' });
+      setNewTicket({ title: '', description: '', category: 'Hardware', priority: 'Medium', assigned_to_id: UNASSIGNED, image: '' });
       fetchTickets();
     } catch (err) {
       setTicketError('Network error — could not reach the server. Check your connection and try again.');
@@ -604,7 +691,7 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
       description: '',
       category: defaultCategory,
       priority: 'Medium',
-      assigned_to: 'Unassigned',
+      assigned_to_id: UNASSIGNED,
       image: ''
     });
     setTicketError('');
@@ -612,7 +699,9 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
   };
 
   const handleCancelTicket = async (id) => {
-    await fetch(`${API_URL}/api/tickets/${id}`, {
+    // A failed cancel used to be invisible: the row just snapped back to its
+    // old status on the refetch, with no explanation (#33's cousin).
+    const res = await fetch(`${API_URL}/api/tickets/${id}`, {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
@@ -620,6 +709,10 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
       },
       body: JSON.stringify({ status: 'Cancelled' })
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert(data.error || `Could not cancel this request (HTTP ${res.status}).`);
+    }
     fetchTickets();
   };
 
@@ -1022,27 +1115,27 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
               </div>
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1">Direct Request to Agent (Optional)</label>
-                <select value={newTicket.assigned_to} onChange={(e) => setNewTicket({ ...newTicket, assigned_to: e.target.value })} className="w-full border border-slate-300 rounded p-2 text-xs focus:border-[#0052CC] focus:outline-none">
-                  <option value="Unassigned">Any Available IT Agent</option>
-                  {agentsList.map(a => <option key={a.id} value={a.name}>{a.name}</option>)}
+                {/* Keyed by agent id (#17): two agents with the same display
+                    name used to be indistinguishable here. */}
+                <select value={newTicket.assigned_to_id} onChange={(e) => setNewTicket({ ...newTicket, assigned_to_id: e.target.value })} className="w-full border border-slate-300 rounded p-2 text-xs focus:border-[#0052CC] focus:outline-none">
+                  <option value={UNASSIGNED}>Any Available IT Agent</option>
+                  {agentsList.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
                 </select>
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">Category</label>
+                  {/* Rendered from the API's list: the portal used to offer
+                      only 4 of the 6 categories the server accepts. */}
                   <select value={newTicket.category} onChange={(e) => setNewTicket({ ...newTicket, category: e.target.value })} className="w-full border border-slate-300 rounded p-2 text-xs focus:border-[#0052CC] focus:outline-none">
-                    <option>Hardware</option>
-                    <option>Software</option>
-                    <option>Network</option>
-                    <option>Access/Security</option>
+                    {enums.ticketCategory.map((c) => <option key={c} value={c}>{c}</option>)}
                   </select>
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">Urgency / Priority</label>
+                  {/* "Urgent" was accepted by the API but unreachable here. */}
                   <select value={newTicket.priority} onChange={(e) => setNewTicket({ ...newTicket, priority: e.target.value })} className="w-full border border-slate-300 rounded p-2 text-xs focus:border-[#0052CC] focus:outline-none">
-                    <option>Low</option>
-                    <option>Medium</option>
-                    <option>High</option>
+                    {enums.ticketPriority.map((pr) => <option key={pr} value={pr}>{pr}</option>)}
                   </select>
                 </div>
               </div>
@@ -1076,7 +1169,7 @@ function CustomerPortal({ user, tickets, agentsList = [], fetchTickets, handleLo
   );
 }
 
-function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, fetchUsers, fetchInventory, handleLogout, token }) {
+function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBACK_ENUMS, fetchTickets, fetchUsers, fetchInventory, handleLogout, token }) {
   const [isAssetModalOpen, setIsAssetModalOpen] = useState(false);
   const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
   const [inviteEmail, setInviteEmail] = useState('');
@@ -1097,7 +1190,7 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
     name: '',
     category: 'Laptop',
     serial_number: '',
-    assigned_to: 'Unassigned',
+    assigned_to_id: UNASSIGNED,
     status: 'In Stock'
   });
 
@@ -1130,7 +1223,8 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
         },
-        body: JSON.stringify(newAsset)
+        // id-keyed assignee (#17)
+        body: JSON.stringify({ ...newAsset, ...assigneePayload(newAsset.assigned_to_id) })
       });
       // Never render a literal "undefined" dialog (#19): fall back to a real
       // message when the error body isn't JSON or has no `error` field.
@@ -1139,15 +1233,18 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
         return alert(data.error || `Could not create the asset (HTTP ${res.status}). Please try again.`);
       }
       setIsAssetModalOpen(false);
-      setNewAsset({ name: '', category: 'Laptop', serial_number: '', assigned_to: 'Unassigned', status: 'In Stock' });
+      setNewAsset({ name: '', category: 'Laptop', serial_number: '', assigned_to_id: UNASSIGNED, status: 'In Stock' });
       fetchInventory();
     } catch (err) {
       alert('Network error — could not reach the server. Please try again.');
     }
   };
 
+  // These four used to ignore the response entirely: a rejected change (400)
+  // looked exactly like a successful one until the refetch put the old value
+  // back, with no message. Always surface the server's reason.
   const handleUpdateAsset = async (id, updates) => {
-    await fetch(`${API_URL}/api/inventory/${id}`, {
+    const res = await fetch(`${API_URL}/api/inventory/${id}`, {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
@@ -1155,20 +1252,28 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
       },
       body: JSON.stringify(updates)
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert(data.error || `Could not update this asset (HTTP ${res.status}).`);
+    }
     fetchInventory();
   };
 
   const handleDeleteAsset = async (id) => {
     if (!confirm('Are you sure you want to remove this asset?')) return;
-    await fetch(`${API_URL}/api/inventory/${id}`, {
+    const res = await fetch(`${API_URL}/api/inventory/${id}`, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}` }
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert(data.error || `Could not remove this asset (HTTP ${res.status}).`);
+    }
     fetchInventory();
   };
 
   const handleAgentUpdate = async (id, updates) => {
-    await fetch(`${API_URL}/api/tickets/${id}`, {
+    const res = await fetch(`${API_URL}/api/tickets/${id}`, {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
@@ -1176,15 +1281,23 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
       },
       body: JSON.stringify(updates)
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert(data.error || `Could not update this ticket (HTTP ${res.status}).`);
+    }
     fetchTickets();
   };
 
   const handleDeleteUser = async (id) => {
     if (!confirm('Are you sure you want to remove this account?')) return;
-    await fetch(`${API_URL}/api/users/${id}`, {
+    const res = await fetch(`${API_URL}/api/users/${id}`, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${token}` }
     });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert(data.error || `Could not remove this account (HTTP ${res.status}).`);
+    }
     fetchUsers();
   };
 
@@ -1342,18 +1455,14 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
                               onChange={(e) => handleAgentUpdate(t.id, { status: e.target.value })} 
                               className={`rounded text-xs p-1 font-bold focus:outline-none border border-slate-300 ${t.status === 'Open' ? 'bg-yellow-50 text-yellow-800' : t.status === 'In Progress' ? 'bg-blue-50 text-blue-800' : t.status === 'Pending' ? 'bg-amber-50 text-amber-800' : t.status === 'Cancelled' ? 'bg-red-50 text-red-800' : 'bg-emerald-50 text-emerald-800'}`}
                             >
-                              <option value="Open">Open</option>
-                              <option value="In Progress">In Progress</option>
-                              <option value="Pending">Pending / On Hold</option>
-                              <option value="Resolved">Resolved</option>
-                              <option value="Closed">Closed</option>
-                              <option value="Cancelled">Cancelled</option>
+                              {enums.ticketStatus.map((s) => (
+                                <option key={s} value={s}>{statusLabel(s)}</option>
+                              ))}
                             </select>
                           </td>
                           <td className="py-3.5 px-4">
-                            <select value={t.assigned_to} onChange={(e) => handleAgentUpdate(t.id, { assigned_to: e.target.value, status: e.target.value === 'Unassigned' ? 'Open' : 'In Progress' })} className="bg-white border border-slate-300 text-slate-700 rounded text-xs p-1 focus:outline-none focus:border-[#0052CC]">
-                              <option value="Unassigned">Unassigned</option>
-                              {agentsList.map(a => <option key={a.id} value={a.name}>{a.name}</option>)}
+                            <select value={t.assigned_to_id || (t.assigned_to && t.assigned_to !== UNASSIGNED ? LEGACY_ASSIGNEE : UNASSIGNED)} onChange={(e) => handleAgentUpdate(t.id, { ...assigneePayload(e.target.value), status: e.target.value === UNASSIGNED ? 'Open' : 'In Progress' })} className="bg-white border border-slate-300 text-slate-700 rounded text-xs p-1 focus:outline-none focus:border-[#0052CC]">
+                              {assigneeOptions(agentsList, t).map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                             </select>
                           </td>
                           <td className="py-3.5 px-4 text-right whitespace-nowrap">
@@ -1405,17 +1514,15 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
                         <td className="py-3.5 px-4 text-slate-600">{item.category}</td>
                         <td className="py-3.5 px-4 font-mono text-[#0052CC]">{item.serial_number}</td>
                         <td className="py-3.5 px-4">
-                          <select value={item.assigned_to} onChange={(e) => handleUpdateAsset(item.id, { assigned_to: e.target.value, status: e.target.value === 'Unassigned' ? 'In Stock' : 'Assigned' })} className="bg-white border border-slate-300 text-slate-700 rounded text-xs p-1 focus:outline-none focus:border-[#0052CC]">
-                            <option value="Unassigned">Unassigned</option>
-                            {usersList.map(u => <option key={u.id} value={u.name}>{u.name}</option>)}
+                          <select value={item.assigned_to_id || (item.assigned_to && item.assigned_to !== UNASSIGNED ? LEGACY_ASSIGNEE : UNASSIGNED)} onChange={(e) => handleUpdateAsset(item.id, { ...assigneePayload(e.target.value), status: e.target.value === UNASSIGNED ? 'In Stock' : 'Assigned' })} className="bg-white border border-slate-300 text-slate-700 rounded text-xs p-1 focus:outline-none focus:border-[#0052CC]">
+                            {assigneeOptions(usersList, item).map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                           </select>
                         </td>
                         <td className="py-3.5 px-4">
                           <select value={item.status} onChange={(e) => handleUpdateAsset(item.id, { status: e.target.value })} className="bg-white border border-slate-300 text-slate-700 rounded text-xs p-1 focus:outline-none focus:border-[#0052CC]">
-                            <option>In Stock</option>
-                            <option>Assigned</option>
-                            <option>Under Maintenance</option>
-                            <option>Decommissioned</option>
+                            {enums.inventoryStatus.map((s) => (
+                              <option key={s} value={s}>{statusLabel(s)}</option>
+                            ))}
                           </select>
                         </td>
                         <td className="py-3.5 px-4 text-right">
@@ -1502,18 +1609,17 @@ function AgentConsole({ user, tickets, usersList, inventoryList, fetchTickets, f
                     <div>
                       <label className="block text-xs font-semibold text-slate-700 mb-1">Status</label>
                       <select value={newAsset.status} onChange={(e) => setNewAsset({ ...newAsset, status: e.target.value })} className="w-full border border-slate-300 rounded p-2 text-xs focus:border-[#0052CC] focus:outline-none">
-                        <option>In Stock</option>
-                        <option>Assigned</option>
-                        <option>Under Maintenance</option>
-                        <option>Decommissioned</option>
+                        {enums.inventoryStatus.map((s) => (
+                          <option key={s} value={s}>{statusLabel(s)}</option>
+                        ))}
                       </select>
                     </div>
                   </div>
                   <div>
                     <label className="block text-xs font-semibold text-slate-700 mb-1">Assign to Employee</label>
-                    <select value={newAsset.assigned_to} onChange={(e) => setNewAsset({ ...newAsset, assigned_to: e.target.value })} className="w-full border border-slate-300 rounded p-2 text-xs focus:border-[#0052CC] focus:outline-none">
-                      <option value="Unassigned">Unassigned</option>
-                      {usersList.map(u => <option key={u.id} value={u.name}>{u.name}</option>)}
+                    <select value={newAsset.assigned_to_id} onChange={(e) => setNewAsset({ ...newAsset, assigned_to_id: e.target.value })} className="w-full border border-slate-300 rounded p-2 text-xs focus:border-[#0052CC] focus:outline-none">
+                      <option value={UNASSIGNED}>Unassigned</option>
+                      {usersList.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
                     </select>
                   </div>
                   <div className="flex justify-end gap-2 pt-4 border-t border-slate-100">
