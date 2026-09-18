@@ -10,6 +10,7 @@
 Everything below was **reproduced**, not guessed:
 
 - REST + Socket.IO black-box suites against the live backend (78 checks, 54 failing at diagnosis time)
+- Live end-to-end suites re-run after each step (69 checks across steps 5–6, through the Vite proxy)
 - The real `App.jsx` rendered in jsdom (fresh DOM per scenario) driven by simulated clicks/keystrokes
 - An AST scope analysis (acorn + acorn-jsx) of every JSX file
 - `node --check` on every backend file, `vite build`, and `oxlint`
@@ -277,6 +278,52 @@ issued *before* a restart still reset the password *after* it.
 
 **Verified:** `npm test` → 14/14 pass · `oxlint` → 0 errors (warnings 16 → 14) · `vite build` → clean ·
 34/34 live end-to-end checks through the Vite dev proxy, plus a real server restart mid-reset-flow.
+
+### 14. Every agent could see and edit every ticket — FIXED (step 6)
+
+> Requested feature: *"I only want each agent to see tickets assigned to them; a super admin should see
+> all tickets and be able to reassign them."* Verified first: **neither existed.** Any agent could list
+> every ticket, open anyone's thread, and reassign any work to anyone — there was no dispatcher tier at
+> all. Both are now implemented and regression-tested (`backend/tests/api.test.js`).
+
+#### What was wrong
+`GET /api/tickets` returned `tickets` in full for any `role === 'agent'`, `canAccessTicket()` returned
+`true` for every agent, and `PATCH /api/tickets/:id` had no ownership check for agents — so an agent
+could read, edit and reassign tickets belonging to other agents, including tickets assigned to nobody
+in particular. Reassigning was the *only* way to hand work over, which is why it had been left open.
+
+#### The rules now
+
+| Account | Ticket queue | Reassign |
+|---|---|---|
+| Employee | only tickets they raised | no |
+| Agent | **only tickets assigned to them** | no |
+| Super admin | everything + the unassigned dispatch queue | **yes** |
+
+- Scoped at the API, not in the UI: a regular agent's list response simply never contains other
+  agents' tickets, and direct access returns `403` on **read, edit and chat**.
+- **Live delivery was part of the leak.** Sockets joined every ticket room on connect, so per-ticket
+  chat was pushed to every connected agent regardless of ownership. Rooms are now derived from the
+  session's own queue, and reassignment re-syncs them — the old owner loses the room, the new owner
+  gains it, both without a reload.
+- `super_admin` is a flag on an agent account rather than a new role value, so every existing
+  `role === 'agent'` rule (JWT payloads, inventory, sockets) kept working untouched.
+- The **last super admin cannot be demoted**, and an agent cannot promote themselves (`403`) — the
+  dispatch tier can't be removed or seized by accident.
+- Existing installs migrate on boot: agent accounts become regular agents and the `ADMIN_EMAIL`
+  account (else the first agent) is promoted, with a log line naming it.
+
+#### Frontend
+The Agent Console is role-aware: a regular agent gets **"My Assigned Tickets"** (assignee column
+read-only), no User Management tab and no dispatch controls; a super admin gets the full queue, the
+reassignment dropdown and a *Ticket Access* selector per agent account. Queues and open threads
+refresh live over the new `ticket_changed` / `ticket_created` events. Agents keep an email-free
+`{id,name,role}` directory (`GET /api/people`) so asset assignment still works without exposing the
+account directory.
+
+**Verified:** 20/20 backend tests (6 new for #36, including a real socket-delivery check), `oxlint`
+0 errors, `vite build` clean, **35/35 live checks** through the Vite proxy for the new rules and
+**34/34** of the previous suite re-run unchanged (no regressions).
 
 ---
 

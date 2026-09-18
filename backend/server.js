@@ -126,8 +126,22 @@ const saveData = () => {
 const BCRYPT_ROUNDS = 10;
 const isBcryptHash = (value) => typeof value === 'string' && /^\$2[aby]\$\d{2}\$/.test(value);
 const signToken = (user) => jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+
+// ------------------------------------------------------------------
+// Super-admin tier (#36).
+//
+// Every agent used to see every ticket and could reassign any of them. Now:
+//   employee     — only their own tickets
+//   agent        — only the tickets assigned to them
+//   super admin  — every ticket, and the only role that can dispatch
+//                  (reassign) work or manage user accounts
+// `super_admin` is a flag on agent accounts rather than a third role value, so
+// every existing `role === 'agent'` check keeps working unchanged.
+// ------------------------------------------------------------------
+const isSuperAdmin = (u) => Boolean(u && u.role === 'agent' && u.super_admin === true);
+
 // Never serialize the password hash to clients.
-const safeUser = (u) => ({ id: u.id, name: u.name, email: u.email, role: u.role });
+const safeUser = (u) => ({ id: u.id, name: u.name, email: u.email, role: u.role, super_admin: isSuperAdmin(u) });
 
 // Databases created before auth hardening store plaintext passwords — hash
 // them in place on boot so every credential at rest is a bcrypt hash.
@@ -155,14 +169,41 @@ if (!users.some((u) => u.role === 'agent')) {
     name: 'IT Admin',
     email: ADMIN_EMAIL,
     role: 'agent',
+    super_admin: true,
     password: bcrypt.hashSync(adminPassword, BCRYPT_ROUNDS),
   });
   saveData();
-  console.log(`[INIT] No agent account found — created ${ADMIN_EMAIL}`);
+  console.log(`[INIT] No agent account found — created ${ADMIN_EMAIL} (super admin)`);
   if (!process.env.ADMIN_PASSWORD) {
     console.warn('[WARN] Using the default admin password. Set ADMIN_PASSWORD in backend/.env (and change it after first sign-in).');
   }
 }
+
+// Super-admin migration (#36). Agents that predate the flag become regular
+// agents — they now see only the tickets assigned to them — and one account is
+// always promoted so the helpdesk can never end up with nobody able to
+// dispatch work. The configured ADMIN_EMAIL account wins; otherwise the first
+// agent in the directory is promoted and named in the log.
+let superAdminMigrated = false;
+users.forEach((u) => {
+  if (u.role === 'agent' && typeof u.super_admin !== 'boolean') {
+    u.super_admin = false;
+    superAdminMigrated = true;
+  }
+});
+if (!users.some(isSuperAdmin)) {
+  const byAdminEmail = users.find((u) => u.role === 'agent' && normalizeEmail(u.email) === ADMIN_EMAIL);
+  const promoted = byAdminEmail || users.find((u) => u.role === 'agent');
+  if (promoted) {
+    promoted.super_admin = true;
+    superAdminMigrated = true;
+    console.log(`[INIT] No super admin found — promoted ${promoted.email} to super admin so tickets can be dispatched.`);
+    if (!byAdminEmail) {
+      console.warn('[WARN] Promote the intended dispatcher in User Management and demote this account.');
+    }
+  }
+}
+if (superAdminMigrated) saveData();
 
 // ------------------------------------------------------------------
 // Assignments keyed by user id (#17).
@@ -285,12 +326,24 @@ const appendTicketMessage = (ticketId, sender, senderName, text) => {
   return { ticket, message };
 };
 
-// True when `user` may see/post in a ticket.
+// True when `user` may see/post in a ticket (#36).
+//   employee    — tickets they raised
+//   agent       — tickets assigned to them
+//   super admin — everything
 const canAccessTicket = (user, ticketId) => {
   if (!user) return false;
-  if (user.role === 'agent') return true;
   const ticket = tickets.find((t) => t.id === String(ticketId));
-  return !!ticket && ticket.created_by === user.id;
+  if (!ticket) return false;
+  if (isSuperAdmin(user)) return true;
+  if (user.role === 'agent') return ticket.assigned_to_id === user.id;
+  return ticket.created_by === user.id;
+};
+
+// The tickets a given session is allowed to list.
+const visibleTicketsFor = (user) => {
+  if (isSuperAdmin(user)) return tickets;
+  if (user.role === 'agent') return tickets.filter((t) => t.assigned_to_id === user.id);
+  return tickets.filter((t) => t.created_by === user.id);
 };
 
 // Verify the Bearer token and attach the CURRENT user record.
@@ -318,6 +371,16 @@ const requireAgent = (req, res, next) => {
   requireAuth(req, res, () => {
     if (req.user.role !== 'agent') {
       return res.status(403).json({ error: 'This action requires an IT agent account.' });
+    }
+    next();
+  });
+};
+
+// User administration and ticket dispatch are the super admin's job (#36).
+const requireSuperAdmin = (req, res, next) => {
+  requireAuth(req, res, () => {
+    if (!isSuperAdmin(req.user)) {
+      return res.status(403).json({ error: 'This action requires a super admin account.' });
     }
     next();
   });
@@ -581,6 +644,12 @@ app.post('/api/auth/login', authRateLimit, async (req, res) => {
   res.json({ token: signToken(user), user: safeUser(user) });
 });
 
+// Who am I, according to the server (#36). Lets a signed-in console pick up a
+// role/super-admin change (or a revocation) without signing out and back in.
+app.get('/api/auth/me', requireAuth, (req, res) => {
+  res.json(safeUser(req.user));
+});
+
 app.post('/api/auth/forgot-password', authRateLimit, async (req, res) => {
   const body = pick(req.body, ['email']);
   if (!body.email || !normalizeEmail(body.email)) {
@@ -630,12 +699,23 @@ app.post('/api/auth/reset-password', authRateLimit, async (req, res) => {
   res.json({ success: true, message: 'Password updated successfully' });
 });
 
-app.get('/api/users', requireAgent, (req, res) => {
-  res.json(users.map(({ password, ...u }) => u));
+// The full directory (emails, roles) is for the super admin who manages
+// accounts; plain agents get the id/name agent picker below (#36).
+app.get('/api/users', requireSuperAdmin, (req, res) => {
+  // `super_admin` is always an explicit boolean so the console's access
+  // dropdown is never fed an `undefined` (#36).
+  res.json(users.map((u) => ({ ...safeUser(u) })));
 });
 
 app.get('/api/agents', requireAuth, (req, res) => {
   res.json(users.filter((u) => u.role === 'agent').map((u) => ({ id: u.id, name: u.name })));
+});
+
+// Email-free directory for the assignment pickers, so a regular agent can
+// still choose who an asset belongs to now that the full directory (emails,
+// roles, account management) is super-admin-only (#36).
+app.get('/api/people', requireAgent, (req, res) => {
+  res.json(users.map((u) => ({ id: u.id, name: u.name, role: u.role })));
 });
 
 // Single source of truth for the values the API accepts (#32/#33). The
@@ -645,7 +725,7 @@ app.get('/api/meta/enums', requireAuth, (req, res) => {
   res.json(ENUMS);
 });
 
-app.delete('/api/users/:id', requireAgent, sensitiveRateLimit, (req, res) => {
+app.delete('/api/users/:id', requireSuperAdmin, sensitiveRateLimit, (req, res) => {
   const target = users.find((u) => u.id === req.params.id);
   if (!target) return res.status(404).json({ error: 'User not found' });
   if (target.id === req.user.id) {
@@ -673,11 +753,14 @@ app.delete('/api/users/:id', requireAgent, sensitiveRateLimit, (req, res) => {
   res.json({ success: true });
 });
 
-app.patch('/api/users/:id', requireAgent, writeRateLimit, (req, res) => {
+app.patch('/api/users/:id', requireSuperAdmin, writeRateLimit, (req, res) => {
   const target = users.find((u) => u.id === req.params.id);
   if (!target) return res.status(404).json({ error: 'User not found' });
   // #8: explicit field allow-list — id/email/password can never be rewritten.
-  const body = pick(req.body, ['role', 'name']);
+  // `super_admin` is settable here because managing the dispatcher tier is a
+  // super-admin action by definition (#36).
+  const body = pick(req.body, ['role', 'name', 'super_admin']);
+  let needsResync = false;
   if (body.role !== undefined) {
     if (!VALID_USER_ROLE.has(body.role)) {
       return res.status(400).json({ error: 'Role must be either "agent" or "user"' });
@@ -688,7 +771,37 @@ app.patch('/api/users/:id', requireAgent, writeRateLimit, (req, res) => {
     if (target.role === 'agent' && body.role === 'user' && users.filter((u) => u.role === 'agent').length <= 1) {
       return res.status(400).json({ error: 'Cannot demote the last IT agent account' });
     }
+    if (body.role === 'user' && isSuperAdmin(target)) {
+      // Demoting an agent to employee drops the flag with it.
+      target.super_admin = false;
+    }
+    if (body.role === 'agent' && typeof target.super_admin !== 'boolean') {
+      // New agents start as regular agents (own queue only) until a super
+      // admin grants them the wider view.
+      target.super_admin = false;
+    }
     target.role = body.role;
+    needsResync = true;
+  }
+  if (body.super_admin !== undefined) {
+    if (typeof body.super_admin !== 'boolean') {
+      return res.status(400).json({ error: 'super_admin must be true or false' });
+    }
+    if (target.role !== 'agent') {
+      return res.status(400).json({ error: 'Only IT agent accounts can be super admins. Promote the account to agent first.' });
+    }
+    if (body.super_admin === true) {
+      target.super_admin = true;
+    } else if (isSuperAdmin(target)) {
+      // Never let the last dispatcher demote themselves out of the job — that
+      // would leave a queue nobody can reassign from.
+      const remaining = users.filter((u) => isSuperAdmin(u) && u.id !== target.id);
+      if (remaining.length === 0) {
+        return res.status(400).json({ error: 'This is the only super admin. Promote another agent before removing the role.' });
+      }
+      target.super_admin = false;
+    }
+    needsResync = true;
   }
   if (body.name !== undefined) {
     const trimmed = String(body.name).trim();
@@ -703,12 +816,17 @@ app.patch('/api/users/:id', requireAgent, writeRateLimit, (req, res) => {
     if (previousName !== trimmed) refreshAssigneeNames(target.id);
   }
   saveData();
+  // Role/flag changes alter what this account may see, so update any live
+  // socket it holds before responding.
+  if (needsResync) resyncUserSockets(target.id);
   res.json(safeUser(target));
 });
 
 app.get('/api/tickets', requireAuth, (req, res) => {
-  if (req.user.role === 'agent') return res.json(tickets);
-  res.json(tickets.filter((t) => t.created_by === req.user.id));
+  // #36: agents only ever receive the tickets assigned to them; the super
+  // admin receives the whole queue. (Not just filtered in the UI — the data
+  // never leaves the server.)
+  res.json(visibleTicketsFor(req.user));
 });
 
 app.post('/api/tickets', requireAuth, writeRateLimit, (req, res) => {
@@ -755,6 +873,9 @@ app.post('/api/tickets', requireAuth, writeRateLimit, (req, res) => {
   };
   tickets.unshift(newTicket);
   saveData();
+  // #36: alert the super admin that there is something to dispatch. Regular
+  // agents hear nothing about tickets they do not own.
+  io.to('role_super_admin').emit('ticket_created', { ticketId: newTicket.id });
   res.json(newTicket);
 });
 
@@ -773,6 +894,19 @@ app.patch('/api/tickets/:id', requireAuth, writeRateLimit, (req, res) => {
     ticket.status = 'Cancelled';
     saveData();
     return res.json(ticket);
+  }
+  // #36: a regular agent only works on the tickets assigned to them. The
+  // super admin manages (and dispatches) every ticket.
+  const superAdmin = isSuperAdmin(req.user);
+  if (!superAdmin && ticket.assigned_to_id !== req.user.id) {
+    return res.status(403).json({
+      error: 'This ticket is not assigned to you. Ask a super admin to reassign it if you need access.',
+    });
+  }
+  let assigneeChanged = false;
+  const changingAssignee = req.body && (req.body.assigned_to_id !== undefined || req.body.assigned_to !== undefined);
+  if (changingAssignee && !superAdmin) {
+    return res.status(403).json({ error: 'Only a super admin can reassign tickets.' });
   }
   // #8 mass-assignment fix: explicit allow-list for agents — id/created_by/
   // created_by_name/messages/created_at can never be overwritten from PATCH.
@@ -813,19 +947,29 @@ app.patch('/api/tickets/:id', requireAuth, writeRateLimit, (req, res) => {
     const assignee = resolveAssignee(requested, { onlyRole: 'agent', allowCurrent: ticket.assigned_to_id });
     if (assignee.error) return res.status(400).json({ error: assignee.error });
     setAssignee(ticket, assignee.id);
+    assigneeChanged = true;
   }
   if (body.image !== undefined) {
     ticket.image = typeof body.image === 'string' ? body.image : '';
   }
   saveData();
+  // A reassignment moves the ticket between agents: the previous owner must
+  // stop receiving it and the new one must start, live (#36).
+  if (assigneeChanged) resyncUserSockets(ticket.assigned_to_id);
+  notifyTicketChanged(ticket);
   res.json(ticket);
 });
 
 app.post('/api/tickets/:id/messages', requireAuth, writeRateLimit, (req, res) => {
   const ticket = tickets.find((t) => t.id === req.params.id);
   if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
-  if (req.user.role !== 'agent' && ticket.created_by !== req.user.id) {
-    return res.status(403).json({ error: 'You can only chat on your own requests' });
+  // #36: the reporter, the assigned agent, or a super admin.
+  if (!canAccessTicket(req.user, ticket.id)) {
+    return res.status(403).json({
+      error: req.user.role === 'agent'
+        ? 'This ticket is not assigned to you.'
+        : 'You can only chat on your own requests',
+    });
   }
   const body = pick(req.body, ['text']);
   const result = appendTicketMessage(
@@ -839,6 +983,7 @@ app.post('/api/tickets/:id/messages', requireAuth, writeRateLimit, (req, res) =>
     ticketId: result.ticket.id,
     message: result.message,
   });
+  notifyTicketChanged(result.ticket);
   res.json(result.message);
 });
 
@@ -942,7 +1087,7 @@ io.use((socket, next) => {
     try {
       const payload = jwt.verify(token, JWT_SECRET);
       const user = users.find((u) => u.id === payload.id);
-      if (user) socket.user = { id: user.id, name: user.name, role: user.role };
+      if (user) socket.user = { id: user.id, name: user.name, role: user.role, super_admin: isSuperAdmin(user) };
     } catch (err) {
       // Stays unauthenticated — handlers below will ignore its emits.
     }
@@ -950,7 +1095,62 @@ io.use((socket, next) => {
   next();
 });
 
+// Give every session the rooms it is entitled to (#36): employees follow the
+// tickets they raised, agents the ones assigned to them, super admins all of
+// them. Without this, per-ticket chat messages were broadcast to every agent
+// socket regardless of who the ticket belonged to.
+const syncTicketRooms = (socket) => {
+  if (!socket.user) return;
+  const member = users.find((u) => u.id === socket.user.id);
+  if (!member) return;
+  if (isSuperAdmin(member)) socket.join('role_super_admin');
+  else socket.leave('role_super_admin');
+  // Reassignment moves a ticket between agents: re-derive the rooms from
+  // scratch so nobody keeps receiving a queue that is no longer theirs.
+  const allowed = new Set(visibleTicketsFor(member).map((t) => `ticket_${t.id}`));
+  for (const room of socket.rooms) {
+    if (room.startsWith('ticket_') && !allowed.has(room)) socket.leave(room);
+  }
+  allowed.forEach((room) => socket.join(room));
+};
+
+// Called after a reassignment so the socket identity and rooms follow the
+// change immediately (promotions/demotions included).
+const resyncUserSockets = (userId) => {
+  io.sockets.sockets.forEach((socket) => {
+    if (!socket.user || socket.user.id !== userId) return;
+    const fresh = users.find((u) => u.id === userId);
+    if (fresh) {
+      socket.user = { id: fresh.id, name: fresh.name, role: fresh.role, super_admin: isSuperAdmin(fresh) };
+    }
+    syncTicketRooms(socket);
+  });
+};
+
+// Tell only the sessions entitled to a ticket that it changed, so agents'
+// queues update on assignment/status changes without leaking other queues.
+const notifyTicketChanged = (ticket) => {
+  const room = `ticket_${ticket.id}`;
+  const seeing = users.filter((u) => u.role === 'agent'
+    && (isSuperAdmin(u) || u.id === ticket.assigned_to_id));
+  const reporterSocket = users.find((u) => u.id === ticket.created_by);
+  io.to(room).emit('ticket_changed', { ticketId: ticket.id });
+  io.sockets.sockets.forEach((socket) => {
+    if (!socket.user) return;
+    const u = users.find((x) => x.id === socket.user.id);
+    if (!u) return;
+    const maySee = isSuperAdmin(u)
+      || (u.role === 'agent' && ticket.assigned_to_id === u.id)
+      || ticket.created_by === u.id;
+    if (!maySee) return;
+    if (seeing.some((a) => a.id === u.id) || (reporterSocket && reporterSocket.id === u.id)) {
+      socket.emit('ticket_changed', { ticketId: ticket.id });
+    }
+  });
+};
+
 io.on('connection', (socket) => {
+  syncTicketRooms(socket);
   // Per-socket message rate-limit (#7) so one client can't spam everyone.
   let socketMsgCount = 0;
   let socketMsgWindow = Date.now();
@@ -1000,6 +1200,7 @@ io.on('connection', (socket) => {
       ticketId: result.ticket.id,
       message: result.message,
     });
+    notifyTicketChanged(result.ticket);
   });
 });
 

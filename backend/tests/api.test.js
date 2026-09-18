@@ -482,3 +482,309 @@ test('unknown API routes still return JSON 404s', async () => {
   assert.equal(res.status, 404);
   assert.match(res.body.error, /Unknown API endpoint/);
 });
+
+// ---------------------------------------------------------------------------
+// #36 — scoped ticket visibility and the super-admin dispatch tier.
+//
+//   employee    -> only their own tickets
+//   agent       -> only tickets assigned to them
+//   super admin -> everything, and the only role that can reassign or
+//                  manage user accounts
+// ---------------------------------------------------------------------------
+
+/** Create an agent account (signup always yields an employee) and sign in. */
+const makeAgent = async (client, label, adminToken) => {
+  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const email = `${label}-${stamp}@example.com`;
+  const created = await client.post('/api/auth/signup', {
+    body: { name: `${label} ${stamp}`, email, password: 'AgentPass!2345' },
+  });
+  assert.equal(created.status, 200);
+  const promoted = await client.patch(`/api/users/${created.body.user.id}`, {
+    token: adminToken,
+    body: { role: 'agent' },
+  });
+  assert.equal(promoted.status, 200, `promotion failed: ${JSON.stringify(promoted.body)}`);
+  const session = await login(client, email, 'AgentPass!2345');
+  return { ...session.user, token: session.token };
+};
+
+const raiseTicket = async (client, token, title) => {
+  const res = await client.post('/api/tickets', {
+    token,
+    body: { title, description: 'raised by the #36 test suite' },
+  });
+  assert.equal(res.status, 200);
+  return res.body;
+};
+
+test('#36: a regular agent only ever receives the tickets assigned to them', async () => {
+  const agentA = await makeAgent(client, 'agent-a', admin.token);
+  const agentB = await makeAgent(client, 'agent-b', admin.token);
+  const employee = (
+    await client.post('/api/auth/signup', {
+      body: { name: 'Visibility Employee', email: `vis-${Date.now()}@example.com`, password: 'EmployeePass!23' },
+    })
+  ).body;
+
+  const assignedToA = await raiseTicket(client, employee.token, 'Ticket for agent A');
+  const assignedToB = await raiseTicket(client, employee.token, 'Ticket for agent B');
+  const unassigned = await raiseTicket(client, employee.token, 'Nobody owns this yet');
+
+  // The super admin dispatches.
+  for (const [ticket, agent] of [[assignedToA, agentA], [assignedToB, agentB]]) {
+    const res = await client.patch(`/api/tickets/${ticket.id}`, {
+      token: admin.token,
+      body: { assigned_to_id: agent.id, status: 'In Progress' },
+    });
+    assert.equal(res.status, 200, `dispatch failed: ${JSON.stringify(res.body)}`);
+    assert.equal(res.body.assigned_to_id, agent.id);
+  }
+
+  const listA = (await client.get('/api/tickets', { token: agentA.token })).body;
+  const listB = (await client.get('/api/tickets', { token: agentB.token })).body;
+  const listAdmin = (await client.get('/api/tickets', { token: admin.token })).body;
+
+  assert.deepEqual(listA.map((t) => t.id), [assignedToA.id], 'agent A must only see their own queue');
+  assert.deepEqual(listB.map((t) => t.id), [assignedToB.id], 'agent B must only see their own queue');
+  assert.ok(listA.every((t) => t.assigned_to_id === agentA.id));
+
+  const adminIds = listAdmin.map((t) => t.id);
+  for (const t of [assignedToA, assignedToB, unassigned]) {
+    assert.ok(adminIds.includes(t.id), 'the super admin sees every ticket');
+  }
+  // The unassigned ticket is invisible to every agent — it is the dispatcher's
+  // queue until it is handed out.
+  assert.ok(!listA.some((t) => t.id === unassigned.id));
+  assert.ok(!listB.some((t) => t.id === unassigned.id));
+});
+
+test('#36: an agent cannot read, edit or chat on another agent\'s ticket', async () => {
+  const agentA = await makeAgent(client, 'iso-a', admin.token);
+  const agentB = await makeAgent(client, 'iso-b', admin.token);
+  const employee = (
+    await client.post('/api/auth/signup', {
+      body: { name: 'Iso Employee', email: `iso-${Date.now()}@example.com`, password: 'EmployeePass!23' },
+    })
+  ).body;
+
+  const ticket = await raiseTicket(client, employee.token, 'Agent A only');
+  await client.patch(`/api/tickets/${ticket.id}`, {
+    token: admin.token,
+    body: { assigned_to_id: agentA.id },
+  });
+
+  const foreignPatch = await client.patch(`/api/tickets/${ticket.id}`, {
+    token: agentB.token,
+    body: { status: 'Resolved' },
+  });
+  assert.equal(foreignPatch.status, 403, 'another agent must not be able to edit the ticket');
+
+  const foreignChat = await client.post(`/api/tickets/${ticket.id}/messages`, {
+    token: agentB.token,
+    body: { text: 'butting in' },
+  });
+  assert.equal(foreignChat.status, 403, 'another agent must not be able to post in the ticket chat');
+
+  // The owner can.
+  const ownPatch = await client.patch(`/api/tickets/${ticket.id}`, {
+    token: agentA.token,
+    body: { status: 'Resolved' },
+  });
+  assert.equal(ownPatch.status, 200, `the assigned agent must be able to work the ticket: ${JSON.stringify(ownPatch.body)}`);
+  assert.equal(ownPatch.body.status, 'Resolved');
+
+  const ownChat = await client.post(`/api/tickets/${ticket.id}/messages`, {
+    token: agentA.token,
+    body: { text: 'on it' },
+  });
+  assert.equal(ownChat.status, 200);
+});
+
+test('#36: only a super admin can reassign a ticket', async () => {
+  const agentA = await makeAgent(client, 'disp-a', admin.token);
+  const agentB = await makeAgent(client, 'disp-b', admin.token);
+  const employee = (
+    await client.post('/api/auth/signup', {
+      body: { name: 'Dispatch Employee', email: `disp-${Date.now()}@example.com`, password: 'EmployeePass!23' },
+    })
+  ).body;
+  const ticket = await raiseTicket(client, employee.token, 'Dispatch me');
+  await client.patch(`/api/tickets/${ticket.id}`, { token: admin.token, body: { assigned_to_id: agentA.id } });
+
+  // An agent cannot hand their own ticket to someone else (or back to the pool).
+  const selfReassign = await client.patch(`/api/tickets/${ticket.id}`, {
+    token: agentA.token,
+    body: { assigned_to_id: agentB.id },
+  });
+  assert.equal(selfReassign.status, 403, 'agents must not be able to reassign');
+  assert.match(selfReassign.body.error, /super admin/i);
+
+  const releaseToPool = await client.patch(`/api/tickets/${ticket.id}`, {
+    token: agentA.token,
+    body: { assigned_to_id: null },
+  });
+  assert.equal(releaseToPool.status, 403, 'agents must not be able to unassign themselves either');
+
+  // The super admin can move it, and the new owner sees it immediately.
+  const dispatched = await client.patch(`/api/tickets/${ticket.id}`, {
+    token: admin.token,
+    body: { assigned_to_id: agentB.id },
+  });
+  assert.equal(dispatched.status, 200);
+
+  const listA = (await client.get('/api/tickets', { token: agentA.token })).body;
+  const listB = (await client.get('/api/tickets', { token: agentB.token })).body;
+  assert.ok(!listA.some((t) => t.id === ticket.id), 'the old owner must lose sight of it');
+  assert.ok(listB.some((t) => t.id === ticket.id), 'the new owner must gain it');
+
+  const oldOwnerPatch = await client.patch(`/api/tickets/${ticket.id}`, {
+    token: agentA.token,
+    body: { status: 'In Progress' },
+  });
+  assert.equal(oldOwnerPatch.status, 403, 'the old owner loses write access too');
+});
+
+test('#36: user management is super-admin-only', async () => {
+  const agent = await makeAgent(client, 'mgmt', admin.token);
+  const employee = (
+    await client.post('/api/auth/signup', {
+      body: { name: 'Mgmt Employee', email: `mgmt-${Date.now()}@example.com`, password: 'EmployeePass!23' },
+    })
+  ).body;
+
+  const agentUsers = await client.get('/api/users', { token: agent.token });
+  assert.equal(agentUsers.status, 403, 'a regular agent must not read the account directory');
+
+  const agentPromote = await client.patch(`/api/users/${employee.user.id}`, {
+    token: agent.token,
+    body: { role: 'agent' },
+  });
+  assert.equal(agentPromote.status, 403, 'a regular agent must not manage accounts');
+
+  const agentSelfPromote = await client.patch(`/api/users/${agent.id}`, {
+    token: agent.token,
+    body: { super_admin: true },
+  });
+  assert.equal(agentSelfPromote.status, 403, 'a regular agent must not promote themselves');
+
+  // The employee-facing agent picker still works for everyone signed in.
+  const agents = await client.get('/api/agents', { token: employee.token });
+  assert.equal(agents.status, 200);
+
+  // Regular agents keep the email-free picker directory for asset assignment.
+  const people = await client.get('/api/people', { token: agent.token });
+  assert.equal(people.status, 200);
+  assert.ok(people.body.every((p) => p.email === undefined), 'the picker must not leak emails');
+
+  const superAdminUsers = await client.get('/api/users', { token: admin.token });
+  assert.equal(superAdminUsers.status, 200);
+  assert.ok(superAdminUsers.body.some((u) => u.super_admin === true), 'the seeded admin is a super admin');
+});
+
+test('#36: the last super admin cannot be demoted away', async () => {
+  const solo = await makeAgent(client, 'solo', admin.token);
+  // Promote the new agent, then try to strip the original admin.
+  assert.equal(
+    (await client.patch(`/api/users/${solo.id}`, { token: admin.token, body: { super_admin: true } })).status,
+    200,
+  );
+  assert.equal(
+    (await client.patch(`/api/users/${admin.user.id}`, { token: admin.token, body: { super_admin: false } })).status,
+    200,
+    'with a second super admin in place, the first can step down',
+  );
+
+  const lastOne = await client.patch(`/api/users/${solo.id}`, {
+    token: solo.token,
+    body: { super_admin: false },
+  });
+  assert.equal(lastOne.status, 400, 'the only super admin must not be able to demote themselves');
+  assert.match(lastOne.body.error, /only super admin/i);
+
+  // Restore the fixture for the tests that follow.
+  assert.equal(
+    (await client.patch(`/api/users/${admin.user.id}`, { token: solo.token, body: { super_admin: true } })).status,
+    200,
+  );
+  assert.equal(
+    (await client.patch(`/api/users/${solo.id}`, { token: admin.token, body: { super_admin: false } })).status,
+    200,
+  );
+});
+
+test('#36: live ticket chat is only delivered to the people entitled to it', async () => {
+  const io = require('socket.io-client');
+  const agentA = await makeAgent(client, 'sock-a', admin.token);
+  const agentB = await makeAgent(client, 'sock-b', admin.token);
+  const employee = (
+    await client.post('/api/auth/signup', {
+      body: { name: 'Sock Employee', email: `sock-${Date.now()}@example.com`, password: 'EmployeePass!23' },
+    })
+  ).body;
+
+  const ticket = await raiseTicket(client, employee.token, 'Socket scoping');
+  await client.patch(`/api/tickets/${ticket.id}`, { token: admin.token, body: { assigned_to_id: agentA.id } });
+
+  const connect = (token) =>
+    io(server.base, { auth: { token }, transports: ['websocket'], forceNew: true, reconnection: false });
+
+  const socketA = connect(agentA.token);
+  const socketB = connect(agentB.token);
+  const receivedByB = [];
+
+  try {
+    socketB.on('receive_ticket_message', (payload) => receivedByB.push(payload));
+    await Promise.all([
+      new Promise((r) => socketA.on('connect', r)),
+      new Promise((r) => socketB.on('connect', r)),
+    ]);
+    // Let the server finish its room sync.
+    await new Promise((r) => setTimeout(r, 250));
+
+    // Agent A posts in their own ticket; agent B is connected but not entitled.
+    const posted = await client.post(`/api/tickets/${ticket.id}/messages`, {
+      token: agentA.token,
+      body: { text: 'private to agent A' },
+    });
+    assert.equal(posted.status, 200);
+
+    await new Promise((r) => setTimeout(r, 400));
+    assert.equal(receivedByB.length, 0, 'agent B must not receive another agent\'s ticket traffic');
+  } finally {
+    socketA.close();
+    socketB.close();
+  }
+});
+
+test('#36: /api/auth/me reports the live role and access level', async () => {
+  const agent = await makeAgent(client, 'me', admin.token);
+
+  const superMe = await client.get('/api/auth/me', { token: admin.token });
+  assert.equal(superMe.status, 200);
+  assert.equal(superMe.body.super_admin, true, 'the seeded admin reports super-admin access');
+  assert.equal(superMe.body.role, 'agent');
+  assert.equal(superMe.body.password, undefined, 'never serialize the password hash');
+
+  const agentMe = await client.get('/api/auth/me', { token: agent.token });
+  assert.equal(agentMe.status, 200);
+  assert.equal(agentMe.body.super_admin, false, 'a regular agent reports its own access level');
+
+  // Promoting changes what the next poll sees — that is how a console picks up
+  // a role change without signing out.
+  assert.equal(
+    (await client.patch(`/api/users/${agent.id}`, { token: admin.token, body: { super_admin: true } })).status,
+    200,
+  );
+  const promoted = await client.get('/api/auth/me', { token: agent.token });
+  assert.equal(promoted.body.super_admin, true, 'the promotion is visible immediately');
+
+  const anon = await client.get('/api/auth/me');
+  assert.equal(anon.status, 401);
+
+  // Put the fixture back the way the other tests expect it.
+  assert.equal(
+    (await client.patch(`/api/users/${agent.id}`, { token: admin.token, body: { super_admin: false } })).status,
+    200,
+  );
+});

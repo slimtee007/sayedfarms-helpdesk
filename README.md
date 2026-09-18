@@ -33,12 +33,35 @@ Default admin sign-in (development only — override via `ADMIN_EMAIL` /
 - Passwords are stored as bcrypt hashes; sessions are signed JWTs
   (`Authorization: Bearer <token>`, 12-hour expiry by default).
 - **Every public signup creates an employee account.** There is no way to
-  self-register as an agent: agent access is granted by an existing agent
-  from User Management in the Agent Console.
+  self-register as an agent or a super admin: those are granted from User
+  Management in the Agent Console.
+
+### Who sees which ticket
+
+| Account | Ticket queue | Can reassign |
+|---|---|---|
+| Employee | only the tickets they raised | no |
+| **Agent** | **only the tickets assigned to them** | no |
+| **Super admin** | every ticket (plus the unassigned dispatch queue) | **yes** |
+
+- An agent can work their own tickets (status, details, per-ticket chat) and
+  nothing else — another agent's ticket is a `403` on read, edit *and* chat,
+  and its live chat traffic is never delivered to their socket.
+- The **super admin** dispatches: only that role can move a ticket between
+  agents, hand it back to the unassigned pool, or manage user accounts. The
+  queue and any open thread update live when work is reassigned.
+- `super_admin` is a flag on an agent account (`safeUser().super_admin`), so
+  every `role === 'agent'` rule keeps working. Promotion/demotion lives in
+  User Management → *Ticket Access*; the **last** super admin cannot be
+  demoted, so a queue can never become unassignable.
+- On first boot after upgrading, existing agent accounts become regular
+  agents and the `ADMIN_EMAIL` account (or, failing that, the first agent) is
+  promoted to super admin — the boot log says which.
 - Employees only ever see their own tickets (list, updates, chat). The user
-  directory and inventory are agent-only; employees get an id/name agent
-  picker (`GET /api/agents`) for the "direct request" dropdown — picking an
-  agent there really does assign them.
+  directory is super-admin-only; everyone else uses the id/name agent picker
+  (`GET /api/agents`) for the "direct request" dropdown — picking an agent
+  there really does assign them. Agents keep an email-free `{id,name,role}`
+  directory (`GET /api/people`) for assigning assets.
 - **Assignments are keyed by user id.** Tickets and assets carry
   `assigned_to_id` (canonical) plus `assigned_to` (a denormalized display name
   kept in sync), so renaming a user never orphans their work and two accounts
@@ -56,7 +79,8 @@ cd frontend && npm run lint && npm run build
 ```
 
 `backend/tests/api.test.js` covers the authz guards, the UI/API status contracts,
-id-keyed assignments (rename/duplicate-name/delete/legacy migration), the
+id-keyed assignments (rename/duplicate-name/delete/legacy migration), per-agent
+queue scoping and super-admin dispatch (including live socket delivery), the
 persisted reset codes and the rate limiter. `.github/workflows/ci.yml` runs all
 of it on every push and pull request.
 
