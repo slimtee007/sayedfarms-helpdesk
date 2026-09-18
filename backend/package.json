@@ -5,7 +5,9 @@
   "main": "server.js",
   "scripts": {
     "test": "node --test tests/*.test.js",
-    "start": "node server.js"
+    "start": "node server.js",
+    "accounts": "node scripts/admin.js --list",
+    "grant-super-admin": "node scripts/admin.js"
   },
   "keywords": [],
   "author": "",

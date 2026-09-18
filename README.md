@@ -71,6 +71,33 @@ Default admin sign-in (development only — override via `ADMIN_EMAIL` /
   emits from unauthenticated sockets and ticket-room joins for tickets you
   don't own are ignored.
 
+## Locked out of the super admin account?
+
+Passwords are stored as bcrypt hashes, so **nobody can read a password back out
+of `db.json`** — not you, not this project. Access is restored instead:
+
+```bash
+cd backend
+npm run accounts                      # who exists, and who is the super admin
+node scripts/admin.js admin@sayedfarms.com --password 'a-new-strong-password'
+npm start                             # restart: accounts are loaded at boot
+```
+
+- `npm run accounts` (`node scripts/admin.js --list`) prints every account, its
+  role and whether it holds super-admin access — never a password hash.
+- Reset one account and it is granted IT agent + super admin; add `--agent` to
+  grant the queue-scoped agent role instead.
+- Omit `--password` and a strong random one is generated and shown once.
+- The tool refuses to leave the installation with **zero** super admins.
+- Point it elsewhere with `--file <path>` (or the `DATA_FILE` env var).
+
+**Stop the server first.** It keeps the whole database in memory and rewrites
+`db.json` on every write, so a change made while it is running can be silently
+overwritten. Restart it afterwards.
+
+Forgot-password also works without SMTP: with no SMTP configured the reset code
+is printed to the backend terminal and shown on screen (development only).
+
 ## Tests & CI
 
 ```bash
@@ -118,12 +145,13 @@ Required env (see `backend/.env.example`): `JWT_SECRET` (the server refuses
 to boot in production without it), `ADMIN_EMAIL`, `ADMIN_PASSWORD`,
 `CORS_ORIGIN`, `JWT_EXPIRES_IN`.
 
-> **Note:** `backend/db.json` was tracked in git in an early commit and
-> contained plaintext passwords. It is now git-ignored and no longer
-> committed, but the old values live on in history — treat every password
-> that was ever committed there as compromised, rotate them, and purge the
-> file from history (e.g. `git filter-repo --path backend/db.json
-> --invert-paths`) before any real deployment.
+> **Note on git history.** `backend/db.json` is git-ignored and is not in the
+> repository's history. What *is* in history is a plaintext credential file
+> (`frontend/di-rect password.txt`, deleted in `0cebc46` but still reachable on
+> the `arena/*` branches): the credentials in it are exposed on GitHub and must
+> be treated as compromised — **rotate them**, then purge the file from history
+> (`git filter-repo --path 'frontend/di-rect password.txt' --invert-paths`) and
+> force-push, or delete the stale branches. See BUG-REPORT.md #37.
 
 ## Password reset emails (SMTP)
 

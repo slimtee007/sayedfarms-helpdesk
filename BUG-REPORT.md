@@ -325,6 +325,45 @@ account directory.
 0 errors, `vite build` clean, **35/35 live checks** through the Vite proxy for the new rules and
 **34/34** of the previous suite re-run unchanged (no regressions).
 
+### 15. Credentials committed to git — PARTIALLY FIXED (step 7)
+
+While auditing the credential situation, the record in this report needed correcting: the note above
+blamed `backend/db.json`, but **that file was never committed** — `git rev-list --all --objects |
+grep db.json` returns nothing. What actually leaked is different, and it is still reachable.
+
+| # | Finding | Status |
+|---|---|---|
+| 37 | **`frontend/di-rect password.txt` was committed with plaintext credentials** (`admin`, `remote`, `Alaba-Links` and their passwords). Deleted in `0cebc46`, but the commit is an ancestor of the still-existing `arena/*` branches, so the contents remain readable on GitHub in a **public** repository. | **File deleted · history NOT purged — rotate now** |
+| 38 | Any agent could see, edit and reassign every ticket; no dispatcher tier existed. | **FIXED** — see FIXED §14 (#36) |
+
+**To close #37:** treat every credential in that file as compromised and rotate it at the source
+(none of them are helpdesk accounts — they look like unrelated infrastructure logins, so check what
+else uses them), then remove it from history and force-push, or delete the stale `arena/*` branches:
+
+```bash
+git filter-repo --path 'frontend/di-rect password.txt' --invert-paths
+git push --force --all && git push --force --tags
+```
+
+GitHub also keeps unreachable objects for a while after a force-push; contact support if the repo was
+public and you need them expired immediately. Rotating the credentials is the part that actually
+matters — the history purge only stops future readers.
+
+#### Account recovery tooling — ADDED
+Because passwords are bcrypt hashes and cannot be read back out of `db.json`, `backend/scripts/admin.js`
+now handles "I am locked out" without editing files by hand:
+
+- `npm run accounts` — lists accounts, roles and who holds super-admin access (never a hash).
+- `node scripts/admin.js <email> --password <new>` — resets the password and grants IT agent +
+  super admin (`--agent` for the queue-scoped role instead, omit `--password` to generate one).
+- Refuses to leave the installation with zero super admins, writes atomically, and warns that the
+  server must be stopped first (it holds the database in memory and overwrites `db.json` on writes).
+
+**Verified:** 24/24 backend tests (3 new covering the listing, a real locked-out recovery, and the
+zero-super-admin guard), plus a manual end-to-end run — reset the super admin password, booted the
+server, signed in with the new password, confirmed the old one is rejected and the full ticket queue
+is visible.
+
 ---
 
 ## OPEN — security (fix before any real deployment)

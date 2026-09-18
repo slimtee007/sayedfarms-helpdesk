@@ -788,3 +788,96 @@ test('#36: /api/auth/me reports the live role and access level', async () => {
     200,
   );
 });
+
+// ---------------------------------------------------------------------------
+// Locked out? scripts/admin.js is the recovery path — passwords are bcrypt
+// hashes and cannot be read back, so this is how access is restored.
+// ---------------------------------------------------------------------------
+const SCRIPT = path.join(__dirname, '..', 'scripts', 'admin.js');
+const runScript = (args) => {
+  const { execFileSync } = require('node:child_process');
+  return execFileSync(process.execPath, [SCRIPT, ...args], { encoding: 'utf8' });
+};
+
+test('scripts/admin.js --list reports accounts without leaking hashes', async () => {
+  const out = runScript(['--list', '--file', dbFile]);
+  assert.match(out, /SUPER ADMIN/, 'the super admin should be visible in the listing');
+  assert.match(out, /admin@sayedfarms\.test/, 'the seeded admin should be listed');
+  assert.ok(!/\$2[aby]\$/.test(out), 'password hashes must never be printed');
+});
+
+test('scripts/admin.js restores access to a super admin whose password is lost', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sayedfarms-recover-'));
+  const file = path.join(dir, 'db.json');
+  const email = 'locked-out@sayedfarms.test';
+  const newPassword = 'RegainedAccess!2026';
+
+  // A database whose only super admin has a password nobody knows.
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      users: [{
+        id: 'locked-1',
+        name: 'Locked Out',
+        email,
+        role: 'agent',
+        super_admin: true,
+        password: require('bcryptjs').hashSync('forgotten-password', 10),
+      }],
+      tickets: [],
+      inventory: [],
+      resetCodes: {},
+    })
+  );
+
+  const out = runScript([email, '--password', newPassword, '--file', file]);
+  assert.match(out, /Updated/, `unexpected output: ${out}`);
+
+  // The new password works, the old one does not, and the account keeps dispatch rights.
+  const s = await startServer(file, await freePort());
+  try {
+    const c = api(s.base);
+    const good = await c.post('/api/auth/login', { body: { email, password: newPassword } });
+    assert.equal(good.status, 200, 'the recovered password must sign in');
+    assert.equal(good.body.user.super_admin, true, 'the account must still be a super admin');
+
+    const stale = await c.post('/api/auth/login', { body: { email, password: 'forgotten-password' } });
+    assert.equal(stale.status, 400, 'the forgotten password must stop working');
+
+    const all = await c.get('/api/tickets', { token: good.body.token });
+    assert.equal(all.status, 200, 'the recovered account can reach the full queue');
+  } finally {
+    await s.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('scripts/admin.js can create a missing super admin and refuses to remove the last one', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sayedfarms-recover2-'));
+  const file = path.join(dir, 'db.json');
+  const email = 'fresh-admin@sayedfarms.test';
+
+  // Empty database (no users at all).
+  fs.writeFileSync(file, JSON.stringify({ users: [], tickets: [], inventory: [], resetCodes: {} }));
+
+  const created = runScript([email, '--password', 'BrandNewAdmin!1', '--file', file]);
+  assert.match(created, /Created a new account/, `unexpected output: ${created}`);
+
+  const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(onDisk.users.length, 1);
+  assert.equal(onDisk.users[0].super_admin, true, 'a recovered account gets dispatch rights by default');
+
+  // Demoting the ONLY super admin is refused, so a queue can never be stranded.
+  assert.throws(
+    () => runScript([email, '--agent', '--password', 'BrandNewAdmin!1', '--file', file]),
+    /no super admin/i
+  );
+
+  // With a second super admin present, a plain agent account is allowed.
+  const second = runScript(['second@sayedfarms.test', '--agent', '--password', 'SecondAgent!1', '--file', file]);
+  assert.match(second, /Updated|Created/);
+  const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(after.users.find((u) => u.email === 'second@sayedfarms.test').super_admin, false);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
