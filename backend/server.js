@@ -1215,3 +1215,24 @@ const PORT = process.env.PORT || 5000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+// A second `npm start` used to die with a raw EADDRINUSE stack trace, which
+// reads like a code fault rather than "you already have a server running".
+// Recovered from the stale arena/01a08b5a branch before it was deleted.
+server.on('error', (err) => {
+  if (err && err.code === 'EADDRINUSE') {
+    console.error(`\n[FATAL] Port ${PORT} is already in use — another copy of the backend is probably still running.`);
+    console.error('        Stop the other process, then start the server again:');
+    console.error(`          Windows (PowerShell):  Get-Process node | Stop-Process -Force`);
+    console.error(`          macOS/Linux:           lsof -ti:${PORT} | xargs kill -9`);
+    console.error('        Or start this copy on a different port:  PORT=5001 npm start\n');
+    process.exit(1);
+  }
+  if (err && err.code === 'EACCES') {
+    console.error(`\n[FATAL] Not allowed to bind port ${PORT}. Ports below 1024 need elevated privileges.`);
+    console.error('        Set PORT to a value above 1024 in backend/.env and try again.\n');
+    process.exit(1);
+  }
+  console.error('[FATAL] Server error:', err);
+  process.exit(1);
+});

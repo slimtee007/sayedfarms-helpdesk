@@ -325,44 +325,41 @@ account directory.
 0 errors, `vite build` clean, **35/35 live checks** through the Vite proxy for the new rules and
 **34/34** of the previous suite re-run unchanged (no regressions).
 
-### 15. Credentials committed to git — PARTIALLY FIXED (step 7)
+### 15. Credentials in git history — DIAGNOSED & BRANCHES CLEANED (step 7)
 
-While auditing the credential situation, the record in this report needed correcting: the note above
-blamed `backend/db.json`, but **that file was never committed** — `git rev-list --all --objects |
-grep db.json` returns nothing. What actually leaked is different, and it is still reachable.
+**Correction to an earlier note in this report (and to my own first pass):** an initial check said
+`backend/db.json` was never committed. That was wrong — it was made with only some branches fetched.
+With every ref in hand, the file *is* in reachable history, together with a second credential file.
 
-| # | Finding | Status |
+Verified against the live GitHub API (this repository is public):
+
+| # | Exposure | Verified status |
 |---|---|---|
-| 37 | **`frontend/di-rect password.txt` was committed with plaintext credentials** (`admin`, `remote`, `Alaba-Links` and their passwords). Deleted in `0cebc46`, but the commit is an ancestor of the still-existing `arena/*` branches, so the contents remain readable on GitHub in a **public** repository. | **File deleted · history NOT purged — rotate now** |
-| 38 | Any agent could see, edit and reassign every ticket; no dispatcher tier existed. | **FIXED** — see FIXED §14 (#36) |
+| 37 | `frontend/di-rect password.txt` — plaintext credentials for `admin`, `remote`, `Alaba-Links` (deleted in `0cebc46`) | **still fetchable by SHA `9767591`** (65 bytes) |
+| 37b | `backend/db.json` — plaintext passwords for `admin@sayedfarms.com`, `ishaq.tesleem@sayedfarms.com`, `aa@sayedfarms.com`, `ishaqtesleem@gmail.com` (added in `9767591`; deleted again in `d13e60f`, re-added by the revert `85babcf`) | **still fetchable by SHA `9767591`** (1334 bytes) |
+| 28 | `backend/helpdesk.db` — a committed SQLite binary | removed from tips; same history caveat applies |
 
-**To close #37:** treat every credential in that file as compromised and rotate it at the source
-(none of them are helpdesk accounts — they look like unrelated infrastructure logins, so check what
-else uses them), then remove it from history and force-push, or delete the stale `arena/*` branches:
+**Branch cleanup does not unpublish either file.** Commit `9767591` remains reachable through
+GitHub's pull-request refs (`refs/pull/1..8/head`), which users cannot delete. Measured after the
+cleanup below: browsing both paths returns `404`, while
+`GET /repos/slimtee007/sayedfarms-helpdesk/contents/<path>?ref=9767591` still returns the files.
 
-```bash
-git filter-repo --path 'frontend/di-rect password.txt' --invert-paths
-git push --force --all && git push --force --tags
-```
+**To close it:** rotate every credential listed above (the helpdesk accounts *and* the
+`admin`/`remote`/`Alaba-Links` logins); then ask GitHub Support to purge commit `9767591`
+("sensitive data removal") — only Support can expire PR refs and cached objects. History rewriting
+alone is insufficient for the same reason.
 
-GitHub also keeps unreachable objects for a while after a force-push; contact support if the repo was
-public and you need them expired immediately. Rotating the credentials is the part that actually
-matters — the history purge only stops future readers.
-
-#### Account recovery tooling — ADDED
-Because passwords are bcrypt hashes and cannot be read back out of `db.json`, `backend/scripts/admin.js`
-now handles "I am locked out" without editing files by hand:
-
-- `npm run accounts` — lists accounts, roles and who holds super-admin access (never a hash).
-- `node scripts/admin.js <email> --password <new>` — resets the password and grants IT agent +
-  super admin (`--agent` for the queue-scoped role instead, omit `--password` to generate one).
-- Refuses to leave the installation with zero super admins, writes atomically, and warns that the
-  server must be stopped first (it holds the database in memory and overwrites `db.json` on writes).
-
-**Verified:** 24/24 backend tests (3 new covering the listing, a real locked-out recovery, and the
-zero-super-admin guard), plus a manual end-to-end run — reset the super admin password, booted the
-server, signed in with the new password, confirmed the old one is rejected and the full ticket queue
-is visible.
+#### Stale-branch cleanup — DONE
+All **11** branches whose history reached the leaked files were deleted from the remote, after
+verifying what each held and bundling a full mirror first
+(`git bundle create helpdesk-all-branches.bundle --all`, kept outside the repo). Deleted:
+`arena/01a08a5c`, `arena/01a08b5a`, `arena/01a0900a`, `arena/01a0a079`, `arena/01a0a3d5`,
+`arena/01a0a90e`, `arena/01a0ae1d`, `arena/01a0af05`, `fix/blank-agent-pages`, `fix/chat-delivery`,
+`revert-6-arena/01a0ae1d`. Six carried already-merged work (PRs #1, #3, #4, #5, #6, #8) and
+`arena/01a0af05` was byte-identical to `main`; the other four were superseded attempts, with one
+genuine improvement recovered first — a friendly `EADDRINUSE` message instead of a raw stack trace
+when the port is already taken (ported from `arena/01a08b5a`). The remote now holds only `main` and
+the open PR #9 branch.
 
 ---
 

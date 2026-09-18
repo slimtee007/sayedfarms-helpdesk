@@ -145,13 +145,33 @@ Required env (see `backend/.env.example`): `JWT_SECRET` (the server refuses
 to boot in production without it), `ADMIN_EMAIL`, `ADMIN_PASSWORD`,
 `CORS_ORIGIN`, `JWT_EXPIRES_IN`.
 
-> **Note on git history.** `backend/db.json` is git-ignored and is not in the
-> repository's history. What *is* in history is a plaintext credential file
-> (`frontend/di-rect password.txt`, deleted in `0cebc46` but still reachable on
-> the `arena/*` branches): the credentials in it are exposed on GitHub and must
-> be treated as compromised — **rotate them**, then purge the file from history
-> (`git filter-repo --path 'frontend/di-rect password.txt' --invert-paths`) and
-> force-push, or delete the stale branches. See BUG-REPORT.md #37.
+> **Security: two credential files are still readable in this repository's
+> history. Rotate them — that is the only fix that protects you.**
+>
+> Both were verified against the live GitHub API, not inferred:
+>
+> | File | What it contains | Status |
+> |---|---|---|
+> | `backend/db.json` | plaintext passwords for `admin@sayedfarms.com`, `ishaq.tesleem@sayedfarms.com`, `aa@sayedfarms.com`, `ishaqtesleem@gmail.com` | **fetchable by commit SHA** (`9767591`) |
+> | `frontend/di-rect password.txt` | plaintext credentials for `admin`, `remote`, `Alaba-Links` | **fetchable by commit SHA** (`9767591`) |
+>
+> Deleting the branches that contained them does **not** unpublish them:
+> commit `9767591` stays reachable through GitHub's pull-request refs
+> (`refs/pull/1..8/head`), which cannot be deleted by users. Browsing the repo
+> returns 404, but `GET /repos/:owner/:repo/contents/<path>?ref=9767591` still
+> serves both files.
+>
+> To close it:
+> 1. **Rotate every credential above** wherever it is used (the helpdesk
+>    accounts *and* the `admin`/`remote`/`Alaba-Links` logins), then change the
+>    passwords in the app — `npm run accounts` lists the accounts, and
+>    `node scripts/admin.js <email> --password <new>` resets one.
+> 2. **Ask GitHub Support to purge commit `9767591`** ("sensitive data
+>    removal"). Only Support can expire the PR refs and cached objects.
+> 3. Optional and incomplete: `git filter-repo --path backend/db.json --path
+>    'frontend/di-rect password.txt' --invert-paths` then force-push. It rewrites
+>    every branch SHA (breaking clones and open PRs) and *still* leaves the PR
+>    refs intact, so do 1 and 2 regardless.
 
 ## Password reset emails (SMTP)
 
