@@ -50,7 +50,9 @@ const io = new Server(server, {
   }
 });
 
-const DATA_FILE = path.join(__dirname, 'db.json');
+// Overridable so tests (and multi-instance deployments) can point the server
+// at a scratch file without touching the real store.
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'db.json');
 
 // Default initial data if db.json does not exist. db.json is git-ignored and
 // local to each machine — the admin account below is created on first boot
@@ -72,8 +74,10 @@ const initialData = {
     }
   ],
   inventory: [
-    { id: '1', name: 'MacBook Pro 16 M2', category: 'Laptop', serial_number: 'SN-8942-X1', assigned_to: 'Unassigned', status: 'In Stock' }
-  ]
+    { id: '1', name: 'MacBook Pro 16 M2', category: 'Laptop', serial_number: 'SN-8942-X1', assigned_to: 'Unassigned', assigned_to_id: null, status: 'In Stock' }
+  ],
+  // Persisted password-reset codes (#24) — keyed by normalized email.
+  resetCodes: {}
 };
 
 // Load persistent data from JSON file
@@ -93,6 +97,9 @@ const db = loadData();
 let users = db.users || [];
 let tickets = db.tickets || [];
 let inventory = db.inventory || [];
+// Reset codes survive restarts (#24) — a restart used to void every pending
+// code, which looked like "the code you just emailed me is wrong".
+let resetCodes = db.resetCodes && typeof db.resetCodes === 'object' ? db.resetCodes : {};
 
 // Monotonic id generator (#18). Date.now() primary keys collided under
 // concurrent writes: 6 simultaneous signups produced the same id, and
@@ -110,7 +117,7 @@ const normalizeEmail = (email) => (email || '').trim().toLowerCase();
 
 // Save state to disk
 const saveData = () => {
-  fs.writeFileSync(DATA_FILE, JSON.stringify({ users, tickets, inventory }, null, 2));
+  fs.writeFileSync(DATA_FILE, JSON.stringify({ users, tickets, inventory, resetCodes }, null, 2));
 };
 
 // ------------------------------------------------------------------
@@ -119,8 +126,22 @@ const saveData = () => {
 const BCRYPT_ROUNDS = 10;
 const isBcryptHash = (value) => typeof value === 'string' && /^\$2[aby]\$\d{2}\$/.test(value);
 const signToken = (user) => jwt.sign({ id: user.id, role: user.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+
+// ------------------------------------------------------------------
+// Super-admin tier (#36).
+//
+// Every agent used to see every ticket and could reassign any of them. Now:
+//   employee     — only their own tickets
+//   agent        — only the tickets assigned to them
+//   super admin  — every ticket, and the only role that can dispatch
+//                  (reassign) work or manage user accounts
+// `super_admin` is a flag on agent accounts rather than a third role value, so
+// every existing `role === 'agent'` check keeps working unchanged.
+// ------------------------------------------------------------------
+const isSuperAdmin = (u) => Boolean(u && u.role === 'agent' && u.super_admin === true);
+
 // Never serialize the password hash to clients.
-const safeUser = (u) => ({ id: u.id, name: u.name, email: u.email, role: u.role });
+const safeUser = (u) => ({ id: u.id, name: u.name, email: u.email, role: u.role, super_admin: isSuperAdmin(u) });
 
 // Databases created before auth hardening store plaintext passwords — hash
 // them in place on boot so every credential at rest is a bcrypt hash.
@@ -148,18 +169,122 @@ if (!users.some((u) => u.role === 'agent')) {
     name: 'IT Admin',
     email: ADMIN_EMAIL,
     role: 'agent',
+    super_admin: true,
     password: bcrypt.hashSync(adminPassword, BCRYPT_ROUNDS),
   });
   saveData();
-  console.log(`[INIT] No agent account found — created ${ADMIN_EMAIL}`);
+  console.log(`[INIT] No agent account found — created ${ADMIN_EMAIL} (super admin)`);
   if (!process.env.ADMIN_PASSWORD) {
     console.warn('[WARN] Using the default admin password. Set ADMIN_PASSWORD in backend/.env (and change it after first sign-in).');
   }
 }
 
+// Super-admin migration (#36). Agents that predate the flag become regular
+// agents — they now see only the tickets assigned to them — and one account is
+// always promoted so the helpdesk can never end up with nobody able to
+// dispatch work. The configured ADMIN_EMAIL account wins; otherwise the first
+// agent in the directory is promoted and named in the log.
+let superAdminMigrated = false;
+users.forEach((u) => {
+  if (u.role === 'agent' && typeof u.super_admin !== 'boolean') {
+    u.super_admin = false;
+    superAdminMigrated = true;
+  }
+});
+if (!users.some(isSuperAdmin)) {
+  const byAdminEmail = users.find((u) => u.role === 'agent' && normalizeEmail(u.email) === ADMIN_EMAIL);
+  const promoted = byAdminEmail || users.find((u) => u.role === 'agent');
+  if (promoted) {
+    promoted.super_admin = true;
+    superAdminMigrated = true;
+    console.log(`[INIT] No super admin found — promoted ${promoted.email} to super admin so tickets can be dispatched.`);
+    if (!byAdminEmail) {
+      console.warn('[WARN] Promote the intended dispatcher in User Management and demote this account.');
+    }
+  }
+}
+if (superAdminMigrated) saveData();
+
+// ------------------------------------------------------------------
+// Assignments keyed by user id (#17).
+//
+// Assignments used to be stored as the assignee's *display name*. Renaming a
+// user orphaned every ticket and asset pointing at them, and two accounts with
+// the same name were indistinguishable (the <select> even emitted duplicate
+// React keys). `assigned_to_id` is now the source of truth and `assigned_to`
+// is kept as a denormalized display name so existing API consumers, badges and
+// exports keep working.
+// ------------------------------------------------------------------
+const UNASSIGNED = 'Unassigned';
+
+const displayNameForId = (id) => {
+  if (!id) return UNASSIGNED;
+  const u = users.find((x) => x.id === id);
+  return u ? u.name : UNASSIGNED;
+};
+
+const setAssignee = (row, id) => {
+  row.assigned_to_id = id || null;
+  row.assigned_to = displayNameForId(id);
+};
+
+/**
+ * Resolve a client-supplied assignee (id, or a legacy display name) to a user.
+ * Returns { id } on success (id === null means "Unassigned"), or { error }.
+ *
+ * `onlyRole` restricts who may be assigned (tickets go to IT agents).
+ * `allowCurrent` lets a row keep an assignee that no longer matches the
+ * restriction instead of hard-failing the whole PATCH.
+ */
+const resolveAssignee = (raw, { onlyRole, allowCurrent } = {}) => {
+  const value = typeof raw === 'string' ? raw.trim() : raw;
+  if (value === undefined || value === null || value === '' || value === UNASSIGNED) {
+    return { id: null };
+  }
+  const byId = users.find((u) => u.id === value);
+  const byName = users.find((u) => u.name && u.name.toLowerCase() === String(value).toLowerCase());
+  const user = byId || byName;
+  if (!user) {
+    return { error: `No such user: "${String(value).slice(0, 100)}". Pick someone from the list, or Unassigned.` };
+  }
+  if (onlyRole && user.role !== onlyRole && user.id !== allowCurrent) {
+    return { error: `${user.name} is not an IT agent. Tickets can only be assigned to agents or Unassigned.` };
+  }
+  return { id: user.id };
+};
+
+// Keep the denormalized names honest after a rename.
+const refreshAssigneeNames = (userId) => {
+  let changed = false;
+  const sync = (row) => {
+    if (row.assigned_to_id === userId) {
+      row.assigned_to = displayNameForId(userId);
+      changed = true;
+    }
+  };
+  tickets.forEach(sync);
+  inventory.forEach(sync);
+  return changed;
+};
+
 // Backfill per-ticket chat history for tickets created before it existed, plus
-// ownership for tickets created before reporter identity was stamped (#14).
+// ownership for tickets created before reporter identity was stamped (#14),
+// plus id-keyed assignments for rows written before #17 was fixed.
 let ticketsMigrated = false;
+const migrateAssignee = (row) => {
+  if (row.assigned_to_id !== undefined) return;
+  const raw = row.assigned_to;
+  if (!raw || raw === UNASSIGNED) {
+    row.assigned_to_id = null;
+    row.assigned_to = UNASSIGNED;
+  } else {
+    const owner = users.find((u) => u.name && u.name.toLowerCase() === String(raw).toLowerCase());
+    row.assigned_to_id = owner ? owner.id : null;
+    // An unresolvable legacy name (deleted account, hand-edited db.json) is
+    // kept visible rather than silently relabelled "Unassigned".
+    row.assigned_to = owner ? owner.name : String(raw);
+  }
+};
 tickets.forEach((t) => {
   if (!Array.isArray(t.messages)) {
     t.messages = [];
@@ -172,9 +297,18 @@ tickets.forEach((t) => {
     t.created_by = owner ? owner.id : null;
     ticketsMigrated = true;
   }
+  if (t.assigned_to_id === undefined) {
+    migrateAssignee(t);
+    ticketsMigrated = true;
+  }
+});
+inventory.forEach((i) => {
+  if (i.assigned_to_id === undefined) {
+    migrateAssignee(i);
+    ticketsMigrated = true;
+  }
 });
 if (ticketsMigrated) saveData();
-
 // Append a chat message to a ticket (shared by the REST endpoint and sockets).
 const appendTicketMessage = (ticketId, sender, senderName, text) => {
   const ticket = tickets.find((t) => t.id === String(ticketId));
@@ -192,12 +326,24 @@ const appendTicketMessage = (ticketId, sender, senderName, text) => {
   return { ticket, message };
 };
 
-// True when `user` may see/post in a ticket.
+// True when `user` may see/post in a ticket (#36).
+//   employee    — tickets they raised
+//   agent       — tickets assigned to them
+//   super admin — everything
 const canAccessTicket = (user, ticketId) => {
   if (!user) return false;
-  if (user.role === 'agent') return true;
   const ticket = tickets.find((t) => t.id === String(ticketId));
-  return !!ticket && ticket.created_by === user.id;
+  if (!ticket) return false;
+  if (isSuperAdmin(user)) return true;
+  if (user.role === 'agent') return ticket.assigned_to_id === user.id;
+  return ticket.created_by === user.id;
+};
+
+// The tickets a given session is allowed to list.
+const visibleTicketsFor = (user) => {
+  if (isSuperAdmin(user)) return tickets;
+  if (user.role === 'agent') return tickets.filter((t) => t.assigned_to_id === user.id);
+  return tickets.filter((t) => t.created_by === user.id);
 };
 
 // Verify the Bearer token and attach the CURRENT user record.
@@ -230,12 +376,26 @@ const requireAgent = (req, res, next) => {
   });
 };
 
+// User administration and ticket dispatch are the super admin's job (#36).
+const requireSuperAdmin = (req, res, next) => {
+  requireAuth(req, res, () => {
+    if (!isSuperAdmin(req.user)) {
+      return res.status(403).json({ error: 'This action requires a super admin account.' });
+    }
+    next();
+  });
+};
+
 // ------------------------------------------------------------------
 // Rate limiting (#7) — tiny in-memory sliding window, zero new deps.
 // Blunts brute-force on login/OTP endpoints; production can put a real
 // reverse-proxy limiter in front. Configurable via RATE_LIMIT_* env.
 // ------------------------------------------------------------------
 const rateBuckets = new Map();
+// Multiplier for every bucket's budget. Default 1; raise it (e.g. behind a
+// trusted proxy, or in a test suite that drives the whole API from one IP)
+// without disabling the limiter outright.
+const RATE_LIMIT_SCALE = Math.max(1, Number(process.env.RATE_LIMIT_SCALE) || 1);
 const rateLimit = (opts) => {
   const { windowMs, max, keyFn, message } = {
     windowMs: 15 * 60 * 1000,
@@ -244,6 +404,7 @@ const rateLimit = (opts) => {
     message: 'Too many requests. Please slow down and try again in a few minutes.',
     ...opts,
   };
+  const budget = Math.max(1, Math.round(max * RATE_LIMIT_SCALE));
   return (req, res, next) => {
     const key = keyFn(req);
     const now = Date.now();
@@ -253,11 +414,11 @@ const rateLimit = (opts) => {
       rateBuckets.set(key, entry);
     }
     entry.count += 1;
-    res.set('X-RateLimit-Limit', String(max));
-    res.set('X-RateLimit-Remaining', String(Math.max(0, max - entry.count)));
+    res.set('X-RateLimit-Limit', String(budget));
+    res.set('X-RateLimit-Remaining', String(Math.max(0, budget - entry.count)));
     const resetSec = Math.max(1, Math.ceil((entry.start + windowMs - now) / 1000));
     res.set('X-RateLimit-Reset', String(resetSec));
-    if (entry.count > max) {
+    if (entry.count > budget) {
       return res.status(429).json({ error: message, retryAfter: resetSec });
     }
     next();
@@ -306,18 +467,79 @@ const requireStrings = (obj, fields) => {
   return null;
 };
 
-// Validators for #15 input validation
+// Validators for #15 input validation.
+//
+// These sets MUST cover every value the UI can submit. They previously did not:
+// the Agent Console offers "Pending / On Hold" and "Closed" (both 400'd), and
+// the Asset forms offer "Under Maintenance" and "Decommissioned" (the create
+// endpoint *silently* replaced them with "In Stock"). See BUG-REPORT #32/#33.
+// GET /api/meta/enums publishes these sets so the frontend renders its
+// <select>s from the server's list instead of drifting again.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const VALID_TICKET_STATUS = new Set(['Open', 'In Progress', 'Resolved', 'Cancelled']);
+const VALID_TICKET_STATUS = new Set(['Open', 'In Progress', 'Pending', 'Resolved', 'Closed', 'Cancelled']);
 const VALID_TICKET_PRIORITY = new Set(['Low', 'Medium', 'High', 'Urgent']);
 // Matches the options the portal form actually offers (incl. 'Access/Security').
 const VALID_TICKET_CATEGORY = new Set(['Hardware', 'Software', 'Network', 'Access/Security', 'Account', 'Other']);
 const VALID_USER_ROLE = new Set(['agent', 'user']);
-const VALID_INVENTORY_STATUS = new Set(['In Stock', 'Assigned', 'In Repair', 'Retired']);
+// Union of the two asset forms: the console's edit dropdown used In Repair /
+// Retired while the "Add Asset" form used Under Maintenance / Decommissioned.
+const VALID_INVENTORY_STATUS = new Set(['In Stock', 'Assigned', 'In Repair', 'Retired', 'Under Maintenance', 'Decommissioned']);
+const ENUMS = {
+  ticketStatus: [...VALID_TICKET_STATUS],
+  ticketPriority: [...VALID_TICKET_PRIORITY],
+  ticketCategory: [...VALID_TICKET_CATEGORY],
+  inventoryStatus: [...VALID_INVENTORY_STATUS],
+  userRole: [...VALID_USER_ROLE],
+};
 
 const { sendOtpEmail, isSmtpConfigured } = require('./utils/sendEmail');
 
-const otpStore = {};
+// ------------------------------------------------------------------
+// Password-reset codes (#24).
+//
+// These used to live in a plain in-memory object: any restart (a deploy, a
+// crash, a free-tier dyno cycle) silently voided every code a user had just
+// been emailed, which reads as "the code you sent me is wrong". They are now
+// persisted in db.json, stored as a SHA-256 digest rather than plaintext, and
+// capped at RESET_MAX_ATTEMPTS guesses each.
+// ------------------------------------------------------------------
+const RESET_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const RESET_MAX_ATTEMPTS = 5;
+
+const otpDigest = (email, otp) =>
+  crypto.createHash('sha256').update(`${normalizeEmail(email)}:${String(otp).trim()}`).digest('hex');
+
+const digestsMatch = (a, b) => {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'));
+};
+
+const pruneResetCodes = () => {
+  const now = Date.now();
+  let pruned = false;
+  for (const [email, rec] of Object.entries(resetCodes)) {
+    if (!rec || typeof rec !== 'object' || !rec.expiresAt || rec.expiresAt < now) {
+      delete resetCodes[email];
+      pruned = true;
+    }
+  }
+  if (pruned) saveData();
+  return pruned;
+};
+
+const storeResetCode = (email, otp) => {
+  pruneResetCodes();
+  resetCodes[normalizeEmail(email)] = {
+    codeHash: otpDigest(email, otp),
+    expiresAt: Date.now() + RESET_TTL_MS,
+    attempts: 0,
+    createdAt: new Date().toISOString(),
+  };
+  saveData();
+};
+
+// Drop codes that expired while the server was down.
+pruneResetCodes();
 
 if (!isSmtpConfigured()) {
   console.warn('\n[WARN] SMTP is NOT configured (backend/.env). Password reset emails will NOT be sent.');
@@ -339,10 +561,9 @@ const generateAndSendOtp = async (res, email, kind) => {
   const genericSuccess = () =>
     res.json({ success: true, emailSent: true, message: 'If an account matches that email, a verification code has been sent.' });
 
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
-  const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+  const otp = crypto.randomInt(100000, 1000000).toString();
 
-  if (user) otpStore[key] = { otp, expiresAt };
+  if (user) storeResetCode(key, otp);
 
   if (!isSmtpConfigured()) {
     if (!user) {
@@ -423,6 +644,12 @@ app.post('/api/auth/login', authRateLimit, async (req, res) => {
   res.json({ token: signToken(user), user: safeUser(user) });
 });
 
+// Who am I, according to the server (#36). Lets a signed-in console pick up a
+// role/super-admin change (or a revocation) without signing out and back in.
+app.get('/api/auth/me', requireAuth, (req, res) => {
+  res.json(safeUser(req.user));
+});
+
 app.post('/api/auth/forgot-password', authRateLimit, async (req, res) => {
   const body = pick(req.body, ['email']);
   if (!body.email || !normalizeEmail(body.email)) {
@@ -447,28 +674,58 @@ app.post('/api/auth/reset-password', authRateLimit, async (req, res) => {
   const key = normalizeEmail(body.email);
   const user = users.find((u) => normalizeEmail(u.email) === key);
   if (!user) return res.status(400).json({ error: 'Invalid or expired OTP code.' });
-  const record = otpStore[key];
-  if (!record || String(record.otp) !== String(body.otp) || Date.now() > record.expiresAt) {
+  const record = resetCodes[key];
+  if (!record || !record.expiresAt || Date.now() > record.expiresAt) {
+    return res.status(400).json({ error: 'Invalid or expired OTP code.' });
+  }
+  if (!digestsMatch(record.codeHash, otpDigest(key, body.otp))) {
+    // Burn the code after too many wrong guesses so a 6-digit space can't be
+    // walked by hand within the 10-minute window.
+    record.attempts = Number(record.attempts || 0) + 1;
+    if (record.attempts >= RESET_MAX_ATTEMPTS) {
+      delete resetCodes[key];
+      saveData();
+      return res.status(400).json({ error: 'Too many incorrect codes. Request a new one.' });
+    }
+    saveData();
     return res.status(400).json({ error: 'Invalid or expired OTP code.' });
   }
   if (typeof body.password !== 'string' || body.password.length < 8) {
     return res.status(400).json({ error: 'Password must be at least 8 characters long' });
   }
   user.password = await bcrypt.hash(body.password, BCRYPT_ROUNDS);
-  delete otpStore[key];
+  delete resetCodes[key];
   saveData();
   res.json({ success: true, message: 'Password updated successfully' });
 });
 
-app.get('/api/users', requireAgent, (req, res) => {
-  res.json(users.map(({ password, ...u }) => u));
+// The full directory (emails, roles) is for the super admin who manages
+// accounts; plain agents get the id/name agent picker below (#36).
+app.get('/api/users', requireSuperAdmin, (req, res) => {
+  // `super_admin` is always an explicit boolean so the console's access
+  // dropdown is never fed an `undefined` (#36).
+  res.json(users.map((u) => ({ ...safeUser(u) })));
 });
 
 app.get('/api/agents', requireAuth, (req, res) => {
   res.json(users.filter((u) => u.role === 'agent').map((u) => ({ id: u.id, name: u.name })));
 });
 
-app.delete('/api/users/:id', requireAgent, sensitiveRateLimit, (req, res) => {
+// Email-free directory for the assignment pickers, so a regular agent can
+// still choose who an asset belongs to now that the full directory (emails,
+// roles, account management) is super-admin-only (#36).
+app.get('/api/people', requireAgent, (req, res) => {
+  res.json(users.map((u) => ({ id: u.id, name: u.name, role: u.role })));
+});
+
+// Single source of truth for the values the API accepts (#32/#33). The
+// frontend renders its dropdowns from this, so a status added here can never
+// be rejected by the server or silently rewritten.
+app.get('/api/meta/enums', requireAuth, (req, res) => {
+  res.json(ENUMS);
+});
+
+app.delete('/api/users/:id', requireSuperAdmin, sensitiveRateLimit, (req, res) => {
   const target = users.find((u) => u.id === req.params.id);
   if (!target) return res.status(404).json({ error: 'User not found' });
   if (target.id === req.user.id) {
@@ -477,13 +734,17 @@ app.delete('/api/users/:id', requireAgent, sensitiveRateLimit, (req, res) => {
   if (target.role === 'agent' && users.filter((u) => u.role === 'agent').length <= 1) {
     return res.status(400).json({ error: 'Cannot delete the last IT agent account' });
   }
-  // Re-home assignments keyed by id OR name (#17 partial extension).
+  // Re-home every assignment that pointed at this account — matched by id
+  // (the canonical key) and by legacy display name (#17).
+  const wasTheirs = (row) =>
+    (row.assigned_to_id && row.assigned_to_id === target.id)
+    || (!row.assigned_to_id && row.assigned_to === target.name);
   tickets.forEach((t) => {
-    if (t.assigned_to === target.id || t.assigned_to === target.name) t.assigned_to = 'Unassigned';
+    if (wasTheirs(t)) setAssignee(t, null);
   });
   inventory.forEach((i) => {
-    if (i.assigned_to === target.id || i.assigned_to === target.name) {
-      i.assigned_to = 'Unassigned';
+    if (wasTheirs(i)) {
+      setAssignee(i, null);
       if (i.status === 'Assigned') i.status = 'In Stock';
     }
   });
@@ -492,11 +753,14 @@ app.delete('/api/users/:id', requireAgent, sensitiveRateLimit, (req, res) => {
   res.json({ success: true });
 });
 
-app.patch('/api/users/:id', requireAgent, writeRateLimit, (req, res) => {
+app.patch('/api/users/:id', requireSuperAdmin, writeRateLimit, (req, res) => {
   const target = users.find((u) => u.id === req.params.id);
   if (!target) return res.status(404).json({ error: 'User not found' });
   // #8: explicit field allow-list — id/email/password can never be rewritten.
-  const body = pick(req.body, ['role', 'name']);
+  // `super_admin` is settable here because managing the dispatcher tier is a
+  // super-admin action by definition (#36).
+  const body = pick(req.body, ['role', 'name', 'super_admin']);
+  let needsResync = false;
   if (body.role !== undefined) {
     if (!VALID_USER_ROLE.has(body.role)) {
       return res.status(400).json({ error: 'Role must be either "agent" or "user"' });
@@ -507,36 +771,91 @@ app.patch('/api/users/:id', requireAgent, writeRateLimit, (req, res) => {
     if (target.role === 'agent' && body.role === 'user' && users.filter((u) => u.role === 'agent').length <= 1) {
       return res.status(400).json({ error: 'Cannot demote the last IT agent account' });
     }
+    if (body.role === 'user' && isSuperAdmin(target)) {
+      // Demoting an agent to employee drops the flag with it.
+      target.super_admin = false;
+    }
+    if (body.role === 'agent' && typeof target.super_admin !== 'boolean') {
+      // New agents start as regular agents (own queue only) until a super
+      // admin grants them the wider view.
+      target.super_admin = false;
+    }
     target.role = body.role;
+    needsResync = true;
+  }
+  if (body.super_admin !== undefined) {
+    if (typeof body.super_admin !== 'boolean') {
+      return res.status(400).json({ error: 'super_admin must be true or false' });
+    }
+    if (target.role !== 'agent') {
+      return res.status(400).json({ error: 'Only IT agent accounts can be super admins. Promote the account to agent first.' });
+    }
+    if (body.super_admin === true) {
+      target.super_admin = true;
+    } else if (isSuperAdmin(target)) {
+      // Never let the last dispatcher demote themselves out of the job — that
+      // would leave a queue nobody can reassign from.
+      const remaining = users.filter((u) => isSuperAdmin(u) && u.id !== target.id);
+      if (remaining.length === 0) {
+        return res.status(400).json({ error: 'This is the only super admin. Promote another agent before removing the role.' });
+      }
+      target.super_admin = false;
+    }
+    needsResync = true;
   }
   if (body.name !== undefined) {
     const trimmed = String(body.name).trim();
     if (!trimmed) return res.status(400).json({ error: 'Name cannot be empty' });
     if (trimmed.length > 100) return res.status(400).json({ error: 'Name is too long' });
+    const previousName = target.name;
     target.name = trimmed;
+    // Assignments are keyed by id, so a rename must not orphan anything —
+    // but the denormalized display names on tickets/assets do need refreshing
+    // (#17). Before this, renaming a user left every one of their tickets
+    // labelled with the old name.
+    if (previousName !== trimmed) refreshAssigneeNames(target.id);
   }
   saveData();
+  // Role/flag changes alter what this account may see, so update any live
+  // socket it holds before responding.
+  if (needsResync) resyncUserSockets(target.id);
   res.json(safeUser(target));
 });
 
 app.get('/api/tickets', requireAuth, (req, res) => {
-  if (req.user.role === 'agent') return res.json(tickets);
-  res.json(tickets.filter((t) => t.created_by === req.user.id));
+  // #36: agents only ever receive the tickets assigned to them; the super
+  // admin receives the whole queue. (Not just filtered in the UI — the data
+  // never leaves the server.)
+  res.json(visibleTicketsFor(req.user));
 });
 
 app.post('/api/tickets', requireAuth, writeRateLimit, (req, res) => {
-  const body = pick(req.body, ['title', 'description', 'category', 'priority', 'assigned_to', 'image']);
+  const body = pick(req.body, ['title', 'description', 'category', 'priority', 'assigned_to_id', 'assigned_to', 'image']);
   if (!String(body.title || '').trim() || !String(body.description || '').trim()) {
     return res.status(400).json({ error: 'Title and description are required' });
   }
   if (String(body.title).trim().length > 200) {
     return res.status(400).json({ error: 'Title is too long (max 200 characters)' });
   }
-  const category = body.category && VALID_TICKET_CATEGORY.has(body.category) ? body.category : 'Hardware';
-  const priority = body.priority && VALID_TICKET_PRIORITY.has(body.priority) ? body.priority : 'Medium';
-  // Employees can't assign tickets to arbitrary people (#8): only agents may.
-  const assignedTo = req.user.role === 'agent' && body.assigned_to ? String(body.assigned_to) : 'Unassigned';
+  if (body.category !== undefined && !VALID_TICKET_CATEGORY.has(body.category)) {
+    return res.status(400).json({ error: `Category must be one of: ${[...VALID_TICKET_CATEGORY].join(', ')}` });
+  }
+  if (body.priority !== undefined && !VALID_TICKET_PRIORITY.has(body.priority)) {
+    return res.status(400).json({ error: `Priority must be one of: ${[...VALID_TICKET_PRIORITY].join(', ')}` });
+  }
+  const category = body.category || 'Hardware';
+  const priority = body.priority || 'Medium';
+  // "Direct Request to Agent" is honoured for everyone — but the target must be
+  // a real IT agent (or left Unassigned). Employees still cannot assign a
+  // ticket to an arbitrary user or invent a name (#8). This used to be dropped
+  // on the floor for employees, so the dropdown silently did nothing (#34).
+  const requested = body.assigned_to_id !== undefined ? body.assigned_to_id : body.assigned_to;
+  const assignee = resolveAssignee(requested, { onlyRole: 'agent' });
+  if (assignee.error) return res.status(400).json({ error: assignee.error });
   const image = typeof body.image === 'string' && body.image.length < 2_000_000 ? body.image : '';
+  if (body.image && !image) {
+    return res.status(400).json({ error: 'Attached image is too large (max ~1.5 MB after encoding). Please remove it and try again.' });
+  }
   const newTicket = {
     id: genId('ticket-'),
     title: String(body.title).trim(),
@@ -544,7 +863,8 @@ app.post('/api/tickets', requireAuth, writeRateLimit, (req, res) => {
     category,
     priority,
     status: 'Open',
-    assigned_to: assignedTo,
+    assigned_to_id: assignee.id || null,
+    assigned_to: displayNameForId(assignee.id),
     created_by: req.user.id,
     created_by_name: req.user.name,
     image,
@@ -553,6 +873,9 @@ app.post('/api/tickets', requireAuth, writeRateLimit, (req, res) => {
   };
   tickets.unshift(newTicket);
   saveData();
+  // #36: alert the super admin that there is something to dispatch. Regular
+  // agents hear nothing about tickets they do not own.
+  io.to('role_super_admin').emit('ticket_created', { ticketId: newTicket.id });
   res.json(newTicket);
 });
 
@@ -572,9 +895,22 @@ app.patch('/api/tickets/:id', requireAuth, writeRateLimit, (req, res) => {
     saveData();
     return res.json(ticket);
   }
+  // #36: a regular agent only works on the tickets assigned to them. The
+  // super admin manages (and dispatches) every ticket.
+  const superAdmin = isSuperAdmin(req.user);
+  if (!superAdmin && ticket.assigned_to_id !== req.user.id) {
+    return res.status(403).json({
+      error: 'This ticket is not assigned to you. Ask a super admin to reassign it if you need access.',
+    });
+  }
+  let assigneeChanged = false;
+  const changingAssignee = req.body && (req.body.assigned_to_id !== undefined || req.body.assigned_to !== undefined);
+  if (changingAssignee && !superAdmin) {
+    return res.status(403).json({ error: 'Only a super admin can reassign tickets.' });
+  }
   // #8 mass-assignment fix: explicit allow-list for agents — id/created_by/
   // created_by_name/messages/created_at can never be overwritten from PATCH.
-  const body = pick(req.body, ['title', 'description', 'category', 'priority', 'status', 'assigned_to', 'image']);
+  const body = pick(req.body, ['title', 'description', 'category', 'priority', 'status', 'assigned_to_id', 'assigned_to', 'image']);
   if (body.title !== undefined) {
     const t = String(body.title).trim();
     if (!t) return res.status(400).json({ error: 'Title cannot be empty' });
@@ -604,21 +940,36 @@ app.patch('/api/tickets/:id', requireAuth, writeRateLimit, (req, res) => {
     }
     ticket.status = body.status;
   }
-  if (body.assigned_to !== undefined) {
-    ticket.assigned_to = String(body.assigned_to || 'Unassigned');
+  if (body.assigned_to_id !== undefined || body.assigned_to !== undefined) {
+    // `assigned_to_id` is canonical; `assigned_to` is still accepted so older
+    // clients (and hand-written scripts) keep working (#17).
+    const requested = body.assigned_to_id !== undefined ? body.assigned_to_id : body.assigned_to;
+    const assignee = resolveAssignee(requested, { onlyRole: 'agent', allowCurrent: ticket.assigned_to_id });
+    if (assignee.error) return res.status(400).json({ error: assignee.error });
+    setAssignee(ticket, assignee.id);
+    assigneeChanged = true;
   }
   if (body.image !== undefined) {
     ticket.image = typeof body.image === 'string' ? body.image : '';
   }
   saveData();
+  // A reassignment moves the ticket between agents: the previous owner must
+  // stop receiving it and the new one must start, live (#36).
+  if (assigneeChanged) resyncUserSockets(ticket.assigned_to_id);
+  notifyTicketChanged(ticket);
   res.json(ticket);
 });
 
 app.post('/api/tickets/:id/messages', requireAuth, writeRateLimit, (req, res) => {
   const ticket = tickets.find((t) => t.id === req.params.id);
   if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
-  if (req.user.role !== 'agent' && ticket.created_by !== req.user.id) {
-    return res.status(403).json({ error: 'You can only chat on your own requests' });
+  // #36: the reporter, the assigned agent, or a super admin.
+  if (!canAccessTicket(req.user, ticket.id)) {
+    return res.status(403).json({
+      error: req.user.role === 'agent'
+        ? 'This ticket is not assigned to you.'
+        : 'You can only chat on your own requests',
+    });
   }
   const body = pick(req.body, ['text']);
   const result = appendTicketMessage(
@@ -632,6 +983,7 @@ app.post('/api/tickets/:id/messages', requireAuth, writeRateLimit, (req, res) =>
     ticketId: result.ticket.id,
     message: result.message,
   });
+  notifyTicketChanged(result.ticket);
   res.json(result.message);
 });
 
@@ -640,21 +992,30 @@ app.get('/api/inventory', requireAgent, (req, res) => {
 });
 
 app.post('/api/inventory', requireAgent, writeRateLimit, (req, res) => {
-  const body = pick(req.body, ['name', 'category', 'serial_number', 'assigned_to', 'status']);
+  const body = pick(req.body, ['name', 'category', 'serial_number', 'assigned_to_id', 'assigned_to', 'status']);
   const missing = requireStrings(body, ['name', 'category', 'serial_number']);
   if (missing) return res.status(400).json({ error: `${missing} is required` });
   const serial = String(body.serial_number).trim();
   if (inventory.some((i) => String(i.serial_number).toLowerCase() === serial.toLowerCase())) {
     return res.status(400).json({ error: 'An asset with this serial number already exists' });
   }
-  const status = body.status && VALID_INVENTORY_STATUS.has(body.status) ? body.status : 'In Stock';
+  // A status the API doesn't know is now an explicit 400. It used to fall
+  // through to 'In Stock', so picking "Under Maintenance" on the Add Asset
+  // form saved the asset as "In Stock" without a word (#33).
+  if (body.status !== undefined && !VALID_INVENTORY_STATUS.has(body.status)) {
+    return res.status(400).json({ error: `Status must be one of: ${[...VALID_INVENTORY_STATUS].join(', ')}` });
+  }
+  const requested = body.assigned_to_id !== undefined ? body.assigned_to_id : body.assigned_to;
+  const assignee = resolveAssignee(requested);
+  if (assignee.error) return res.status(400).json({ error: assignee.error });
   const newItem = {
     id: genId('asset-'),
     name: String(body.name).trim(),
     category: String(body.category).trim(),
     serial_number: serial,
-    assigned_to: body.assigned_to ? String(body.assigned_to) : 'Unassigned',
-    status,
+    assigned_to_id: assignee.id || null,
+    assigned_to: displayNameForId(assignee.id),
+    status: body.status || 'In Stock',
   };
   inventory.unshift(newItem);
   saveData();
@@ -665,7 +1026,7 @@ app.patch('/api/inventory/:id', requireAgent, writeRateLimit, (req, res) => {
   const item = inventory.find((i) => i.id === req.params.id);
   if (!item) return res.status(404).json({ error: 'Asset not found' });
   // #8 mass-assignment fix: explicit allow-list — id can never be overwritten.
-  const body = pick(req.body, ['name', 'category', 'serial_number', 'assigned_to', 'status']);
+  const body = pick(req.body, ['name', 'category', 'serial_number', 'assigned_to_id', 'assigned_to', 'status']);
   if (body.name !== undefined) {
     const n = String(body.name).trim();
     if (!n) return res.status(400).json({ error: 'Name cannot be empty' });
@@ -686,10 +1047,13 @@ app.patch('/api/inventory/:id', requireAgent, writeRateLimit, (req, res) => {
       return res.status(400).json({ error: `Status must be one of: ${[...VALID_INVENTORY_STATUS].join(', ')}` });
     }
     item.status = body.status;
-    if (body.status !== 'Assigned') item.assigned_to = 'Unassigned';
+    if (body.status !== 'Assigned') setAssignee(item, null);
   }
-  if (body.assigned_to !== undefined) {
-    item.assigned_to = body.assigned_to ? String(body.assigned_to) : 'Unassigned';
+  if (body.assigned_to_id !== undefined || body.assigned_to !== undefined) {
+    const requested = body.assigned_to_id !== undefined ? body.assigned_to_id : body.assigned_to;
+    const assignee = resolveAssignee(requested);
+    if (assignee.error) return res.status(400).json({ error: assignee.error });
+    setAssignee(item, assignee.id);
   }
   saveData();
   res.json(item);
@@ -723,7 +1087,7 @@ io.use((socket, next) => {
     try {
       const payload = jwt.verify(token, JWT_SECRET);
       const user = users.find((u) => u.id === payload.id);
-      if (user) socket.user = { id: user.id, name: user.name, role: user.role };
+      if (user) socket.user = { id: user.id, name: user.name, role: user.role, super_admin: isSuperAdmin(user) };
     } catch (err) {
       // Stays unauthenticated — handlers below will ignore its emits.
     }
@@ -731,7 +1095,62 @@ io.use((socket, next) => {
   next();
 });
 
+// Give every session the rooms it is entitled to (#36): employees follow the
+// tickets they raised, agents the ones assigned to them, super admins all of
+// them. Without this, per-ticket chat messages were broadcast to every agent
+// socket regardless of who the ticket belonged to.
+const syncTicketRooms = (socket) => {
+  if (!socket.user) return;
+  const member = users.find((u) => u.id === socket.user.id);
+  if (!member) return;
+  if (isSuperAdmin(member)) socket.join('role_super_admin');
+  else socket.leave('role_super_admin');
+  // Reassignment moves a ticket between agents: re-derive the rooms from
+  // scratch so nobody keeps receiving a queue that is no longer theirs.
+  const allowed = new Set(visibleTicketsFor(member).map((t) => `ticket_${t.id}`));
+  for (const room of socket.rooms) {
+    if (room.startsWith('ticket_') && !allowed.has(room)) socket.leave(room);
+  }
+  allowed.forEach((room) => socket.join(room));
+};
+
+// Called after a reassignment so the socket identity and rooms follow the
+// change immediately (promotions/demotions included).
+const resyncUserSockets = (userId) => {
+  io.sockets.sockets.forEach((socket) => {
+    if (!socket.user || socket.user.id !== userId) return;
+    const fresh = users.find((u) => u.id === userId);
+    if (fresh) {
+      socket.user = { id: fresh.id, name: fresh.name, role: fresh.role, super_admin: isSuperAdmin(fresh) };
+    }
+    syncTicketRooms(socket);
+  });
+};
+
+// Tell only the sessions entitled to a ticket that it changed, so agents'
+// queues update on assignment/status changes without leaking other queues.
+const notifyTicketChanged = (ticket) => {
+  const room = `ticket_${ticket.id}`;
+  const seeing = users.filter((u) => u.role === 'agent'
+    && (isSuperAdmin(u) || u.id === ticket.assigned_to_id));
+  const reporterSocket = users.find((u) => u.id === ticket.created_by);
+  io.to(room).emit('ticket_changed', { ticketId: ticket.id });
+  io.sockets.sockets.forEach((socket) => {
+    if (!socket.user) return;
+    const u = users.find((x) => x.id === socket.user.id);
+    if (!u) return;
+    const maySee = isSuperAdmin(u)
+      || (u.role === 'agent' && ticket.assigned_to_id === u.id)
+      || ticket.created_by === u.id;
+    if (!maySee) return;
+    if (seeing.some((a) => a.id === u.id) || (reporterSocket && reporterSocket.id === u.id)) {
+      socket.emit('ticket_changed', { ticketId: ticket.id });
+    }
+  });
+};
+
 io.on('connection', (socket) => {
+  syncTicketRooms(socket);
   // Per-socket message rate-limit (#7) so one client can't spam everyone.
   let socketMsgCount = 0;
   let socketMsgWindow = Date.now();
@@ -781,6 +1200,7 @@ io.on('connection', (socket) => {
       ticketId: result.ticket.id,
       message: result.message,
     });
+    notifyTicketChanged(result.ticket);
   });
 });
 
@@ -794,4 +1214,25 @@ process.on('unhandledRejection', (reason) => {
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
+});
+
+// A second `npm start` used to die with a raw EADDRINUSE stack trace, which
+// reads like a code fault rather than "you already have a server running".
+// Recovered from the stale arena/01a08b5a branch before it was deleted.
+server.on('error', (err) => {
+  if (err && err.code === 'EADDRINUSE') {
+    console.error(`\n[FATAL] Port ${PORT} is already in use — another copy of the backend is probably still running.`);
+    console.error('        Stop the other process, then start the server again:');
+    console.error(`          Windows (PowerShell):  Get-Process node | Stop-Process -Force`);
+    console.error(`          macOS/Linux:           lsof -ti:${PORT} | xargs kill -9`);
+    console.error('        Or start this copy on a different port:  PORT=5001 npm start\n');
+    process.exit(1);
+  }
+  if (err && err.code === 'EACCES') {
+    console.error(`\n[FATAL] Not allowed to bind port ${PORT}. Ports below 1024 need elevated privileges.`);
+    console.error('        Set PORT to a value above 1024 in backend/.env and try again.\n');
+    process.exit(1);
+  }
+  console.error('[FATAL] Server error:', err);
+  process.exit(1);
 });

@@ -1,10 +1,16 @@
 # SayedFarms Helpdesk — Bug Report & Fix Log
 
-**Branch:** `arena/01a0af05-sayedfarms-helpdesk` · **Base:** PR #6 head (`2770f8a`)
+**Branch:** `arena/01a0b4da-sayedfarms-helpdesk` · **Base:** `main` (`eec876a`, PR #8 merged)
+
+> **Step 5 (this branch):** UI ↔ API contract drift + assignment integrity. Items **#17** and **#24**
+> are now fixed, and four new findings (#32–#35) — all reproduced against the running server — are
+> fixed with them. A regression suite (`backend/tests/api.test.js`, 14 tests) and a CI workflow now
+> guard the behaviours that broke. See [FIXED §13](#13-ui--api-contract-drift--assignment-integrity--fixed-step-5).
 
 Everything below was **reproduced**, not guessed:
 
 - REST + Socket.IO black-box suites against the live backend (78 checks, 54 failing at diagnosis time)
+- Live end-to-end suites re-run after each step (69 checks across steps 5–6, through the Vite proxy)
 - The real `App.jsx` rendered in jsdom (fresh DOM per scenario) driven by simulated clicks/keystrokes
 - An AST scope analysis (acorn + acorn-jsx) of every JSX file
 - `node --check` on every backend file, `vite build`, and `oxlint`
@@ -179,6 +185,182 @@ Verified: `vite build` + `oxlint` clean; `ForgotPassword` rendered in jsdom — 
 response shows the dev code box, a mocked SMTP-up response shows the inbox message with no dev code,
 reset success auto-redirects, and no `resetStep`/`handleRequestOtp` remnants remain in `App.jsx`.
 
+### 13. UI ↔ API contract drift + assignment integrity — FIXED (step 5)
+
+Every finding below was reproduced against the running server before being fixed, and each has a
+regression test in `backend/tests/api.test.js`.
+
+#### #32. The Agent Console offered two ticket statuses the API rejected — FIXED
+The status `<select>` offers **`Pending / On Hold`** and **`Closed`**; `VALID_TICKET_STATUS` was
+`['Open', 'In Progress', 'Resolved', 'Cancelled']`. Picking either one returned
+`400 {"error":"Status must be one of: Open, In Progress, Resolved, Cancelled"}`, so a ticket could
+never actually be parked or closed — even though the badge colours and the `Pending` filter already
+existed on the employee side.
+
+```
+PATCH /api/tickets/:id {"status":"Pending"}  ->  400   (was)
+PATCH /api/tickets/:id {"status":"Closed"}   ->  400   (was)
+```
+
+Fixed: the enum now covers every value the UI can produce, and `GET /api/meta/enums` publishes the
+lists so the frontend renders its dropdowns from the server's own source of truth. `Pending` and
+`Closed` are accepted and stored verbatim.
+
+#### #33. Asset status was *silently* rewritten to "In Stock" — FIXED
+Worse than a 400. The Add Asset form offers **`Under Maintenance`** and **`Decommissioned`**, and the
+create endpoint did:
+
+```js
+const status = body.status && VALID_INVENTORY_STATUS.has(body.status) ? body.status : 'In Stock';
+```
+
+The validity set was `['In Stock', 'Assigned', 'In Repair', 'Retired']`. So an agent picking
+"Under Maintenance" pressed Save, got `200 OK`, and the asset was quietly stored as **In Stock** —
+wrong data, no error, no hint. Editing an existing asset to either value failed outright with a 400
+(`Status must be one of: In Stock, Assigned, In Repair, Retired`).
+
+Fixed: one canonical set covering both forms' options (the union), the create path now **rejects**
+an unknown status with a 400 instead of silently substituting one, and both asset dropdowns render
+from `/api/meta/enums` — which also makes `In Repair` / `Retired` reachable from the Add Asset form
+(it previously couldn't produce them).
+
+#### #34. "Direct Request to Agent" was silently ignored for employees — FIXED
+The employee portal's ticket form has a **Direct Request to Agent (Optional)** dropdown listing real
+agents with "Any Available IT Agent" as the default. The backend threw the choice away:
+
+```js
+const assignedTo = req.user.role === 'agent' && body.assigned_to ? String(body.assigned_to) : 'Unassigned';
+```
+
+An employee could pick a specific agent, submit, and get an "Unassigned" ticket with no feedback.
+Fixed: the request is honoured for everyone, but the target must be a real IT agent (or Unassigned) —
+employees still cannot assign a ticket to an arbitrary user or invent a name, and an unknown assignee
+now returns a clear 400 instead of being discarded.
+
+#### #35. Failed agent actions were invisible (silent revert) — FIXED
+`handleAgentUpdate`, `handleUpdateAsset`, `handleDeleteAsset`, `handleDeleteUser` and
+`handleCancelTicket` never looked at the response. Combined with the 400s above, the UI *looked*
+like it worked: the control changed, the refetch restored the old value, and the agent was told
+nothing. All five now surface the server's message (`alert` / inline error). The attachment input
+also warned nothing when a file exceeded the server's ~2 MB cap — it is now rejected up front with
+the actual size and limit.
+
+#### #17. Assignments are now keyed by user id — FIXED
+Assignments were stored as the assignee's **display name**, so renaming a user orphaned every ticket
+and asset pointing at them, and two accounts sharing a name were indistinguishable (the assignee
+`<select>` emitted duplicate React keys and two identical option values — you could not pick one of
+them).
+
+- `assigned_to_id` is now the source of truth; `assigned_to` is kept as a denormalized display name
+  so existing consumers keep working. Legacy name-only rows are migrated on boot (verified: the
+  migration is persisted, and an unresolvable name is preserved rather than relabelled "Unassigned").
+- Writes accept `assigned_to_id` (preferred) or `assigned_to` (legacy), and the frontend sends ids.
+- Renaming a user refreshes the denormalized names; deleting a user clears the id and returns their
+  assets to `In Stock`; tickets may only be assigned to IT agents.
+
+#### #24. Password-reset codes survive a restart — FIXED
+Codes lived in a plain in-memory object, so any restart (deploy, crash, free-tier cycle) voided the
+code the user had just been emailed — which reads as "the code you sent me is wrong". They now live
+in `db.json` under `resetCodes`, stored as a **SHA-256 digest** rather than plaintext, with expired
+entries pruned on boot and a **5-attempt cap** (`Too many incorrect codes. Request a new one.`) so
+the 6-digit space can't be walked inside the 10-minute window. Verified on the live server: a code
+issued *before* a restart still reset the password *after* it.
+
+#### Supporting changes
+- `GET /api/meta/enums` (authenticated) publishes status/priority/category/role lists; the frontend
+  falls back to built-in defaults if the call fails, so a partial response can never blank a dropdown.
+- `DATA_FILE` env override, so tests (and multi-instance deployments) don't touch the real store.
+- `RATE_LIMIT_SCALE` env multiplier (default `1`): the limiter stays on, but a test suite driving the
+  whole API from one IP can raise the budget instead of disabling it.
+- `backend/tests/api.test.js` — 14 tests (authz guards, statuses, assignments/rename/delete, legacy
+  migration, reset-code persistence + burn, rate-limit 429s, JSON 404s) run by `npm test`.
+- `.github/workflows/ci.yml` — runs the tests, the linter and the production build on every push/PR.
+
+**Verified:** `npm test` → 14/14 pass · `oxlint` → 0 errors (warnings 16 → 14) · `vite build` → clean ·
+34/34 live end-to-end checks through the Vite dev proxy, plus a real server restart mid-reset-flow.
+
+### 14. Every agent could see and edit every ticket — FIXED (step 6)
+
+> Requested feature: *"I only want each agent to see tickets assigned to them; a super admin should see
+> all tickets and be able to reassign them."* Verified first: **neither existed.** Any agent could list
+> every ticket, open anyone's thread, and reassign any work to anyone — there was no dispatcher tier at
+> all. Both are now implemented and regression-tested (`backend/tests/api.test.js`).
+
+#### What was wrong
+`GET /api/tickets` returned `tickets` in full for any `role === 'agent'`, `canAccessTicket()` returned
+`true` for every agent, and `PATCH /api/tickets/:id` had no ownership check for agents — so an agent
+could read, edit and reassign tickets belonging to other agents, including tickets assigned to nobody
+in particular. Reassigning was the *only* way to hand work over, which is why it had been left open.
+
+#### The rules now
+
+| Account | Ticket queue | Reassign |
+|---|---|---|
+| Employee | only tickets they raised | no |
+| Agent | **only tickets assigned to them** | no |
+| Super admin | everything + the unassigned dispatch queue | **yes** |
+
+- Scoped at the API, not in the UI: a regular agent's list response simply never contains other
+  agents' tickets, and direct access returns `403` on **read, edit and chat**.
+- **Live delivery was part of the leak.** Sockets joined every ticket room on connect, so per-ticket
+  chat was pushed to every connected agent regardless of ownership. Rooms are now derived from the
+  session's own queue, and reassignment re-syncs them — the old owner loses the room, the new owner
+  gains it, both without a reload.
+- `super_admin` is a flag on an agent account rather than a new role value, so every existing
+  `role === 'agent'` rule (JWT payloads, inventory, sockets) kept working untouched.
+- The **last super admin cannot be demoted**, and an agent cannot promote themselves (`403`) — the
+  dispatch tier can't be removed or seized by accident.
+- Existing installs migrate on boot: agent accounts become regular agents and the `ADMIN_EMAIL`
+  account (else the first agent) is promoted, with a log line naming it.
+
+#### Frontend
+The Agent Console is role-aware: a regular agent gets **"My Assigned Tickets"** (assignee column
+read-only), no User Management tab and no dispatch controls; a super admin gets the full queue, the
+reassignment dropdown and a *Ticket Access* selector per agent account. Queues and open threads
+refresh live over the new `ticket_changed` / `ticket_created` events. Agents keep an email-free
+`{id,name,role}` directory (`GET /api/people`) so asset assignment still works without exposing the
+account directory.
+
+**Verified:** 20/20 backend tests (6 new for #36, including a real socket-delivery check), `oxlint`
+0 errors, `vite build` clean, **35/35 live checks** through the Vite proxy for the new rules and
+**34/34** of the previous suite re-run unchanged (no regressions).
+
+### 15. Credentials in git history — DIAGNOSED & BRANCHES CLEANED (step 7)
+
+**Correction to an earlier note in this report (and to my own first pass):** an initial check said
+`backend/db.json` was never committed. That was wrong — it was made with only some branches fetched.
+With every ref in hand, the file *is* in reachable history, together with a second credential file.
+
+Verified against the live GitHub API (this repository is public):
+
+| # | Exposure | Verified status |
+|---|---|---|
+| 37 | `frontend/di-rect password.txt` — plaintext credentials for `admin`, `remote`, `Alaba-Links` (deleted in `0cebc46`) | **still fetchable by SHA `9767591`** (65 bytes) |
+| 37b | `backend/db.json` — plaintext passwords for `admin@sayedfarms.com`, `ishaq.tesleem@sayedfarms.com`, `aa@sayedfarms.com`, `ishaqtesleem@gmail.com` (added in `9767591`; deleted again in `d13e60f`, re-added by the revert `85babcf`) | **still fetchable by SHA `9767591`** (1334 bytes) |
+| 28 | `backend/helpdesk.db` — a committed SQLite binary | removed from tips; same history caveat applies |
+
+**Branch cleanup does not unpublish either file.** Commit `9767591` remains reachable through
+GitHub's pull-request refs (`refs/pull/1..8/head`), which users cannot delete. Measured after the
+cleanup below: browsing both paths returns `404`, while
+`GET /repos/slimtee007/sayedfarms-helpdesk/contents/<path>?ref=9767591` still returns the files.
+
+**To close it:** rotate every credential listed above (the helpdesk accounts *and* the
+`admin`/`remote`/`Alaba-Links` logins); then ask GitHub Support to purge commit `9767591`
+("sensitive data removal") — only Support can expire PR refs and cached objects. History rewriting
+alone is insufficient for the same reason.
+
+#### Stale-branch cleanup — DONE
+All **11** branches whose history reached the leaked files were deleted from the remote, after
+verifying what each held and bundling a full mirror first
+(`git bundle create helpdesk-all-branches.bundle --all`, kept outside the repo). Deleted:
+`arena/01a08a5c`, `arena/01a08b5a`, `arena/01a0900a`, `arena/01a0a079`, `arena/01a0a3d5`,
+`arena/01a0a90e`, `arena/01a0ae1d`, `arena/01a0af05`, `fix/blank-agent-pages`, `fix/chat-delivery`,
+`revert-6-arena/01a0ae1d`. Six carried already-merged work (PRs #1, #3, #4, #5, #6, #8) and
+`arena/01a0af05` was byte-identical to `main`; the other four were superseded attempts, with one
+genuine improvement recovered first — a friendly `EADDRINUSE` message instead of a raw stack trace
+when the port is already taken (ported from `arena/01a08b5a`). The remote now holds only `main` and
+the open PR #9 branch.
+
 ---
 
 ## OPEN — security (fix before any real deployment)
@@ -203,26 +385,29 @@ reset success auto-redirects, and no `resetStep`/`handleRequestOtp` remnants rem
 | 14 | ~~Reporter identity lost~~ — **FIXED** with §4 (`created_by` + `created_by_name` from session; legacy backfilled). | — |
 | 15 | ~~No input validation~~ — **FIXED**, see FIXED §10 (required fields, enums, length caps). | — |
 | 16 | ~~Duplicate-email guard bypassable by case~~ — **FIXED** with §4 (all comparisons normalised; signup rejects case variants). | — |
-| 17 | **Assignments still keyed by display name**, not id: renaming a user orphans every ticket/asset assignment; duplicate names are indistinguishable. PARTIAL: deleting a user re-homes their assignments to `Unassigned` (by id or name); id-keyed assignments still open. | `server.js` PATCH user |
+| 17 | ~~Assignments keyed by display name~~ — **FIXED**, see FIXED §13 (canonical `assigned_to_id` + migration, duplicate names distinguishable, renames/deletes handled). | — |
 | 18 | ~~`Date.now()` primary keys collide~~ — **FIXED**, see FIXED §10 (monotonic `genId`). | — |
 | 19 | ~~Ticket creation swallows failures~~ — **FIXED**, see FIXED §9. | — |
 | 20 | ~~Invite link goes nowhere~~ — **FIXED**, see FIXED §9. | — |
 | 21 | ~~Fabricated chat history~~ — **FIXED**, see FIXED §9. | — |
 | 22 | ~~`socket.off` with no handler detaches all listeners~~ — **FIXED**, see FIXED §9. | — |
 | 23 | **Attachments base64-inlined into `db.json`**, which is rewritten in full on every chat message. PARTIAL: new ticket images are capped (~2 MB) so the worst bloat is bounded; the inline-base64 storage design remains. Move attachments to files/object storage with a size limit. | `server.js`, `App.jsx` |
-| 24 | **Fragments remaining**: reset codes live only in memory, so any restart voids them (move to the DB or accept the UX). Everything else in the original finding is fixed — JSON 404s, error middleware, duplicate serial rejection, string OTP compare. | `otpStore` |
+| 24 | ~~Reset codes live only in memory~~ — **FIXED**, see FIXED §13 (persisted in `db.json`, stored as a SHA-256 digest, 5-attempt cap). Everything else in the original finding was already fixed — JSON 404s, error middleware, duplicate serial rejection, string OTP compare. | — |
 
 ## OPEN — repo hygiene
 
 | # | Finding |
 |---|---|
 | 25–29 | ~~Dead/broken/orphaned files~~ — **FIXED**, see FIXED §8 (all deleted). |
-| 30 | ~~Server-only deps, dead tailwind config, "frontend" title~~ — **FIXED** (§8). **Remaining:** there is still no test suite / CI wiring (`npm test` is a stub). |
-| 31 | ~~`no-undef` never enabled~~ — **FIXED** (§8: enabled with `browser:true`, 0 errors). **Remaining:** no CI job runs the linter/build yet. |
+| 30 | ~~Server-only deps, dead tailwind config, "frontend" title~~ — **FIXED** (§8). **Tests FIXED in step 5:** `backend/tests/api.test.js` (14 tests, `npm test` boots the real server against a scratch db) and `.github/workflows/ci.yml` runs tests + lint + build on every push/PR. |
+| 31 | ~~`no-undef` never enabled~~ — **FIXED** (§8: enabled with `browser:true`, 0 errors). **CI FIXED in step 5:** the workflow runs `npm run lint` and `npm run build` on every push/PR (warnings logged, errors fail the job). |
 
 ## Suggested order for the remaining work
 
 1. ~~#4 + #6 + #5~~ — **DONE** (plus #13, #14, #16; partials on #11, #17, #24). Remaining: purge `db.json` from main's history (see FIXED §5).
 2. ~~#12~~ — **DONE** (see FIXED §12).
 3. ~~#7, #8~~ — **DONE** (plus #15, #18, #10, most of #24; see FIXED §7/§10).
-4. ~~Remaining functional + hygiene~~ — **DONE** for #19–#22, #25–#29, #30/#31 cleanups (see FIXED §8/§9). Still open: #9 (global chat design), #11 (admin seed policy), #17 (id-keyed assignments), #23 (attachment storage), #24 (persist reset codes), test/CI wiring, and the history purge from #5.
+4. ~~Remaining functional + hygiene~~ — **DONE** for #19–#22, #25–#29, #30/#31 cleanups (see FIXED §8/§9).
+5. ~~#17 + #24 + test/CI wiring~~ — **DONE** (see FIXED §13), along with four new contract bugs found while
+   verifying it (#32–#35). Still open: #9 (global chat design), #11 (admin seed policy), #23 (attachment
+   storage), and the `db.json` history purge from #5.
