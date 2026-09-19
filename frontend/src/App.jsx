@@ -1459,9 +1459,24 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
             <Activity className="h-5 w-5" />
           </div>
           <span className="font-semibold text-base tracking-tight">SayedFarm Service Desk <span className="text-xs bg-blue-700 font-medium px-2 py-0.5 rounded ml-2 border border-blue-400/30">Agent Console</span></span>
+          {/* #36: make the signed-in access level unmistakable. A super admin
+              sees every ticket and can reassign; an agent sees only their own
+              queue and must not be shown dispatch controls. */}
+          {superAdmin ? (
+            <span className="text-xs bg-indigo-500 font-bold px-2 py-0.5 rounded ml-2 border border-indigo-300/40" title="You can see every ticket and reassign work">
+              Super Admin
+            </span>
+          ) : (
+            <span className="text-xs bg-blue-800 font-medium px-2 py-0.5 rounded ml-2 border border-blue-400/30" title="You only see tickets assigned to you">
+              My Queue
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-4">
           <div className="flex items-center gap-2 border-l border-blue-400/30 pl-4">
+            <span className="text-[10px] text-blue-100/80">
+              {superAdmin ? 'All tickets · can reassign' : 'Tickets assigned to you'}
+            </span>
             <span className="text-xs font-medium">{user.name}</span>
             <button onClick={handleLogout} title="Sign Out" className="p-1 hover:bg-blue-700 rounded transition text-blue-100">
               <LogOut className="h-4 w-4" />

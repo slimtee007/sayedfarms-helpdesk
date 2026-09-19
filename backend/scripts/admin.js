@@ -62,9 +62,15 @@ ${c.bold('SayedFarms Helpdesk — account recovery')}
   ${c.bold('node scripts/admin.js <email>')}
       Generate a strong password for that account and print it once.
 
+  ${c.bold('node scripts/admin.js <email> --demote')}
+      Make that account a plain IT agent: it keeps its password but loses
+      super-admin rights, so it only ever sees tickets assigned to it.
+      Use this to leave exactly one dispatcher (e.g. admin@sayedfarms.com).
+
 Options:
   --password <pw>   The new password (8+ characters).
   --agent           Grant IT agent without super-admin rights.
+  --demote          Keep the password, drop super-admin rights (own queue only).
   --name "<name>"   Set the display name (default: keep, or derive from email).
   --file <path>     Use a different db.json (default: ${DATA_FILE}).
   --force           Proceed even if a server looks like it is running.
@@ -95,6 +101,7 @@ const fileOverride = takeFlag('--file', true);
 const passwordFlag = takeFlag('--password', true);
 const nameFlag = takeFlag('--name', true);
 const agentOnly = Boolean(takeFlag('--agent', false));
+const demote = Boolean(takeFlag('--demote', false));
 const force = Boolean(takeFlag('--force', false));
 const listOnly = Boolean(takeFlag('--list', false)) || argv.length === 0;
 const emailArg = argv[0];
@@ -183,6 +190,29 @@ if (!emailArg || emailArg.startsWith('--')) {
 
 const email = norm(emailArg);
 let user = db.users.find((u) => norm(u.email) === email);
+
+// --demote: keep the password, drop the wide view (#36). This is how you make
+// sure only one account can see and reassign every ticket.
+if (demote) {
+  if (!user) die(`No account found for ${email}.`);
+  if (!(user.role === 'agent' && user.super_admin === true)) {
+    console.log(`\n${c.dim('Nothing to do:')} ${c.bold(email)} is not a super admin.`);
+    console.log(`   role = ${user.role}, super_admin = ${user.super_admin === true}\n`);
+    process.exit(0);
+  }
+  const others = db.users.filter((u) => u.role === 'agent' && u.super_admin === true && u.id !== user.id);
+  if (others.length === 0) {
+    die(`Refusing to demote ${email}: it is the only super admin, and a helpdesk with\n   nobody able to reassign tickets cannot be recovered from the UI.\n   Promote another agent first:  node scripts/admin.js <other-email> --password <pw>`);
+  }
+  warnIfServerRunning();
+  user.super_admin = false;
+  save();
+  console.log(`${c.green('✓')} ${c.bold(email)} is now a regular IT agent.`);
+  console.log(`   ticket access: own queue only (it no longer sees or reassigns other tickets)`);
+  console.log(`   password     : unchanged`);
+  console.log(`\n   Super admins remaining: ${others.map((u) => u.email).join(', ')}\n`);
+  process.exit(0);
+}
 
 const generated = !passwordFlag;
 const password = passwordFlag || crypto.randomBytes(9).toString('base64').replace(/[+/=]/g, '').slice(0, 12) + '!A9';

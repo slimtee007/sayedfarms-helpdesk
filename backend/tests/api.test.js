@@ -881,3 +881,98 @@ test('scripts/admin.js can create a missing super admin and refuses to remove th
 
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// #36 follow-up — the two house rules that must hold in production:
+//   1. every agent can manage the whole IT asset inventory
+//   2. exactly one account dispatches tickets (admin@sayedfarms.com)
+// ---------------------------------------------------------------------------
+test('#36: a regular agent can manage the whole IT asset inventory', async () => {
+  const agent = await makeAgent(client, 'assets', admin.token);
+
+  // Read the inventory (every agent sees all assets, not a per-agent subset).
+  const list = await client.get('/api/inventory', { token: agent.token });
+  assert.equal(list.status, 200, 'agents must be able to list assets');
+
+  // Create one.
+  const serial = `SN-ASSET-${Date.now()}`;
+  const created = await client.post('/api/inventory', {
+    token: agent.token,
+    body: { name: 'Agent Managed Laptop', category: 'Laptop', serial_number: serial, status: 'In Stock' },
+  });
+  assert.equal(created.status, 200, `agents must be able to create assets: ${JSON.stringify(created.body)}`);
+
+  // Assign it to an employee using the email-free picker.
+  const people = (await client.get('/api/people', { token: agent.token })).body;
+  const employee = people.find((p) => p.role === 'user');
+  assert.ok(employee, 'the picker must offer employees');
+  const updated = await client.patch(`/api/inventory/${created.body.id}`, {
+    token: agent.token,
+    body: { assigned_to_id: employee.id, status: 'Assigned' },
+  });
+  assert.equal(updated.status, 200, `agents must be able to assign assets: ${JSON.stringify(updated.body)}`);
+  assert.equal(updated.body.assigned_to_id, employee.id);
+  assert.equal(updated.body.assigned_to, employee.name);
+
+  // Every other agent sees the same asset.
+  const other = await makeAgent(client, 'assets2', admin.token);
+  const otherView = (await client.get('/api/inventory', { token: other.token })).body;
+  assert.ok(otherView.some((i) => i.id === created.body.id), 'assets are shared across the whole team');
+
+  // And can retire it.
+  const deleted = await client.delete(`/api/inventory/${created.body.id}`, { token: agent.token });
+  assert.equal(deleted.status, 200, 'agents must be able to remove assets');
+});
+
+test('#36: --demote enforces a single dispatcher, and refuses to leave none', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sayedfarms-demote-'));
+  const file = path.join(dir, 'db.json');
+  const bcrypt = require('bcryptjs');
+
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      users: [
+        { id: 'a1', name: 'Dispatcher', email: 'admin@sayedfarms.test', role: 'agent', super_admin: true, password: bcrypt.hashSync('DispatcherPass!1', 10) },
+        { id: 'a2', name: 'Second', email: 'second@sayedfarms.test', role: 'agent', super_admin: true, password: bcrypt.hashSync('SecondPass!1', 10) },
+      ],
+      tickets: [],
+      inventory: [],
+      resetCodes: {},
+    })
+  );
+
+  // Demote one of two super admins: allowed, password untouched.
+  const out = runScript(['second@sayedfarms.test', '--demote', '--file', file]);
+  assert.match(out, /regular IT agent/, `unexpected output: ${out}`);
+  const after = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const second = after.users.find((u) => u.email === 'second@sayedfarms.test');
+  assert.equal(second.super_admin, false);
+  assert.equal(second.role, 'agent');
+  assert.ok(second.password.startsWith('$2'), 'the password hash must be left untouched');
+
+  // The second account can still sign in and manages assets — it just has its own queue.
+  const s = await startServer(file, await freePort(), { ADMIN_EMAIL: 'nobody@sayedfarms.test' });
+  try {
+    const c = api(s.base);
+    const session = await login(c, 'second@sayedfarms.test', 'SecondPass!1');
+    assert.equal(session.user.super_admin, false, 'the demoted agent reports own-queue access');
+    assert.equal((await c.get('/api/inventory', { token: session.token })).status, 200, 'still manages assets');
+    assert.equal((await c.get('/api/users', { token: session.token })).status, 403, 'but no longer administers accounts');
+  } finally {
+    await s.stop();
+  }
+
+  // Demoting the LAST super admin is refused — otherwise nobody could ever
+  // reassign a ticket again.
+  assert.throws(
+    () => runScript(['admin@sayedfarms.test', '--demote', '--file', file]),
+    /only super admin/i
+  );
+
+  // Demoting a non-super-admin is a friendly no-op, not an error.
+  const noop = runScript(['second@sayedfarms.test', '--demote', '--file', file]);
+  assert.match(noop, /Nothing to do/);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
