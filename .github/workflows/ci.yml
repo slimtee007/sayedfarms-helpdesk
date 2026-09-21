@@ -21,8 +21,32 @@ jobs:
           cache-dependency-path: backend/package-lock.json
       - run: npm ci
       # Boots the real server against a throwaway db.json and drives the API:
-      # statuses, assignments, reset codes, authz guards (BUG-REPORT #17, #24, #32–#34).
-      - run: npm test
+      # statuses, assignments, reset codes, authz guards (BUG-REPORT #17, #24, #32–#34),
+      # plus the PBX call-logging suite (backend/tests/pbx.test.js).
+      - run: npm test 2>&1 | tee backend-test.log
+      # The raw job log is only reachable from GitHub's blob storage; mirror the
+      # failing output into the run summary so a red build can be diagnosed from
+      # any machine (or the API) without downloading logs.
+      - name: Backend test failures
+        if: failure()
+        run: |
+          {
+            echo '### Backend test failures'
+            echo '```text'
+            grep -E '^(not ok|# (fail|tests|cancelled)|Error|.*Error:)' -A 12 backend-test.log | tail -n 200 || true
+            echo '```'
+            echo '<details><summary>Last 100 log lines</summary>'
+            echo
+            echo '```text'
+            tail -n 100 backend-test.log || true
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-log
+          path: backend/backend-test.log
 
   frontend:
     name: Frontend lint & build
