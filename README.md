@@ -101,6 +101,25 @@ report covers every ticket, a regular agent's only the tickets assigned to
 them (`scope: "all" | "own"`). The Agent Console shows it under **MTTR
 Reports**, and ticket tables display "Resolved in …" / "Reopened ×n" per row.
 
+### Report generation
+
+Every report screen has **Export CSV** and **Print** (browser print → save as
+PDF); the exports are also plain authenticated API endpoints:
+
+| Endpoint | Output |
+|---|---|
+| `GET /api/reports/mttr/export?days=…` | MTTR report CSV — summary block, then one row per resolved ticket behind the numbers (created / first response / resolved / closed stamps, resolution minutes, reopens). Same scoping as the JSON feed. |
+| `GET /api/reports/assets` | IT asset stock report — totals, **in stock vs out of stock**, per-category split, per-status counts, and the asset rows. |
+| `GET /api/reports/assets/export` | The asset report as CSV — summary block, category and status splits, then one row per asset with its stock state. |
+
+Assets count as **in stock** when their status is `In Stock` (available in the
+store room); every other status (Assigned, In Repair, Under Maintenance,
+Retired, Decommissioned) is **out of stock** — not available to hand out. The
+exact status is always carried alongside the binary split so retired gear is
+never confused with deployed gear. **Asset Reports** in the Agent Console
+shows the split with an All / In stock / Out of stock filter; CSVs are
+RFC-4180 quoted (Excel-friendly, with a UTF-8 BOM).
+
 ## Locked out of the super admin account?
 
 Passwords are stored as bcrypt hashes, so **nobody can read a password back out

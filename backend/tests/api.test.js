@@ -1262,3 +1262,107 @@ test('#asset-categories: legacy "Desktop" assets migrate to "Desktop Computer" o
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Report generation — MTTR + IT asset reports, CSV exports, stock split.
+// ---------------------------------------------------------------------------
+test('report generation: the asset report splits in stock vs out of stock and exports CSV', async () => {
+  // Employees are not ops-reporting users; bad auth stays 401.
+  const email = `rep-emp-${Date.now()}@example.com`;
+  const emp = (
+    await client.post('/api/auth/signup', {
+      body: { name: 'Report Employee', email, password: 'EmployeePass!23' },
+    })
+  ).body;
+  assert.equal((await client.get('/api/reports/assets', { token: emp.token })).status, 403);
+  assert.equal((await client.get('/api/reports/assets')).status, 401);
+
+  const before = (await client.get('/api/reports/assets', { token: admin.token })).body;
+  const mkAsset = (name, status) =>
+    client.post('/api/inventory', {
+      token: admin.token,
+      body: { name, category: 'Printer', serial_number: `SN-REP-${name.replace(/\W+/g, '-').toUpperCase()}-${Date.now()}`, status },
+    });
+  const inStockRes = await mkAsset('Report Stock Printer', 'In Stock');
+  assert.equal(inStockRes.status, 200, `create failed: ${JSON.stringify(inStockRes.body)}`);
+  const inStockAsset = inStockRes.body;
+  const assignedAsset = (await mkAsset('Report Deployed NVR', 'Assigned')).body;
+  const retiredAsset = (await mkAsset('Report Retired Camera', 'Retired')).body;
+
+  const after = (await client.get('/api/reports/assets', { token: admin.token })).body;
+  // One new 'In Stock', two new out-of-stock (Assigned + Retired).
+  assert.equal(after.summary.inStock, before.summary.inStock + 1);
+  assert.equal(after.summary.outOfStock, before.summary.outOfStock + 2);
+  assert.equal(after.summary.total, before.summary.total + 3);
+
+  const bySerial = (id) => after.rows.find((r) => r.id === id);
+  assert.equal(bySerial(inStockAsset.id).stockState, 'In Stock');
+  assert.equal(bySerial(assignedAsset.id).stockState, 'Out of Stock');
+  assert.equal(bySerial(retiredAsset.id).stockState, 'Out of Stock');
+  const printerCat = after.byCategory.find((c) => c.key === 'Printer');
+  assert.ok(printerCat.inStock >= 1 && printerCat.outOfStock >= 2, 'the category row must carry the split');
+  const retiredStatus = after.byStatus.find((st) => st.key === 'Retired');
+  assert.equal(retiredStatus.stockState, 'Out of Stock', 'retired gear is never "in stock"');
+
+  // CSV export: summary block, per-category split, and one row per asset.
+  const res = await fetch(`${server.base}/api/reports/assets/export`, {
+    headers: { Authorization: `Bearer ${admin.token}` },
+  });
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type') || '', /text\/csv/);
+  assert.match(res.headers.get('content-disposition') || '', /attachment; filename="asset-report-\d{4}-\d{2}-\d{2}\.csv"/);
+  const text = await res.text();
+  for (const wanted of ['In stock', 'Out of stock', 'Stock state', 'Category', 'Serial number', inStockAsset.serial_number, retiredAsset.serial_number]) {
+    assert.ok(text.includes(wanted), `the CSV must contain ${JSON.stringify(wanted)}`);
+  }
+  assert.equal((await fetch(`${server.base}/api/reports/assets/export`)).status, 401);
+});
+
+test('report generation: MTTR CSV export carries the summary and scoped ticket rows', async () => {
+  // Bad range and anonymous access are rejected the same way as the JSON feed.
+  const rawAnon = await fetch(`${server.base}/api/reports/mttr/export`);
+  assert.equal(rawAnon.status, 401);
+  const rawBad = await fetch(`${server.base}/api/reports/mttr/export?days=soon`, {
+    headers: { Authorization: `Bearer ${admin.token}` },
+  });
+  assert.equal(rawBad.status, 400);
+
+  // A ticket title with CSV-hostile characters must come back quoted (RFC 4180).
+  const created = await newTicket({ title: 'Printer, "main" office', description: 'csv escaping check' });
+  const id = created.body.id;
+  await client.patch(`/api/tickets/${id}`, { token: admin.token, body: { status: 'Resolved' } });
+
+  const res = await fetch(`${server.base}/api/reports/mttr/export?days=all`, {
+    headers: { Authorization: `Bearer ${admin.token}` },
+  });
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type') || '', /text\/csv/);
+  assert.match(res.headers.get('content-disposition') || '', /attachment; filename="mttr-report-all-\d{4}-\d{2}-\d{2}\.csv"/);
+  const text = await res.text();
+  assert.ok(text.includes('Mean time to resolve (minutes)'), 'the summary block must be present');
+  assert.ok(text.includes('Time to resolve (minutes)'), 'the per-ticket table must be present');
+  assert.ok(text.includes('"Printer, ""main"" office"'), 'quotes and commas must be RFC-4180 escaped');
+  assert.ok(text.includes(id));
+
+  // Scope (#36): a regular agent's export covers only their own resolved work.
+  const agentEmail = `rep-agent-${Date.now()}@example.com`;
+  const agentUser = (
+    await client.post('/api/auth/signup', {
+      body: { name: 'Report Agent', email: agentEmail, password: 'AgentPass!2345' },
+    })
+  ).body;
+  const promoted = await client.patch(`/api/users/${agentUser.user.id}`, { token: admin.token, body: { role: 'agent' } });
+  assert.equal(promoted.status, 200);
+  const theirs = await newTicket({ title: 'AGENT-OWNED resolved work', assigned_to_id: agentUser.user.id });
+  await client.patch(`/api/tickets/${theirs.body.id}`, { token: admin.token, body: { status: 'Resolved' } });
+
+  const agentSession = await login(client, agentEmail, 'AgentPass!2345');
+  const agentRes = await fetch(`${server.base}/api/reports/mttr/export?days=all`, {
+    headers: { Authorization: `Bearer ${agentSession.token}` },
+  });
+  assert.equal(agentRes.status, 200);
+  const agentCsv = await agentRes.text();
+  assert.ok(agentCsv.includes('AGENT-OWNED resolved work'), 'the agent must see their own resolved ticket');
+  assert.ok(agentCsv.includes('Tickets assigned to me'), 'the export header must state the scope');
+  assert.ok(!agentCsv.includes('Printer, ""main"" office'), "another queue's ticket must never leak into the export");
+});

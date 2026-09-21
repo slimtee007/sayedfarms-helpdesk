@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, Navigate, Link, useLocation } from 'react-router-dom';
 import { io } from 'socket.io-client';
-import { Activity, Plus, ShieldCheck, User, LogOut, Image as ImageIcon, X, Paperclip, Users, Ticket, UserPlus, Copy, Check, Trash2, Box, PackagePlus, ChevronRight, Search, Headphones, KeyRound, AlertCircle, Monitor, Laptop, FilePlus, ChevronDown, Filter, MessageSquare, Send, Timer } from 'lucide-react';
+import { Activity, Plus, ShieldCheck, User, LogOut, Image as ImageIcon, X, Paperclip, Users, Ticket, UserPlus, Copy, Check, Trash2, Box, PackagePlus, ChevronRight, Search, Headphones, KeyRound, AlertCircle, Monitor, Laptop, FilePlus, ChevronDown, Filter, MessageSquare, Send, Timer, FileText, Download, Printer } from 'lucide-react';
 import ForgotPassword from './pages/ForgotPassword.jsx';
 
 // Same-origin by default: in dev, Vite proxies /api and /socket.io to the
@@ -114,6 +114,82 @@ const bucketLabel = (bucket) => {
   if (/^\d{4}-\d{2}-\d{2}$/.test(bucket)) return bucket.slice(5).replace('-', '/');
   return bucket;
 };
+
+// ---- Report generation (CSV download + print / save-as-PDF) ----------------
+
+// Download a CSV export. The endpoints need the session token, so this goes
+// through fetch + blob rather than a plain link.
+const downloadCsv = async (token, url, fallbackName) => {
+  try {
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      return alert(data.error || `Could not generate the export (HTTP ${res.status}).`);
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get('Content-Disposition') || '';
+    const match = cd.match(/filename="?([^";]+)"?/i);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = (match && match[1]) || fallbackName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(a.href);
+  } catch {
+    alert('Network error — could not reach the server.');
+  }
+};
+
+const escHtml = (v) => String(v == null ? '' : v)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+// Print / Save-as-PDF via a hidden iframe: a clean, chrome-free document the
+// browser can print or archive without shipping a PDF dependency.
+const openPrintableReport = (title, bodyHtml) => {
+  const iframe = document.createElement('iframe');
+  iframe.setAttribute('aria-hidden', 'true');
+  iframe.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden';
+  document.body.appendChild(iframe);
+  const win = iframe.contentWindow;
+  const doc = win && win.document;
+  if (!doc) {
+    document.body.removeChild(iframe);
+    return alert('Printing is not available in this browser.');
+  }
+  doc.open();
+  doc.write(`<!doctype html><html><head><meta charset="utf-8"><title>${escHtml(title)}</title>
+<style>
+  body { font-family: ui-sans-serif, system-ui, Arial, sans-serif; color: #1e293b; margin: 28px; font-size: 12px; }
+  h1 { font-size: 18px; margin: 0 0 2px; }
+  .meta { color: #64748b; margin-bottom: 16px; }
+  h2 { font-size: 12px; margin: 18px 0 6px; text-transform: uppercase; letter-spacing: .04em; color: #475569; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 8px; }
+  th, td { border: 1px solid #cbd5e1; padding: 5px 8px; text-align: left; vertical-align: top; }
+  th { background: #f1f5f9; font-size: 10px; text-transform: uppercase; letter-spacing: .03em; color: #475569; }
+  td.num, th.num { text-align: right; }
+  .muted { color: #94a3b8; }
+</style></head><body>${bodyHtml}</body></html>`);
+  doc.close();
+  win.focus();
+  win.print();
+  // Give the print dialog time to open before the iframe goes away.
+  setTimeout(() => { if (iframe.parentNode) iframe.parentNode.removeChild(iframe); }, 2000);
+};
+
+// Table/KPI builders for the printable documents.
+const printTable = (headers, rows, numCols = []) => {
+  const body = rows.length ? rows : [headers.map((h, i) => (i === 0 ? 'No data' : ''))];
+  return `
+  <table><thead><tr>${headers.map((h, i) => `<th${numCols.includes(i) ? ' class="num"' : ''}>${escHtml(h)}</th>`).join('')}</tr></thead>
+  <tbody>${body.map((r) => `<tr>${r.map((c, i) => `<td${numCols.includes(i) ? ' class="num"' : ''}>${escHtml(c)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+};
+const printKpis = (pairs) => `
+  <table><thead><tr>${pairs.map(([label]) => `<th>${escHtml(label)}</th>`).join('')}</tr></thead>
+  <tbody><tr>${pairs.map(([, value]) => `<td>${escHtml(value)}</td>`).join('')}</tr></tbody></table>`;
+const printHeader = (title, metaLines) => `
+  <h1>${escHtml(title)}</h1>
+  <div class="meta">${metaLines.map(escHtml).join(' · ')}</div>`;
 
 // Catches any render-time exception and shows a recoverable message instead of
 // unmounting the whole app into a blank page.
@@ -1359,6 +1435,53 @@ function MttrReports({ token }) {
 
   const s = report && report.summary;
 
+  // Printable copy of exactly what is on screen (Print / Save as PDF).
+  const handlePrint = () => {
+    if (!report || !s) return;
+    const rangeName = (RANGES.find((r) => r.value === days) || {}).label || String(days);
+    let body = printHeader(`MTTR Report — ${rangeName}`, [
+      report.scope === 'all' ? 'Scope: all tickets' : 'Scope: tickets assigned to me',
+      `Generated ${new Date(report.range.to).toLocaleString()}`,
+    ]);
+    body += printKpis([
+      ['MTTR (mean)', formatDuration(s.meanMinutes)],
+      ['Median', formatDuration(s.medianMinutes)],
+      ['Fastest', formatDuration(s.minMinutes)],
+      ['Slowest', formatDuration(s.maxMinutes)],
+      ['Resolved tickets', String(s.count)],
+      ['Mean first reply', s.meanFirstResponseMinutes == null ? '—' : formatDuration(s.meanFirstResponseMinutes)],
+      ['Reopens', String(s.reopenedCount)],
+    ]);
+    body += `<h2>Resolution time per ${escHtml(report.bucket)}</h2>` + printTable(
+      ['Period', 'Resolved', 'Mean (min)', 'Median (min)'],
+      report.trend.map((b) => [bucketLabel(b.bucket), b.count, b.meanMinutes, b.medianMinutes]),
+      [1, 2, 3],
+    );
+    body += '<h2>By category</h2>' + printTable(
+      ['Category', 'Resolved', 'Mean (min)', 'Median (min)', 'Slowest (min)'],
+      report.byCategory.map((g) => [g.key, g.count, g.meanMinutes, g.medianMinutes, g.maxMinutes]),
+      [1, 2, 3, 4],
+    );
+    body += '<h2>By priority</h2>' + printTable(
+      ['Priority', 'Resolved', 'Mean (min)', 'Median (min)', 'Slowest (min)'],
+      report.byPriority.map((g) => [g.key, g.count, g.meanMinutes, g.medianMinutes, g.maxMinutes]),
+      [1, 2, 3, 4],
+    );
+    if (report.byAgent.length > 0) {
+      body += '<h2>By agent</h2>' + printTable(
+        ['Agent', 'Resolved', 'Mean (min)', 'Median (min)', 'Slowest (min)'],
+        report.byAgent.map((a) => [a.name, a.count, a.meanMinutes, a.medianMinutes, a.maxMinutes]),
+        [1, 2, 3, 4],
+      );
+    }
+    body += '<h2>Slowest resolved tickets</h2>' + printTable(
+      ['Ticket', 'Category', 'Priority', 'Agent', 'Time to resolve (min)'],
+      report.slowest.map((t) => [t.title, t.category, t.priority, t.agentName, t.minutes]),
+      [4],
+    );
+    openPrintableReport(`MTTR Report (${rangeName})`, body);
+  };
+
   const kpi = (label, value, hint) => (
     <div className="bg-white border border-slate-200 rounded-md p-3.5 shadow-sm">
       <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">{label}</div>
@@ -1375,16 +1498,33 @@ function MttrReports({ token }) {
           to resolution — including any time spent reopened. Cancelled and not-yet-resolved
           tickets are excluded. {report && report.scope === 'own' ? 'These numbers cover the tickets assigned to you.' : 'These numbers cover the whole helpdesk.'}
         </p>
-        <div className="flex items-center gap-1 bg-white border border-slate-200 rounded-md p-1 shadow-sm">
-          {RANGES.map((r) => (
-            <button
-              key={r.value}
-              onClick={() => setDays(r.value)}
-              className={`px-2.5 py-1 rounded text-[11px] font-medium transition ${days === r.value ? 'bg-[#0052CC] text-white' : 'text-slate-600 hover:bg-slate-100'}`}
-            >
-              {r.label}
-            </button>
-          ))}
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1 bg-white border border-slate-200 rounded-md p-1 shadow-sm">
+            {RANGES.map((r) => (
+              <button
+                key={r.value}
+                onClick={() => setDays(r.value)}
+                className={`px-2.5 py-1 rounded text-[11px] font-medium transition ${days === r.value ? 'bg-[#0052CC] text-white' : 'text-slate-600 hover:bg-slate-100'}`}
+              >
+                {r.label}
+              </button>
+            ))}
+          </div>
+          {/* Report generation: CSV for spreadsheets, print for PDF archives. */}
+          <button
+            onClick={() => downloadCsv(token, `${API_URL}/api/reports/mttr/export?days=${days}`, `mttr-report-${days}.csv`)}
+            disabled={!report}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-md text-[11px] font-medium text-slate-600 hover:bg-slate-50 shadow-sm transition disabled:opacity-50"
+          >
+            <Download className="h-3.5 w-3.5" /> Export CSV
+          </button>
+          <button
+            onClick={handlePrint}
+            disabled={!report}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-md text-[11px] font-medium text-slate-600 hover:bg-slate-50 shadow-sm transition disabled:opacity-50"
+          >
+            <Printer className="h-3.5 w-3.5" /> Print
+          </button>
         </div>
       </div>
 
@@ -1566,6 +1706,255 @@ function MttrBreakdown({ title, rows }) {
   );
 }
 
+/**
+ * IT asset stock report — what is in the store room, what is deployed or gone.
+ *
+ * Feeds on GET /api/reports/assets. "In stock" = status "In Stock"; every
+ * other status (Assigned, In Repair, Under Maintenance, Retired,
+ * Decommissioned) counts as "out of stock" — not available to hand out — while
+ * the exact status stays visible so retired gear is never confused with
+ * deployed gear. CSV export and print mirror the screen.
+ */
+function AssetReports({ token }) {
+  const STOCK_FILTERS = [
+    { value: 'all', label: 'All assets' },
+    { value: 'In Stock', label: 'In stock' },
+    { value: 'Out of Stock', label: 'Out of stock' },
+  ];
+  const [report, setReport] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [stockFilter, setStockFilter] = useState('all');
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError('');
+      try {
+        const res = await fetch(`${API_URL}/api/reports/assets`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!res.ok) {
+          setReport(null);
+          setError(data.error || `Could not load the asset report (HTTP ${res.status}).`);
+        } else {
+          setReport(data);
+        }
+      } catch {
+        if (!cancelled) {
+          setReport(null);
+          setError('Network error — could not reach the server.');
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [token]);
+
+  const summary = report && report.summary;
+  const rows = (report && report.rows) || [];
+  const visibleRows = stockFilter === 'all' ? rows : rows.filter((r) => r.stockState === stockFilter);
+
+  // Printable copy of the stock report (Print / Save as PDF).
+  const handlePrint = () => {
+    if (!report) return;
+    let body = printHeader('IT Asset Report', [
+      `Generated ${new Date(report.generatedAt).toLocaleString()}`,
+      'In stock = available in the store room; out of stock = deployed, in repair or retired',
+    ]);
+    body += printKpis([
+      ['Total assets', String(summary.total)],
+      ['In stock', String(summary.inStock)],
+      ['Out of stock', String(summary.outOfStock)],
+    ]);
+    body += '<h2>By category</h2>' + printTable(
+      ['Category', 'Total', 'In stock', 'Out of stock'],
+      report.byCategory.map((c) => [c.key, c.total, c.inStock, c.outOfStock]),
+      [1, 2, 3],
+    );
+    body += '<h2>By status</h2>' + printTable(
+      ['Status', 'Stock state', 'Count'],
+      report.byStatus.map((st) => [st.key, st.stockState, st.count]),
+      [2],
+    );
+    body += '<h2>Assets</h2>' + printTable(
+      ['Asset', 'Category', 'Serial number', 'Assigned to', 'Status', 'Stock state'],
+      rows.map((r) => [r.name, r.category, r.serial, r.assignedTo, r.status, r.stockState]),
+    );
+    openPrintableReport('IT Asset Report', body);
+  };
+
+  const stockBadge = (state) => (
+    <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${state === 'In Stock' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>
+      {state}
+    </span>
+  );
+
+  const kpi = (label, value, hint) => (
+    <div className="bg-white border border-slate-200 rounded-md p-3.5 shadow-sm">
+      <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">{label}</div>
+      <div className="text-lg font-bold text-slate-900 mt-1">{value}</div>
+      {hint ? <div className="text-[10px] text-slate-400 mt-0.5">{hint}</div> : null}
+    </div>
+  );
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-xs text-slate-500 max-w-xl">
+          Inventory stock report — how much hardware is available in the store room versus
+          deployed, under repair or retired. "In stock" means status <span className="font-medium text-slate-700">In Stock</span>;
+          everything else counts as out of stock.
+        </p>
+        <div className="flex items-center gap-2">
+          {/* Report generation: CSV for spreadsheets, print for PDF archives. */}
+          <button
+            onClick={() => downloadCsv(token, `${API_URL}/api/reports/assets/export`, 'asset-report.csv')}
+            disabled={!report}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-md text-[11px] font-medium text-slate-600 hover:bg-slate-50 shadow-sm transition disabled:opacity-50"
+          >
+            <Download className="h-3.5 w-3.5" /> Export CSV
+          </button>
+          <button
+            onClick={handlePrint}
+            disabled={!report}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-md text-[11px] font-medium text-slate-600 hover:bg-slate-50 shadow-sm transition disabled:opacity-50"
+          >
+            <Printer className="h-3.5 w-3.5" /> Print
+          </button>
+        </div>
+      </div>
+
+      {loading && (
+        <div className="bg-white border border-slate-200 rounded-md p-10 text-center text-xs text-slate-400 shadow-sm">
+          Loading asset stock metrics…
+        </div>
+      )}
+      {!loading && error && (
+        <div className="bg-red-50 border border-red-200 rounded-md p-4 text-xs text-red-700">
+          {error}
+        </div>
+      )}
+
+      {!loading && !error && report && (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            {kpi('Total assets', String(summary.total), 'tracked in the inventory')}
+            {kpi('In stock', String(summary.inStock), 'available in the store room')}
+            {kpi('Out of stock', String(summary.outOfStock), 'deployed, in repair or retired')}
+            {kpi('Availability', summary.total ? `${Math.round((summary.inStock / summary.total) * 100)}%` : '—', 'share of stock on hand')}
+          </div>
+
+          <div className="grid md:grid-cols-2 gap-4">
+            <div className="bg-white border border-slate-200 rounded-md p-4 shadow-sm">
+              <h3 className="text-sm font-bold text-slate-800 mb-3">In stock vs out of stock, by category</h3>
+              <table className="w-full text-left text-xs">
+                <thead className="text-slate-400 font-semibold uppercase text-[10px] border-b border-slate-100">
+                  <tr>
+                    <th className="py-2 pr-2">Category</th>
+                    <th className="py-2 pr-2">Total</th>
+                    <th className="py-2 pr-2">In stock</th>
+                    <th className="py-2">Out of stock</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-50">
+                  {report.byCategory.length === 0 ? (
+                    <tr><td colSpan="4" className="py-4 text-center text-slate-400">No assets in the inventory.</td></tr>
+                  ) : report.byCategory.map((c) => (
+                    <tr key={c.key}>
+                      <td className="py-2 pr-2 font-medium text-slate-700">{c.key}</td>
+                      <td className="py-2 pr-2 text-slate-600">{c.total}</td>
+                      <td className="py-2 pr-2 text-emerald-700 font-semibold">{c.inStock}</td>
+                      <td className="py-2 text-amber-700 font-semibold">{c.outOfStock}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="bg-white border border-slate-200 rounded-md p-4 shadow-sm">
+              <h3 className="text-sm font-bold text-slate-800 mb-3">By status</h3>
+              <table className="w-full text-left text-xs">
+                <thead className="text-slate-400 font-semibold uppercase text-[10px] border-b border-slate-100">
+                  <tr>
+                    <th className="py-2 pr-2">Status</th>
+                    <th className="py-2 pr-2">Stock state</th>
+                    <th className="py-2">Count</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-50">
+                  {report.byStatus.length === 0 ? (
+                    <tr><td colSpan="3" className="py-4 text-center text-slate-400">No assets in the inventory.</td></tr>
+                  ) : report.byStatus.map((st) => (
+                    <tr key={st.key}>
+                      <td className="py-2 pr-2 font-medium text-slate-700">{statusLabel(st.key)}</td>
+                      <td className="py-2 pr-2">{stockBadge(st.stockState)}</td>
+                      <td className="py-2 text-slate-600">{st.count}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="bg-white border border-slate-200 rounded-md shadow-sm">
+            <div className="flex items-center justify-between px-4 pt-4 pb-2">
+              <h3 className="text-sm font-bold text-slate-800">Assets</h3>
+              <div className="flex items-center gap-1 bg-slate-50 border border-slate-200 rounded-md p-1">
+                {STOCK_FILTERS.map((f) => {
+                  const n = f.value === 'all' ? rows.length : rows.filter((r) => r.stockState === f.value).length;
+                  return (
+                    <button
+                      key={f.value}
+                      onClick={() => setStockFilter(f.value)}
+                      className={`px-2.5 py-1 rounded text-[11px] font-medium transition ${stockFilter === f.value ? 'bg-[#0052CC] text-white' : 'text-slate-600 hover:bg-slate-100'}`}
+                    >
+                      {f.label} ({n})
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold uppercase">
+                  <tr>
+                    <th className="py-3 px-4">Asset</th>
+                    <th className="py-3 px-4">Category</th>
+                    <th className="py-3 px-4">Serial Number</th>
+                    <th className="py-3 px-4">Assigned To</th>
+                    <th className="py-3 px-4">Status</th>
+                    <th className="py-3 px-4">Stock State</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {visibleRows.length === 0 ? (
+                    <tr>
+                      <td colSpan="6" className="py-8 text-center text-slate-400">No assets match this filter.</td>
+                    </tr>
+                  ) : visibleRows.map((r) => (
+                    <tr key={r.id} className="hover:bg-slate-50 transition">
+                      <td className="py-3.5 px-4 font-semibold text-slate-800">{r.name}</td>
+                      <td className="py-3.5 px-4 text-slate-600">{r.category}</td>
+                      <td className="py-3.5 px-4 font-mono text-[#0052CC]">{r.serial}</td>
+                      <td className="py-3.5 px-4 text-slate-600">{r.assignedTo}</td>
+                      <td className="py-3.5 px-4 text-slate-600">{statusLabel(r.status)}</td>
+                      <td className="py-3.5 px-4">{stockBadge(r.stockState)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBACK_ENUMS, peopleList = [], fetchTickets, fetchUsers, fetchInventory, handleLogout, token, onChatTicketChange }) {
   const superAdmin = isSuperAdmin(user);
   // Who can be picked in the asset-assignment dropdowns: super admins have the
@@ -1602,7 +1991,9 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
   });
 
   const location = useLocation();
-  const currentTab = location.pathname.includes('reports') ? 'reports'
+  // Order matters: /agent/asset-reports also contains "reports".
+  const currentTab = location.pathname.includes('asset-reports') ? 'asset-reports'
+    : location.pathname.includes('reports') ? 'reports'
     : location.pathname.includes('inventory') ? 'inventory'
     : location.pathname.includes('users') ? 'users'
     : 'tickets';
@@ -1817,6 +2208,9 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
               <Link to="/agent/inventory" className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition ${currentTab === 'inventory' ? 'bg-blue-50 text-[#0052CC] font-semibold border-l-2 border-[#0052CC]' : 'text-slate-600 hover:bg-slate-100'}`}>
                 <Box className="h-4 w-4" /> IT Assets
               </Link>
+              <Link to="/agent/asset-reports" className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition ${currentTab === 'asset-reports' ? 'bg-blue-50 text-[#0052CC] font-semibold border-l-2 border-[#0052CC]' : 'text-slate-600 hover:bg-slate-100'}`} title="In stock vs out of stock, per category and status">
+                <FileText className="h-4 w-4" /> Asset Reports
+              </Link>
               {/* #36: only a super admin manages accounts. */}
               {superAdmin && (
                 <Link to="/agent/users" className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition ${currentTab === 'users' ? 'bg-blue-50 text-[#0052CC] font-semibold border-l-2 border-[#0052CC]' : 'text-slate-600 hover:bg-slate-100'}`}>
@@ -1837,6 +2231,7 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
               <h1 className="text-xl font-bold text-slate-900">
                 {currentTab === 'tickets' ? (superAdmin ? 'Service Desk Queues' : 'My Assigned Tickets')
                   : currentTab === 'reports' ? 'Resolution Time (MTTR)'
+                  : currentTab === 'asset-reports' ? 'Asset Stock Report'
                   : currentTab === 'inventory' ? 'Asset Inventory' : 'User Directory'}
               </h1>
               <p className="text-slate-500 text-xs mt-0.5">
@@ -1848,7 +2243,9 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
                     ? (superAdmin
                       ? 'How quickly requests are resolved across the helpdesk — mean, median, and trends.'
                       : 'How quickly your assigned requests are resolved — mean, median, and trends.')
-                    : currentTab === 'inventory' ? 'Track hardware assignments, serials, and equipment status.' : 'View registered users and invite agents or team members.'}
+                    : currentTab === 'asset-reports'
+                      ? 'What is in stock, what is out of stock — per category and status. Export or print the report.'
+                      : currentTab === 'inventory' ? 'Track hardware assignments, serials, and equipment status.' : 'View registered users and invite agents or team members.'}
               </p>
             </div>
             {currentTab === 'users' && (
@@ -1865,6 +2262,10 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
 
           {currentTab === 'reports' && (
             <MttrReports token={token} />
+          )}
+
+          {currentTab === 'asset-reports' && (
+            <AssetReports token={token} />
           )}
 
           {currentTab === 'tickets' && (

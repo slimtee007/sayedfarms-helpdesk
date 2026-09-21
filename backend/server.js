@@ -1179,23 +1179,26 @@ const isoWeekStart = (iso) => {
   return d.toISOString().slice(0, 10);
 };
 
-const buildMttrReport = (scopeTickets, { days, now }) => {
+// One measurement per resolved ticket: total elapsed minutes to resolution.
+// Shared by the on-screen report and the CSV export so both always agree.
+const mttrRows = (scopeTickets, { days, now }) => {
   const cutoff = days === 'all' ? -Infinity : now - days * 24 * 60 * 60 * 1000;
-  const inRange = scopeTickets.filter((t) => {
-    if (!RESOLUTION_STATUSES.has(t.status)) return false;
-    const resolved = Date.parse(t.resolved_at);
-    return Number.isFinite(resolved) && resolved >= cutoff;
-  });
-
-  // One measurement per resolved ticket: total elapsed minutes to resolution.
-  const rows = inRange
+  return scopeTickets
+    .filter((t) => {
+      if (!RESOLUTION_STATUSES.has(t.status)) return false;
+      const resolved = Date.parse(t.resolved_at);
+      return Number.isFinite(resolved) && resolved >= cutoff;
+    })
     .map((t) => ({
       id: t.id,
       title: t.title,
+      status: t.status,
       priority: t.priority,
       category: t.category,
       agentId: t.assigned_to_id || null,
       agentName: t.assigned_to || 'Unassigned',
+      createdAt: t.created_at || null,
+      firstResponseAt: t.first_response_at || null,
       resolvedAt: t.resolved_at,
       closedAt: t.closed_at || null,
       minutes: t.resolution_minutes != null ? t.resolution_minutes : minutesBetween(t.created_at, t.resolved_at),
@@ -1203,6 +1206,11 @@ const buildMttrReport = (scopeTickets, { days, now }) => {
       reopenedCount: t.reopened_count || 0,
     }))
     .filter((r) => r.minutes != null);
+};
+
+const buildMttrReport = (scopeTickets, { days, now }) => {
+  const cutoff = days === 'all' ? -Infinity : now - days * 24 * 60 * 60 * 1000;
+  const rows = mttrRows(scopeTickets, { days, now });
 
   const summary = {
     ...statsFromMinutes(rows.map((r) => r.minutes)),
@@ -1247,22 +1255,159 @@ const buildMttrReport = (scopeTickets, { days, now }) => {
   };
 };
 
+// ---- Report generation (CSV exports + asset stock report) -----------------
+
+// Shared ?days= parsing for the MTTR dashboard feed and its CSV export.
+const parseMttrRange = (query) => {
+  const raw = String((query.days ?? '30')).trim().toLowerCase();
+  if (raw === 'all') return { days: 'all', raw };
+  const days = Number(raw);
+  if (!Number.isInteger(days) || days < 1 || days > 365) {
+    return { error: 'days must be an integer between 1 and 365, or "all"' };
+  }
+  return { days, raw };
+};
+
+const rangeLabel = (days) => (days === 'all' ? 'All time' : `Last ${days} days`);
+
+// Minimal CSV writer: RFC-4180 quoting plus a UTF-8 BOM so Excel on Windows
+// opens the file with the right encoding.
+const csvCell = (v) => {
+  const s = v == null ? '' : String(v);
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+const csvRow = (cells) => cells.map(csvCell).join(',');
+const sendCsv = (res, filename, lines) => {
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(`\uFEFF${lines.join('\r\n')}`);
+};
+const exportDate = () => new Date().toISOString().slice(0, 10);
+const fmtNum = (v) => (v == null ? '' : String(v));
+
 // GET /api/reports/mttr?days=30|7|90|365|all — the MTTR dashboard feed.
 // Agents: metrics over the tickets assigned to them. Super admins: the whole
 // helpdesk (plus the per-agent breakdown). Employees are not ops-reporting
 // users and get a 403 from requireAgent.
 app.get('/api/reports/mttr', requireAgent, (req, res) => {
-  const raw = String((req.query.days ?? '30')).trim().toLowerCase();
-  let days = 30;
-  if (raw !== 'all') {
-    days = Number(raw);
-    if (!Number.isInteger(days) || days < 1 || days > 365) {
-      return res.status(400).json({ error: 'days must be an integer between 1 and 365, or "all"' });
-    }
-  }
-  const report = buildMttrReport(visibleTicketsFor(req.user), { days: raw === 'all' ? 'all' : days, now: Date.now() });
+  const range = parseMttrRange(req.query);
+  if (range.error) return res.status(400).json({ error: range.error });
+  const report = buildMttrReport(visibleTicketsFor(req.user), { days: range.days, now: Date.now() });
   report.scope = isSuperAdmin(req.user) ? 'all' : 'own';
   res.json(report);
+});
+
+// GET /api/reports/mttr/export?days=... — the same report as a CSV download:
+// a summary block, then one row per resolved ticket behind the numbers.
+app.get('/api/reports/mttr/export', requireAgent, (req, res) => {
+  const range = parseMttrRange(req.query);
+  if (range.error) return res.status(400).json({ error: range.error });
+  const scope = visibleTicketsFor(req.user);
+  const now = Date.now();
+  const report = buildMttrReport(scope, { days: range.days, now });
+  const rows = mttrRows(scope, { days: range.days, now });
+  const s = report.summary;
+
+  const lines = [];
+  lines.push(csvRow(['MTTR Report', rangeLabel(range.days)]));
+  lines.push(csvRow(['Scope', isSuperAdmin(req.user) ? 'All tickets' : 'Tickets assigned to me']));
+  lines.push(csvRow(['Generated', new Date(now).toISOString()]));
+  lines.push('');
+  lines.push(csvRow(['Metric', 'Value']));
+  lines.push(csvRow(['Resolved tickets', s.count]));
+  lines.push(csvRow(['Mean time to resolve (minutes)', fmtNum(s.meanMinutes)]));
+  lines.push(csvRow(['Median time to resolve (minutes)', fmtNum(s.medianMinutes)]));
+  lines.push(csvRow(['Fastest resolution (minutes)', fmtNum(s.minMinutes)]));
+  lines.push(csvRow(['Slowest resolution (minutes)', fmtNum(s.maxMinutes)]));
+  lines.push(csvRow(['Mean first response (minutes)', fmtNum(s.meanFirstResponseMinutes)]));
+  lines.push(csvRow(['Reopened after resolution', s.reopenedCount]));
+  lines.push('');
+  lines.push(csvRow(['Ticket ID', 'Title', 'Status', 'Category', 'Priority', 'Agent', 'Created at', 'First response at', 'Resolved at', 'Closed at', 'Time to resolve (minutes)', 'First response (minutes)', 'Reopened count']));
+  rows.forEach((r) => lines.push(csvRow([
+    r.id, r.title, r.status, r.category, r.priority, r.agentName,
+    r.createdAt, r.firstResponseAt, r.resolvedAt, r.closedAt,
+    fmtNum(r.minutes), fmtNum(r.firstResponseMinutes), r.reopenedCount,
+  ])));
+
+  sendCsv(res, `mttr-report-${range.raw}-${exportDate()}.csv`, lines);
+});
+
+// ---- IT asset reports -----------------------------------------------------
+//
+// "In stock" is the store room: assets with status "In Stock". Everything else
+// (Assigned, In Repair, Under Maintenance, Retired, Decommissioned) is "out of
+// stock" — not available to hand out. The exact status is always reported
+// alongside the binary split so retired gear is never confused with deployed
+// gear.
+const stockStateOf = (item) => (item.status === 'In Stock' ? 'In Stock' : 'Out of Stock');
+
+const buildAssetReport = (items) => {
+  const rows = items.map((i) => ({
+    id: i.id,
+    name: i.name,
+    category: i.category || 'Other',
+    serial: i.serial_number,
+    assignedTo: i.assigned_to || 'Unassigned',
+    status: i.status || 'In Stock',
+    stockState: stockStateOf(i),
+  }));
+
+  const inStock = rows.filter((r) => r.stockState === 'In Stock').length;
+  const byCategory = new Map();
+  rows.forEach((r) => {
+    const g = byCategory.get(r.category) || { key: r.category, total: 0, inStock: 0, outOfStock: 0 };
+    g.total += 1;
+    if (r.stockState === 'In Stock') g.inStock += 1;
+    else g.outOfStock += 1;
+    byCategory.set(r.category, g);
+  });
+  const byStatus = new Map();
+  rows.forEach((r) => byStatus.set(r.status, (byStatus.get(r.status) || 0) + 1));
+
+  return {
+    generatedAt: new Date().toISOString(),
+    summary: {
+      total: rows.length,
+      inStock,
+      outOfStock: rows.length - inStock,
+    },
+    byCategory: [...byCategory.values()].sort((a, b) => b.total - a.total || a.key.localeCompare(b.key)),
+    byStatus: [...byStatus.entries()].map(([key, count]) => ({ key, count, stockState: stockStateOf({ status: key }) }))
+      .sort((a, b) => b.count - a.count || a.key.localeCompare(b.key)),
+    rows,
+  };
+};
+
+// GET /api/reports/assets — the IT asset stock report (all agents see the
+// whole inventory, same as /api/inventory).
+app.get('/api/reports/assets', requireAgent, (req, res) => {
+  res.json(buildAssetReport(inventory));
+});
+
+// GET /api/reports/assets/export — the asset report as a CSV download: a
+// summary block (totals and the in/out-of-stock split per category), then one
+// row per asset with its stock state.
+app.get('/api/reports/assets/export', requireAgent, (req, res) => {
+  const report = buildAssetReport(inventory);
+  const lines = [];
+  lines.push(csvRow(['IT Asset Report']));
+  lines.push(csvRow(['Generated', report.generatedAt]));
+  lines.push('');
+  lines.push(csvRow(['Metric', 'Value']));
+  lines.push(csvRow(['Total assets', report.summary.total]));
+  lines.push(csvRow(['In stock', report.summary.inStock]));
+  lines.push(csvRow(['Out of stock', report.summary.outOfStock]));
+  lines.push('');
+  lines.push(csvRow(['Category', 'Total', 'In stock', 'Out of stock']));
+  report.byCategory.forEach((c) => lines.push(csvRow([c.key, c.total, c.inStock, c.outOfStock])));
+  lines.push('');
+  lines.push(csvRow(['Status', 'Count', 'Stock state']));
+  report.byStatus.forEach((s) => lines.push(csvRow([s.key, s.count, s.stockState])));
+  lines.push('');
+  lines.push(csvRow(['Asset ID', 'Name', 'Category', 'Serial number', 'Assigned to', 'Status', 'Stock state']));
+  report.rows.forEach((r) => lines.push(csvRow([r.id, r.name, r.category, r.serial, r.assignedTo, r.status, r.stockState])));
+
+  sendCsv(res, `asset-report-${exportDate()}.csv`, lines);
 });
 
 app.get('/api/inventory', requireAgent, (req, res) => {
