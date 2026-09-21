@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, Navigate, Link, useLocation } from 'react-router-dom';
 import { io } from 'socket.io-client';
-import { Activity, Plus, ShieldCheck, User, LogOut, Image as ImageIcon, X, Paperclip, Users, Ticket, UserPlus, Copy, Check, Trash2, Box, PackagePlus, ChevronRight, Search, Headphones, KeyRound, AlertCircle, Monitor, Laptop, FilePlus, ChevronDown, Filter, MessageSquare, Send } from 'lucide-react';
+import { Activity, Plus, ShieldCheck, User, LogOut, Image as ImageIcon, X, Paperclip, Users, Ticket, UserPlus, Copy, Check, Trash2, Box, PackagePlus, ChevronRight, Search, Headphones, KeyRound, AlertCircle, Monitor, Laptop, FilePlus, ChevronDown, Filter, MessageSquare, Send, Timer, FileText, Download, Printer } from 'lucide-react';
 import ForgotPassword from './pages/ForgotPassword.jsx';
 
 // Same-origin by default: in dev, Vite proxies /api and /socket.io to the
@@ -21,6 +21,10 @@ const FALLBACK_ENUMS = {
   ticketPriority: ['Low', 'Medium', 'High', 'Urgent'],
   ticketCategory: ['Hardware', 'Software', 'Network', 'Access/Security', 'Account', 'Other'],
   inventoryStatus: ['In Stock', 'Assigned', 'In Repair', 'Retired', 'Under Maintenance', 'Decommissioned'],
+  // Server-owned asset-category pick list (#asset-categories). Kept in step
+  // with VALID_INVENTORY_CATEGORY in backend/server.js — the live list comes
+  // from GET /api/meta/enums, this is the offline fallback.
+  inventoryCategory: ['Laptop', 'Desktop Computer', 'Monitor', 'Printer', 'Cartridge', 'Toner', 'IP Camera', 'Solar PTZ Camera', 'NVR', 'SSD/HDD', 'Network Equipment', 'Peripherals', 'Server', 'UPS', 'Other'],
 };
 
 // Human labels for values whose API name is terse.
@@ -58,6 +62,16 @@ const assigneeOptions = (people, current) => {
   return opts;
 };
 
+/**
+ * Options for an asset-category <select> (#asset-categories). `categories` is
+ * the server-owned list (GET /api/meta/enums); `current` keeps a row whose
+ * stored value predates the list selectable instead of blanking the field.
+ */
+const categoryOptions = (categories, current) => {
+  const list = categories && categories.length ? categories : FALLBACK_ENUMS.inventoryCategory;
+  return current && !list.includes(current) ? [...list, current] : list;
+};
+
 // Super admins see every ticket and own the dispatch/user-management screens
 // (#36). `super_admin` rides along on the signed-in user object.
 const isSuperAdmin = (user) => Boolean(user && user.role === 'agent' && user.super_admin === true);
@@ -67,6 +81,115 @@ const assigneePayload = (value) => {
   if (!value || value === UNASSIGNED || value === LEGACY_ASSIGNEE) return { assigned_to_id: null };
   return { assigned_to_id: value };
 };
+
+// ---- MTTR (mean time to resolution) display helpers -----------------------
+// `resolution_minutes` is stamped server-side when a ticket is resolved
+// (resolved_at − created_at). Formatting is shared by the ticket tables and
+// the MTTR report.
+const formatDuration = (minutes) => {
+  if (minutes == null || !Number.isFinite(Number(minutes))) return '—';
+  const m = Math.max(0, Math.round(Number(minutes)));
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  if (h < 24) return rem ? `${h}h ${rem}m` : `${h}h`;
+  const d = Math.floor(h / 24);
+  const rh = h % 24;
+  return rh ? `${d}d ${rh}h` : `${d}d`;
+};
+
+// A one-line timing summary for a ticket row: how long resolution took, or how
+// old the request still is while it is being worked.
+const ticketElapsed = (t) => {
+  if (t.resolution_minutes != null) return `Resolved in ${formatDuration(t.resolution_minutes)}`;
+  if (t.status === 'Cancelled') return null;
+  const created = Date.parse(t.created_at);
+  if (!Number.isFinite(created)) return null;
+  return `Age ${formatDuration((Date.now() - created) / 60000)}`;
+};
+
+// Report bucket keys come back as YYYY-MM-DD (day), YYYY-MM-DD week starts
+// (week) or YYYY-MM (month).
+const bucketLabel = (bucket) => {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(bucket)) return bucket.slice(5).replace('-', '/');
+  return bucket;
+};
+
+// ---- Report generation (CSV download + print / save-as-PDF) ----------------
+
+// Download a CSV export. The endpoints need the session token, so this goes
+// through fetch + blob rather than a plain link.
+const downloadCsv = async (token, url, fallbackName) => {
+  try {
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      return alert(data.error || `Could not generate the export (HTTP ${res.status}).`);
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get('Content-Disposition') || '';
+    const match = cd.match(/filename="?([^";]+)"?/i);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = (match && match[1]) || fallbackName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(a.href);
+  } catch {
+    alert('Network error — could not reach the server.');
+  }
+};
+
+const escHtml = (v) => String(v == null ? '' : v)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+// Print / Save-as-PDF via a hidden iframe: a clean, chrome-free document the
+// browser can print or archive without shipping a PDF dependency.
+const openPrintableReport = (title, bodyHtml) => {
+  const iframe = document.createElement('iframe');
+  iframe.setAttribute('aria-hidden', 'true');
+  iframe.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden';
+  document.body.appendChild(iframe);
+  const win = iframe.contentWindow;
+  const doc = win && win.document;
+  if (!doc) {
+    document.body.removeChild(iframe);
+    return alert('Printing is not available in this browser.');
+  }
+  doc.open();
+  doc.write(`<!doctype html><html><head><meta charset="utf-8"><title>${escHtml(title)}</title>
+<style>
+  body { font-family: ui-sans-serif, system-ui, Arial, sans-serif; color: #1e293b; margin: 28px; font-size: 12px; }
+  h1 { font-size: 18px; margin: 0 0 2px; }
+  .meta { color: #64748b; margin-bottom: 16px; }
+  h2 { font-size: 12px; margin: 18px 0 6px; text-transform: uppercase; letter-spacing: .04em; color: #475569; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 8px; }
+  th, td { border: 1px solid #cbd5e1; padding: 5px 8px; text-align: left; vertical-align: top; }
+  th { background: #f1f5f9; font-size: 10px; text-transform: uppercase; letter-spacing: .03em; color: #475569; }
+  td.num, th.num { text-align: right; }
+  .muted { color: #94a3b8; }
+</style></head><body>${bodyHtml}</body></html>`);
+  doc.close();
+  win.focus();
+  win.print();
+  // Give the print dialog time to open before the iframe goes away.
+  setTimeout(() => { if (iframe.parentNode) iframe.parentNode.removeChild(iframe); }, 2000);
+};
+
+// Table/KPI builders for the printable documents.
+const printTable = (headers, rows, numCols = []) => {
+  const body = rows.length ? rows : [headers.map((h, i) => (i === 0 ? 'No data' : ''))];
+  return `
+  <table><thead><tr>${headers.map((h, i) => `<th${numCols.includes(i) ? ' class="num"' : ''}>${escHtml(h)}</th>`).join('')}</tr></thead>
+  <tbody>${body.map((r) => `<tr>${r.map((c, i) => `<td${numCols.includes(i) ? ' class="num"' : ''}>${escHtml(c)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
+};
+const printKpis = (pairs) => `
+  <table><thead><tr>${pairs.map(([label]) => `<th>${escHtml(label)}</th>`).join('')}</tr></thead>
+  <tbody><tr>${pairs.map(([, value]) => `<td>${escHtml(value)}</td>`).join('')}</tr></tbody></table>`;
+const printHeader = (title, metaLines) => `
+  <h1>${escHtml(title)}</h1>
+  <div class="meta">${metaLines.map(escHtml).join(' · ')}</div>`;
 
 // Catches any render-time exception and shows a recoverable message instead of
 // unmounting the whole app into a blank page.
@@ -1093,7 +1216,13 @@ function CustomerPortal({ user, tickets, agentsList = [], enums = FALLBACK_ENUMS
                   ) : (
                     tickets.map(t => (
                       <tr key={t.id} className="hover:bg-slate-50">
-                        <td className="py-3 font-medium text-slate-800">{t.title}</td>
+                        <td className="py-3">
+                          <div className="font-medium text-slate-800">{t.title}</div>
+                          {/* MTTR: how long the resolution took (or how old the request still is). */}
+                          {ticketElapsed(t) && (
+                            <div className="text-[10px] text-slate-400 mt-0.5">{ticketElapsed(t)}</div>
+                          )}
+                        </td>
                         <td className="py-3 text-slate-500">{t.category}</td>
                         <td className="py-3 text-slate-600 font-medium">{t.assigned_to}</td>
                         <td className="py-3">
@@ -1253,6 +1382,579 @@ function CustomerPortal({ user, tickets, agentsList = [], enums = FALLBACK_ENUMS
   );
 }
 
+/**
+ * MTTR (mean time to resolution) report — the agent-facing analytics screen.
+ *
+ * Feeds on GET /api/reports/mttr: the server aggregates the per-ticket
+ * lifecycle stamps (created_at → resolved_at) and scopes the numbers to the
+ * caller — a super admin sees the whole helpdesk, a regular agent the tickets
+ * assigned to them. Charts are hand-rolled SVG, so there is no charting
+ * dependency to ship or audit.
+ */
+function MttrReports({ token }) {
+  const RANGES = [
+    { value: '7', label: '7 days' },
+    { value: '30', label: '30 days' },
+    { value: '90', label: '90 days' },
+    { value: '365', label: '12 months' },
+    { value: 'all', label: 'All time' },
+  ];
+  const [days, setDays] = useState('30');
+  const [report, setReport] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError('');
+      try {
+        const res = await fetch(`${API_URL}/api/reports/mttr?days=${days}`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!res.ok) {
+          setReport(null);
+          setError(data.error || `Could not load the MTTR report (HTTP ${res.status}).`);
+        } else {
+          setReport(data);
+        }
+      } catch {
+        if (!cancelled) {
+          setReport(null);
+          setError('Network error — could not reach the server.');
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [days, token]);
+
+  const s = report && report.summary;
+
+  // Printable copy of exactly what is on screen (Print / Save as PDF).
+  const handlePrint = () => {
+    if (!report || !s) return;
+    const rangeName = (RANGES.find((r) => r.value === days) || {}).label || String(days);
+    let body = printHeader(`MTTR Report — ${rangeName}`, [
+      report.scope === 'all' ? 'Scope: all tickets' : 'Scope: tickets assigned to me',
+      `Generated ${new Date(report.range.to).toLocaleString()}`,
+    ]);
+    body += printKpis([
+      ['MTTR (mean)', formatDuration(s.meanMinutes)],
+      ['Median', formatDuration(s.medianMinutes)],
+      ['Fastest', formatDuration(s.minMinutes)],
+      ['Slowest', formatDuration(s.maxMinutes)],
+      ['Resolved tickets', String(s.count)],
+      ['Mean first reply', s.meanFirstResponseMinutes == null ? '—' : formatDuration(s.meanFirstResponseMinutes)],
+      ['Reopens', String(s.reopenedCount)],
+    ]);
+    body += `<h2>Resolution time per ${escHtml(report.bucket)}</h2>` + printTable(
+      ['Period', 'Resolved', 'Mean (min)', 'Median (min)'],
+      report.trend.map((b) => [bucketLabel(b.bucket), b.count, b.meanMinutes, b.medianMinutes]),
+      [1, 2, 3],
+    );
+    body += '<h2>By category</h2>' + printTable(
+      ['Category', 'Resolved', 'Mean (min)', 'Median (min)', 'Slowest (min)'],
+      report.byCategory.map((g) => [g.key, g.count, g.meanMinutes, g.medianMinutes, g.maxMinutes]),
+      [1, 2, 3, 4],
+    );
+    body += '<h2>By priority</h2>' + printTable(
+      ['Priority', 'Resolved', 'Mean (min)', 'Median (min)', 'Slowest (min)'],
+      report.byPriority.map((g) => [g.key, g.count, g.meanMinutes, g.medianMinutes, g.maxMinutes]),
+      [1, 2, 3, 4],
+    );
+    if (report.byAgent.length > 0) {
+      body += '<h2>By agent</h2>' + printTable(
+        ['Agent', 'Resolved', 'Mean (min)', 'Median (min)', 'Slowest (min)'],
+        report.byAgent.map((a) => [a.name, a.count, a.meanMinutes, a.medianMinutes, a.maxMinutes]),
+        [1, 2, 3, 4],
+      );
+    }
+    body += '<h2>Slowest resolved tickets</h2>' + printTable(
+      ['Ticket', 'Category', 'Priority', 'Agent', 'Time to resolve (min)'],
+      report.slowest.map((t) => [t.title, t.category, t.priority, t.agentName, t.minutes]),
+      [4],
+    );
+    openPrintableReport(`MTTR Report (${rangeName})`, body);
+  };
+
+  const kpi = (label, value, hint) => (
+    <div className="bg-white border border-slate-200 rounded-md p-3.5 shadow-sm">
+      <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">{label}</div>
+      <div className="text-lg font-bold text-slate-900 mt-1">{value}</div>
+      {hint ? <div className="text-[10px] text-slate-400 mt-0.5">{hint}</div> : null}
+    </div>
+  );
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-xs text-slate-500 max-w-xl">
+          Mean time to resolution (MTTR) measures how long resolved tickets take from creation
+          to resolution — including any time spent reopened. Cancelled and not-yet-resolved
+          tickets are excluded. {report && report.scope === 'own' ? 'These numbers cover the tickets assigned to you.' : 'These numbers cover the whole helpdesk.'}
+        </p>
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1 bg-white border border-slate-200 rounded-md p-1 shadow-sm">
+            {RANGES.map((r) => (
+              <button
+                key={r.value}
+                onClick={() => setDays(r.value)}
+                className={`px-2.5 py-1 rounded text-[11px] font-medium transition ${days === r.value ? 'bg-[#0052CC] text-white' : 'text-slate-600 hover:bg-slate-100'}`}
+              >
+                {r.label}
+              </button>
+            ))}
+          </div>
+          {/* Report generation: CSV for spreadsheets, print for PDF archives. */}
+          <button
+            onClick={() => downloadCsv(token, `${API_URL}/api/reports/mttr/export?days=${days}`, `mttr-report-${days}.csv`)}
+            disabled={!report}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-md text-[11px] font-medium text-slate-600 hover:bg-slate-50 shadow-sm transition disabled:opacity-50"
+          >
+            <Download className="h-3.5 w-3.5" /> Export CSV
+          </button>
+          <button
+            onClick={handlePrint}
+            disabled={!report}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-md text-[11px] font-medium text-slate-600 hover:bg-slate-50 shadow-sm transition disabled:opacity-50"
+          >
+            <Printer className="h-3.5 w-3.5" /> Print
+          </button>
+        </div>
+      </div>
+
+      {loading && (
+        <div className="bg-white border border-slate-200 rounded-md p-10 text-center text-xs text-slate-400 shadow-sm">
+          Loading resolution-time metrics…
+        </div>
+      )}
+      {!loading && error && (
+        <div className="bg-red-50 border border-red-200 rounded-md p-4 text-xs text-red-700">
+          {error}
+        </div>
+      )}
+
+      {!loading && !error && report && s && (
+        <>
+          {s.count === 0 ? (
+            <div className="bg-white border border-slate-200 rounded-md p-10 text-center shadow-sm">
+              <Timer className="h-6 w-6 text-slate-300 mx-auto mb-2" />
+              <p className="text-xs text-slate-500">No tickets were resolved in this period.</p>
+              <p className="text-[11px] text-slate-400 mt-1">Resolve a ticket (or widen the range) and its resolution time will show up here.</p>
+            </div>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
+                {kpi('MTTR', formatDuration(s.meanMinutes), 'mean time to resolve')}
+                {kpi('Median', formatDuration(s.medianMinutes), 'middle of the pack')}
+                {kpi('Fastest', formatDuration(s.minMinutes), 'quickest resolution')}
+                {kpi('Slowest', formatDuration(s.maxMinutes), 'longest resolution')}
+                {kpi('Resolved', String(s.count), s.reopenedCount > 0 ? `${s.reopenedCount} reopen${s.reopenedCount === 1 ? '' : 's'} along the way` : 'in this period')}
+                {kpi('First reply', s.meanFirstResponseMinutes == null ? '—' : formatDuration(s.meanFirstResponseMinutes), `avg · ${s.firstResponseCount} ticket${s.firstResponseCount === 1 ? '' : 's'}`)}
+              </div>
+
+              <div className="bg-white border border-slate-200 rounded-md p-4 shadow-sm">
+                <h3 className="text-sm font-bold text-slate-800 mb-1">MTTR trend</h3>
+                <p className="text-[11px] text-slate-400 mb-3">Mean time to resolve per {report.bucket}. Hover a bar for the count behind it.</p>
+                <MttrTrendChart trend={report.trend} />
+              </div>
+
+              <div className="grid md:grid-cols-2 gap-4">
+                <MttrBreakdown title="By category" rows={report.byCategory} />
+                <MttrBreakdown title="By priority" rows={report.byPriority} />
+              </div>
+
+              {Array.isArray(report.byAgent) && report.byAgent.length > 0 && (
+                <div className="bg-white border border-slate-200 rounded-md p-4 shadow-sm">
+                  <h3 className="text-sm font-bold text-slate-800 mb-3">By agent</h3>
+                  <table className="w-full text-left text-xs">
+                    <thead className="text-slate-400 font-semibold uppercase text-[10px] border-b border-slate-100">
+                      <tr>
+                        <th className="py-2 pr-2">Agent</th>
+                        <th className="py-2 pr-2">Resolved</th>
+                        <th className="py-2 pr-2">MTTR</th>
+                        <th className="py-2 pr-2">Median</th>
+                        <th className="py-2">Slowest</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-50">
+                      {report.byAgent.map((a) => (
+                        <tr key={a.id || 'unassigned'}>
+                          <td className="py-2 pr-2 font-medium text-slate-700">{a.name}</td>
+                          <td className="py-2 pr-2 text-slate-600">{a.count}</td>
+                          <td className="py-2 pr-2 text-slate-800 font-semibold">{formatDuration(a.meanMinutes)}</td>
+                          <td className="py-2 pr-2 text-slate-600">{formatDuration(a.medianMinutes)}</td>
+                          <td className="py-2 text-slate-600">{formatDuration(a.maxMinutes)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {report.slowest.length > 0 && (
+                <div className="bg-white border border-slate-200 rounded-md p-4 shadow-sm">
+                  <h3 className="text-sm font-bold text-slate-800 mb-3">Slowest resolved tickets</h3>
+                  <table className="w-full text-left text-xs">
+                    <thead className="text-slate-400 font-semibold uppercase text-[10px] border-b border-slate-100">
+                      <tr>
+                        <th className="py-2 pr-2">Ticket</th>
+                        <th className="py-2 pr-2">Category</th>
+                        <th className="py-2 pr-2">Priority</th>
+                        <th className="py-2 pr-2">Agent</th>
+                        <th className="py-2 text-right">Time to resolve</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-50">
+                      {report.slowest.map((t) => (
+                        <tr key={t.id}>
+                          <td className="py-2 pr-2 font-medium text-slate-700">{t.title}</td>
+                          <td className="py-2 pr-2 text-slate-500">{t.category}</td>
+                          <td className="py-2 pr-2 text-slate-500">{t.priority}</td>
+                          <td className="py-2 pr-2 text-slate-500">{t.agentName}</td>
+                          <td className="py-2 text-right font-semibold text-slate-800">{formatDuration(t.minutes)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// Mean-MTTR-per-bucket bars, plain SVG. Bar height = mean minutes, the number
+// over each bar is how many tickets were resolved in that bucket.
+function MttrTrendChart({ trend }) {
+  if (!trend || trend.length === 0) {
+    return <p className="text-[11px] text-slate-400">No trend data for this range.</p>;
+  }
+  const W = 640, H = 170, PAD_L = 44, PAD_R = 10, PAD_T = 20, PAD_B = 24;
+  const max = Math.max(...trend.map((b) => b.meanMinutes || 0), 1);
+  const innerW = W - PAD_L - PAD_R;
+  const innerH = H - PAD_T - PAD_B;
+  const slot = innerW / trend.length;
+  const barW = Math.max(4, Math.min(28, slot * 0.6));
+  return (
+    <div className="overflow-x-auto">
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full min-w-[480px]" role="img" aria-label="MTTR trend">
+        {[0, 0.5, 1].map((f) => (
+          <g key={f}>
+            <line x1={PAD_L} x2={W - PAD_R} y1={PAD_T + innerH * f} y2={PAD_T + innerH * f} stroke="#e2e8f0" strokeWidth="1" />
+            <text x={PAD_L - 6} y={PAD_T + innerH * f + 3} textAnchor="end" className="fill-slate-400" fontSize="9">
+              {formatDuration(max * (1 - f))}
+            </text>
+          </g>
+        ))}
+        {trend.map((b, i) => {
+          const h = Math.max(2, ((b.meanMinutes || 0) / max) * innerH);
+          const x = PAD_L + i * slot + (slot - barW) / 2;
+          const y = PAD_T + innerH - h;
+          return (
+            <g key={b.bucket}>
+              <rect x={x} y={y} width={barW} height={h} rx="2" fill="#0052CC">
+                <title>{`${b.bucket}: ${formatDuration(b.meanMinutes)} across ${b.count} ticket${b.count === 1 ? '' : 's'}`}</title>
+              </rect>
+              <text x={x + barW / 2} y={y - 4} textAnchor="middle" className="fill-slate-500" fontSize="9">{b.count}</text>
+              <text x={x + barW / 2} y={H - 8} textAnchor="middle" className="fill-slate-400" fontSize="8.5">{bucketLabel(b.bucket)}</text>
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+function MttrBreakdown({ title, rows }) {
+  return (
+    <div className="bg-white border border-slate-200 rounded-md p-4 shadow-sm">
+      <h3 className="text-sm font-bold text-slate-800 mb-3">{title}</h3>
+      <table className="w-full text-left text-xs">
+        <thead className="text-slate-400 font-semibold uppercase text-[10px] border-b border-slate-100">
+          <tr>
+            <th className="py-2 pr-2">&nbsp;</th>
+            <th className="py-2 pr-2">Resolved</th>
+            <th className="py-2 pr-2">MTTR</th>
+            <th className="py-2 pr-2">Median</th>
+            <th className="py-2">Slowest</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-50">
+          {rows.length === 0 ? (
+            <tr><td colSpan="5" className="py-4 text-center text-slate-400">No data.</td></tr>
+          ) : rows.map((r) => (
+            <tr key={r.key}>
+              <td className="py-2 pr-2 font-medium text-slate-700">{r.key}</td>
+              <td className="py-2 pr-2 text-slate-600">{r.count}</td>
+              <td className="py-2 pr-2 text-slate-800 font-semibold">{formatDuration(r.meanMinutes)}</td>
+              <td className="py-2 pr-2 text-slate-600">{formatDuration(r.medianMinutes)}</td>
+              <td className="py-2 text-slate-600">{formatDuration(r.maxMinutes)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/**
+ * IT asset stock report — what is in the store room, what is deployed or gone.
+ *
+ * Feeds on GET /api/reports/assets. "In stock" = status "In Stock"; every
+ * other status (Assigned, In Repair, Under Maintenance, Retired,
+ * Decommissioned) counts as "out of stock" — not available to hand out — while
+ * the exact status stays visible so retired gear is never confused with
+ * deployed gear. CSV export and print mirror the screen.
+ */
+function AssetReports({ token }) {
+  const STOCK_FILTERS = [
+    { value: 'all', label: 'All assets' },
+    { value: 'In Stock', label: 'In stock' },
+    { value: 'Out of Stock', label: 'Out of stock' },
+  ];
+  const [report, setReport] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [stockFilter, setStockFilter] = useState('all');
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError('');
+      try {
+        const res = await fetch(`${API_URL}/api/reports/assets`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!res.ok) {
+          setReport(null);
+          setError(data.error || `Could not load the asset report (HTTP ${res.status}).`);
+        } else {
+          setReport(data);
+        }
+      } catch {
+        if (!cancelled) {
+          setReport(null);
+          setError('Network error — could not reach the server.');
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [token]);
+
+  const summary = report && report.summary;
+  const rows = (report && report.rows) || [];
+  const visibleRows = stockFilter === 'all' ? rows : rows.filter((r) => r.stockState === stockFilter);
+
+  // Printable copy of the stock report (Print / Save as PDF).
+  const handlePrint = () => {
+    if (!report) return;
+    let body = printHeader('IT Asset Report', [
+      `Generated ${new Date(report.generatedAt).toLocaleString()}`,
+      'In stock = available in the store room; out of stock = deployed, in repair or retired',
+    ]);
+    body += printKpis([
+      ['Total assets', String(summary.total)],
+      ['In stock', String(summary.inStock)],
+      ['Out of stock', String(summary.outOfStock)],
+    ]);
+    body += '<h2>By category</h2>' + printTable(
+      ['Category', 'Total', 'In stock', 'Out of stock'],
+      report.byCategory.map((c) => [c.key, c.total, c.inStock, c.outOfStock]),
+      [1, 2, 3],
+    );
+    body += '<h2>By status</h2>' + printTable(
+      ['Status', 'Stock state', 'Count'],
+      report.byStatus.map((st) => [st.key, st.stockState, st.count]),
+      [2],
+    );
+    body += '<h2>Assets</h2>' + printTable(
+      ['Asset', 'Category', 'Serial number', 'Assigned to', 'Status', 'Stock state'],
+      rows.map((r) => [r.name, r.category, r.serial, r.assignedTo, r.status, r.stockState]),
+    );
+    openPrintableReport('IT Asset Report', body);
+  };
+
+  const stockBadge = (state) => (
+    <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${state === 'In Stock' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>
+      {state}
+    </span>
+  );
+
+  const kpi = (label, value, hint) => (
+    <div className="bg-white border border-slate-200 rounded-md p-3.5 shadow-sm">
+      <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">{label}</div>
+      <div className="text-lg font-bold text-slate-900 mt-1">{value}</div>
+      {hint ? <div className="text-[10px] text-slate-400 mt-0.5">{hint}</div> : null}
+    </div>
+  );
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-xs text-slate-500 max-w-xl">
+          Inventory stock report — how much hardware is available in the store room versus
+          deployed, under repair or retired. "In stock" means status <span className="font-medium text-slate-700">In Stock</span>;
+          everything else counts as out of stock.
+        </p>
+        <div className="flex items-center gap-2">
+          {/* Report generation: CSV for spreadsheets, print for PDF archives. */}
+          <button
+            onClick={() => downloadCsv(token, `${API_URL}/api/reports/assets/export`, 'asset-report.csv')}
+            disabled={!report}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-md text-[11px] font-medium text-slate-600 hover:bg-slate-50 shadow-sm transition disabled:opacity-50"
+          >
+            <Download className="h-3.5 w-3.5" /> Export CSV
+          </button>
+          <button
+            onClick={handlePrint}
+            disabled={!report}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-200 rounded-md text-[11px] font-medium text-slate-600 hover:bg-slate-50 shadow-sm transition disabled:opacity-50"
+          >
+            <Printer className="h-3.5 w-3.5" /> Print
+          </button>
+        </div>
+      </div>
+
+      {loading && (
+        <div className="bg-white border border-slate-200 rounded-md p-10 text-center text-xs text-slate-400 shadow-sm">
+          Loading asset stock metrics…
+        </div>
+      )}
+      {!loading && error && (
+        <div className="bg-red-50 border border-red-200 rounded-md p-4 text-xs text-red-700">
+          {error}
+        </div>
+      )}
+
+      {!loading && !error && report && (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            {kpi('Total assets', String(summary.total), 'tracked in the inventory')}
+            {kpi('In stock', String(summary.inStock), 'available in the store room')}
+            {kpi('Out of stock', String(summary.outOfStock), 'deployed, in repair or retired')}
+            {kpi('Availability', summary.total ? `${Math.round((summary.inStock / summary.total) * 100)}%` : '—', 'share of stock on hand')}
+          </div>
+
+          <div className="grid md:grid-cols-2 gap-4">
+            <div className="bg-white border border-slate-200 rounded-md p-4 shadow-sm">
+              <h3 className="text-sm font-bold text-slate-800 mb-3">In stock vs out of stock, by category</h3>
+              <table className="w-full text-left text-xs">
+                <thead className="text-slate-400 font-semibold uppercase text-[10px] border-b border-slate-100">
+                  <tr>
+                    <th className="py-2 pr-2">Category</th>
+                    <th className="py-2 pr-2">Total</th>
+                    <th className="py-2 pr-2">In stock</th>
+                    <th className="py-2">Out of stock</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-50">
+                  {report.byCategory.length === 0 ? (
+                    <tr><td colSpan="4" className="py-4 text-center text-slate-400">No assets in the inventory.</td></tr>
+                  ) : report.byCategory.map((c) => (
+                    <tr key={c.key}>
+                      <td className="py-2 pr-2 font-medium text-slate-700">{c.key}</td>
+                      <td className="py-2 pr-2 text-slate-600">{c.total}</td>
+                      <td className="py-2 pr-2 text-emerald-700 font-semibold">{c.inStock}</td>
+                      <td className="py-2 text-amber-700 font-semibold">{c.outOfStock}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="bg-white border border-slate-200 rounded-md p-4 shadow-sm">
+              <h3 className="text-sm font-bold text-slate-800 mb-3">By status</h3>
+              <table className="w-full text-left text-xs">
+                <thead className="text-slate-400 font-semibold uppercase text-[10px] border-b border-slate-100">
+                  <tr>
+                    <th className="py-2 pr-2">Status</th>
+                    <th className="py-2 pr-2">Stock state</th>
+                    <th className="py-2">Count</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-50">
+                  {report.byStatus.length === 0 ? (
+                    <tr><td colSpan="3" className="py-4 text-center text-slate-400">No assets in the inventory.</td></tr>
+                  ) : report.byStatus.map((st) => (
+                    <tr key={st.key}>
+                      <td className="py-2 pr-2 font-medium text-slate-700">{statusLabel(st.key)}</td>
+                      <td className="py-2 pr-2">{stockBadge(st.stockState)}</td>
+                      <td className="py-2 text-slate-600">{st.count}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="bg-white border border-slate-200 rounded-md shadow-sm">
+            <div className="flex items-center justify-between px-4 pt-4 pb-2">
+              <h3 className="text-sm font-bold text-slate-800">Assets</h3>
+              <div className="flex items-center gap-1 bg-slate-50 border border-slate-200 rounded-md p-1">
+                {STOCK_FILTERS.map((f) => {
+                  const n = f.value === 'all' ? rows.length : rows.filter((r) => r.stockState === f.value).length;
+                  return (
+                    <button
+                      key={f.value}
+                      onClick={() => setStockFilter(f.value)}
+                      className={`px-2.5 py-1 rounded text-[11px] font-medium transition ${stockFilter === f.value ? 'bg-[#0052CC] text-white' : 'text-slate-600 hover:bg-slate-100'}`}
+                    >
+                      {f.label} ({n})
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold uppercase">
+                  <tr>
+                    <th className="py-3 px-4">Asset</th>
+                    <th className="py-3 px-4">Category</th>
+                    <th className="py-3 px-4">Serial Number</th>
+                    <th className="py-3 px-4">Assigned To</th>
+                    <th className="py-3 px-4">Status</th>
+                    <th className="py-3 px-4">Stock State</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {visibleRows.length === 0 ? (
+                    <tr>
+                      <td colSpan="6" className="py-8 text-center text-slate-400">No assets match this filter.</td>
+                    </tr>
+                  ) : visibleRows.map((r) => (
+                    <tr key={r.id} className="hover:bg-slate-50 transition">
+                      <td className="py-3.5 px-4 font-semibold text-slate-800">{r.name}</td>
+                      <td className="py-3.5 px-4 text-slate-600">{r.category}</td>
+                      <td className="py-3.5 px-4 font-mono text-[#0052CC]">{r.serial}</td>
+                      <td className="py-3.5 px-4 text-slate-600">{r.assignedTo}</td>
+                      <td className="py-3.5 px-4 text-slate-600">{statusLabel(r.status)}</td>
+                      <td className="py-3.5 px-4">{stockBadge(r.stockState)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBACK_ENUMS, peopleList = [], fetchTickets, fetchUsers, fetchInventory, handleLogout, token, onChatTicketChange }) {
   const superAdmin = isSuperAdmin(user);
   // Who can be picked in the asset-assignment dropdowns: super admins have the
@@ -1289,7 +1991,12 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
   });
 
   const location = useLocation();
-  const currentTab = location.pathname.includes('inventory') ? 'inventory' : location.pathname.includes('users') ? 'users' : 'tickets';
+  // Order matters: /agent/asset-reports also contains "reports".
+  const currentTab = location.pathname.includes('asset-reports') ? 'asset-reports'
+    : location.pathname.includes('reports') ? 'reports'
+    : location.pathname.includes('inventory') ? 'inventory'
+    : location.pathname.includes('users') ? 'users'
+    : 'tickets';
 
   useEffect(() => {
     // Named handler so cleanup detaches only THIS listener (#22) — the socket
@@ -1495,8 +2202,14 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
               <Link to="/agent/tickets" className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition ${currentTab === 'tickets' ? 'bg-blue-50 text-[#0052CC] font-semibold border-l-2 border-[#0052CC]' : 'text-slate-600 hover:bg-slate-100'}`}>
                 <Ticket className="h-4 w-4" /> Queues & Tickets
               </Link>
+              <Link to="/agent/reports" className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition ${currentTab === 'reports' ? 'bg-blue-50 text-[#0052CC] font-semibold border-l-2 border-[#0052CC]' : 'text-slate-600 hover:bg-slate-100'}`} title="Mean time to resolution and first-reply metrics">
+                <Timer className="h-4 w-4" /> MTTR Reports
+              </Link>
               <Link to="/agent/inventory" className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition ${currentTab === 'inventory' ? 'bg-blue-50 text-[#0052CC] font-semibold border-l-2 border-[#0052CC]' : 'text-slate-600 hover:bg-slate-100'}`}>
                 <Box className="h-4 w-4" /> IT Assets
+              </Link>
+              <Link to="/agent/asset-reports" className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition ${currentTab === 'asset-reports' ? 'bg-blue-50 text-[#0052CC] font-semibold border-l-2 border-[#0052CC]' : 'text-slate-600 hover:bg-slate-100'}`} title="In stock vs out of stock, per category and status">
+                <FileText className="h-4 w-4" /> Asset Reports
               </Link>
               {/* #36: only a super admin manages accounts. */}
               {superAdmin && (
@@ -1516,14 +2229,23 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
           <header className="flex justify-between items-center mb-6 pb-4 border-b border-slate-200">
             <div>
               <h1 className="text-xl font-bold text-slate-900">
-                {currentTab === 'tickets' ? (superAdmin ? 'Service Desk Queues' : 'My Assigned Tickets') : currentTab === 'inventory' ? 'Asset Inventory' : 'User Directory'}
+                {currentTab === 'tickets' ? (superAdmin ? 'Service Desk Queues' : 'My Assigned Tickets')
+                  : currentTab === 'reports' ? 'Resolution Time (MTTR)'
+                  : currentTab === 'asset-reports' ? 'Asset Stock Report'
+                  : currentTab === 'inventory' ? 'Asset Inventory' : 'User Directory'}
               </h1>
               <p className="text-slate-500 text-xs mt-0.5">
                 {currentTab === 'tickets'
                   ? (superAdmin
                     ? 'Every request across the helpdesk — dispatch, reassign, and resolve.'
                     : 'The requests assigned to you. A super admin dispatches work to this queue.')
-                  : currentTab === 'inventory' ? 'Track hardware assignments, serials, and equipment status.' : 'View registered users and invite agents or team members.'}
+                  : currentTab === 'reports'
+                    ? (superAdmin
+                      ? 'How quickly requests are resolved across the helpdesk — mean, median, and trends.'
+                      : 'How quickly your assigned requests are resolved — mean, median, and trends.')
+                    : currentTab === 'asset-reports'
+                      ? 'What is in stock, what is out of stock — per category and status. Export or print the report.'
+                      : currentTab === 'inventory' ? 'Track hardware assignments, serials, and equipment status.' : 'View registered users and invite agents or team members.'}
               </p>
             </div>
             {currentTab === 'users' && (
@@ -1537,6 +2259,14 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
               </button>
             )}
           </header>
+
+          {currentTab === 'reports' && (
+            <MttrReports token={token} />
+          )}
+
+          {currentTab === 'asset-reports' && (
+            <AssetReports token={token} />
+          )}
 
           {currentTab === 'tickets' && (
             <div className="bg-white border border-slate-200 rounded-md shadow-sm">
@@ -1565,6 +2295,15 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
                             <div className="font-semibold text-blue-600 hover:underline cursor-pointer">{t.title}</div>
                             <div className="text-slate-500 text-[11px] line-clamp-1">{t.description}</div>
                             <div className="text-slate-400 text-[10px] mt-0.5">Reporter: <span className="font-medium text-slate-600">{t.created_by_name}</span></div>
+                            {/* MTTR: resolved-in time once done, running age while active,
+                                and a marker when work resumed after a resolution. */}
+                            {(ticketElapsed(t) || t.reopened_count > 0) && (
+                              <div className="text-slate-400 text-[10px] mt-0.5">
+                                {ticketElapsed(t)}
+                                {ticketElapsed(t) && t.reopened_count > 0 ? ' · ' : ''}
+                                {t.reopened_count > 0 ? `Reopened ×${t.reopened_count}` : ''}
+                              </div>
+                            )}
                           </td>
                           <td className="py-3.5 px-4">
                             {t.image ? (
@@ -1649,7 +2388,15 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
                     {inventoryList.map((item) => (
                       <tr key={item.id} className="hover:bg-slate-50 transition">
                         <td className="py-3.5 px-4 font-semibold text-slate-800">{item.name}</td>
-                        <td className="py-3.5 px-4 text-slate-600">{item.category}</td>
+                        <td className="py-3.5 px-4">
+                          {/* Recategorise in place (#asset-categories) — the
+                              server validates against its published list. */}
+                          <select value={item.category} onChange={(e) => handleUpdateAsset(item.id, { category: e.target.value })} title="Change asset category" className="bg-white border border-slate-300 text-slate-700 rounded text-xs p-1 focus:outline-none focus:border-[#0052CC]">
+                            {categoryOptions(enums.inventoryCategory, item.category).map((c) => (
+                              <option key={c} value={c}>{c}</option>
+                            ))}
+                          </select>
+                        </td>
                         <td className="py-3.5 px-4 font-mono text-[#0052CC]">{item.serial_number}</td>
                         <td className="py-3.5 px-4">
                           <select value={item.assigned_to_id || (item.assigned_to && item.assigned_to !== UNASSIGNED ? LEGACY_ASSIGNEE : UNASSIGNED)} onChange={(e) => handleUpdateAsset(item.id, { ...assigneePayload(e.target.value), status: e.target.value === UNASSIGNED ? 'In Stock' : 'Assigned' })} className="bg-white border border-slate-300 text-slate-700 rounded text-xs p-1 focus:outline-none focus:border-[#0052CC]">
@@ -1759,11 +2506,12 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
                     <div>
                       <label className="block text-xs font-semibold text-slate-700 mb-1">Category</label>
                       <select value={newAsset.category} onChange={(e) => setNewAsset({ ...newAsset, category: e.target.value })} className="w-full border border-slate-300 rounded p-2 text-xs focus:border-[#0052CC] focus:outline-none">
-                        <option>Laptop</option>
-                        <option>Desktop</option>
-                        <option>Monitor</option>
-                        <option>Peripherals</option>
-                        <option>Network Equipment</option>
+                        {/* Server-owned pick list (#asset-categories): laptops,
+                            desktops, printers & consumables, IP / solar PTZ
+                            cameras, NVRs, storage, and so on. */}
+                        {categoryOptions(enums.inventoryCategory, newAsset.category).map((c) => (
+                          <option key={c} value={c}>{c}</option>
+                        ))}
                       </select>
                     </div>
                     <div>

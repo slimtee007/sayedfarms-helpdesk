@@ -71,6 +71,55 @@ Default admin sign-in (development only — override via `ADMIN_EMAIL` /
   emits from unauthenticated sockets and ticket-room joins for tickets you
   don't own are ignored.
 
+## MTTR — mean time to resolution
+
+Tickets carry the stamps the reports aggregate (all set by the server, never
+by a client):
+
+| Field | Meaning |
+|---|---|
+| `created_at` | when the request was raised (start of the clock) |
+| `first_response_at` | the first reply posted by an IT agent (stamped once) |
+| `resolved_at` | when the ticket reached **Resolved** (or **Closed** directly); re-stamped when a reopened ticket is resolved again |
+| `closed_at` | when the ticket reached **Closed** |
+| `resolution_minutes` | `resolved_at − created_at` in minutes — total elapsed time to resolution, reopens included |
+| `reopened_count` | how many times work resumed after a resolution |
+
+Status transitions keep the stamps honest: **Resolved ↔ Closed** keeps the
+original resolve time; leaving a resolution state for active work counts a
+**reopen** and the next cycle is measured fresh; **Cancelled** abandons the
+resolution (stamps cleared, not counted as a reopen). Tickets that were
+already resolved before these stamps existed keep `null` timestamps and are
+excluded from the report rather than estimated.
+
+`GET /api/reports/mttr?days=7|30|90|365|all` (IT agents only; default 30)
+returns the dashboard feed: summary (mean / median / fastest / slowest,
+first-reply average, reopen count), a trend of mean-resolution time per day /
+week / month, breakdowns by category, priority and agent, and the slowest
+resolved tickets. Scoping follows the queue rules exactly — a super admin's
+report covers every ticket, a regular agent's only the tickets assigned to
+them (`scope: "all" | "own"`). The Agent Console shows it under **MTTR
+Reports**, and ticket tables display "Resolved in …" / "Reopened ×n" per row.
+
+### Report generation
+
+Every report screen has **Export CSV** and **Print** (browser print → save as
+PDF); the exports are also plain authenticated API endpoints:
+
+| Endpoint | Output |
+|---|---|
+| `GET /api/reports/mttr/export?days=…` | MTTR report CSV — summary block, then one row per resolved ticket behind the numbers (created / first response / resolved / closed stamps, resolution minutes, reopens). Same scoping as the JSON feed. |
+| `GET /api/reports/assets` | IT asset stock report — totals, **in stock vs out of stock**, per-category split, per-status counts, and the asset rows. |
+| `GET /api/reports/assets/export` | The asset report as CSV — summary block, category and status splits, then one row per asset with its stock state. |
+
+Assets count as **in stock** when their status is `In Stock` (available in the
+store room); every other status (Assigned, In Repair, Under Maintenance,
+Retired, Decommissioned) is **out of stock** — not available to hand out. The
+exact status is always carried alongside the binary split so retired gear is
+never confused with deployed gear. **Asset Reports** in the Agent Console
+shows the split with an All / In stock / Out of stock filter; CSVs are
+RFC-4180 quoted (Excel-friendly, with a UTF-8 BOM).
+
 ## Locked out of the super admin account?
 
 Passwords are stored as bcrypt hashes, so **nobody can read a password back out
@@ -129,8 +178,14 @@ tests, or behind a reverse proxy that already limits traffic.
   validated server-side. An unknown value is rejected with `400` — it is never
   silently replaced by a default.
 - **One source of truth for dropdown values:** the frontend renders its status
-  dropdowns from `GET /api/meta/enums`, so the UI can't offer a value the API
-  rejects (or one it quietly rewrites).
+  and category dropdowns from `GET /api/meta/enums`, so the UI can't offer a
+  value the API rejects (or one it quietly rewrites). Asset categories are
+  server-owned (`inventoryCategory`): Laptop, Desktop Computer, Monitor,
+  Printer, Cartridge, Toner, IP Camera, Solar PTZ Camera, NVR, SSD/HDD,
+  Network Equipment, Peripherals, Server, UPS, Other — the Add Asset form and
+  the inventory table both pick from this list, and an unknown value is
+  rejected with `400` (never silently stored). Legacy rows marked `Desktop`
+  are migrated to `Desktop Computer` on boot.
 - **Password-reset codes** are persisted in `db.json` as SHA-256 digests
   (never plaintext), expire after 10 minutes, and are burned after 5 wrong
   attempts. They survive server restarts.

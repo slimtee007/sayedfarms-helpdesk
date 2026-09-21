@@ -976,3 +976,393 @@ test('#36: --demote enforces a single dispatcher, and refuses to leave none', as
 
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// MTTR — resolution-time tracking and reporting.
+// ---------------------------------------------------------------------------
+test('MTTR: resolving stamps resolved_at/resolution_minutes; close, un-close and reopen keep the lifecycle honest', async () => {
+  const created = await newTicket({ title: 'MTTR lifecycle' });
+  assert.equal(created.status, 200);
+  const id = created.body.id;
+  assert.equal(created.body.resolved_at, null, 'a fresh ticket has no resolution stamp');
+  assert.equal(created.body.reopened_count, 0);
+
+  // Resolve: the resolve time is stamped and measured against created_at.
+  const resolved = await client.patch(`/api/tickets/${id}`, { token: admin.token, body: { status: 'Resolved' } });
+  assert.equal(resolved.status, 200);
+  assert.ok(resolved.body.resolved_at, 'Resolved must stamp resolved_at');
+  assert.equal(typeof resolved.body.resolution_minutes, 'number', 'Resolved must snapshot resolution_minutes');
+  assert.ok(resolved.body.resolution_minutes >= 0);
+  assert.equal(resolved.body.closed_at, null);
+
+  const resolvedAt1 = resolved.body.resolved_at;
+
+  // Close: closed_at is stamped, the resolve time is kept.
+  const closed = await client.patch(`/api/tickets/${id}`, { token: admin.token, body: { status: 'Closed' } });
+  assert.equal(closed.status, 200);
+  assert.ok(closed.body.closed_at, 'Closed must stamp closed_at');
+  assert.equal(closed.body.resolved_at, resolvedAt1, 'closing must not move the resolve time');
+
+  // Un-close back to Resolved: still one resolution cycle, no reopen counted.
+  const unClosed = await client.patch(`/api/tickets/${id}`, { token: admin.token, body: { status: 'Resolved' } });
+  assert.equal(unClosed.body.closed_at, null, 'un-closing clears closed_at');
+  assert.equal(unClosed.body.resolved_at, resolvedAt1);
+  assert.equal(unClosed.body.reopened_count, 0, 'Resolved <-> Closed is not a reopen');
+
+  // Reopen to active work: counted, and the next cycle is measured fresh.
+  const reopened = await client.patch(`/api/tickets/${id}`, { token: admin.token, body: { status: 'In Progress' } });
+  assert.equal(reopened.body.reopened_count, 1, 'resuming work after a resolution is a reopen');
+  assert.equal(reopened.body.resolved_at, null);
+  assert.equal(reopened.body.closed_at, null);
+  assert.equal(reopened.body.resolution_minutes, null);
+
+  // Re-resolve: a fresh resolve stamp for the new cycle.
+  const reresolved = await client.patch(`/api/tickets/${id}`, { token: admin.token, body: { status: 'Resolved' } });
+  assert.ok(reresolved.body.resolved_at, 're-resolving re-stamps resolved_at');
+  assert.notEqual(reresolved.body.resolved_at, resolvedAt1);
+  assert.equal(typeof reresolved.body.resolution_minutes, 'number');
+  assert.equal(reresolved.body.reopened_count, 1, 're-resolving does not add a reopen');
+
+  // Cancelling after a resolution abandons it — cleared, but not a reopen.
+  const cancelled = await client.patch(`/api/tickets/${id}`, { token: admin.token, body: { status: 'Cancelled' } });
+  assert.equal(cancelled.body.resolved_at, null);
+  assert.equal(cancelled.body.resolution_minutes, null);
+  assert.equal(cancelled.body.reopened_count, 1, 'cancelling is not resuming work');
+});
+
+test('MTTR: closing straight from an active status counts as resolved at close time', async () => {
+  const created = await newTicket({ title: 'MTTR direct close' });
+  const id = created.body.id;
+  const closed = await client.patch(`/api/tickets/${id}`, { token: admin.token, body: { status: 'Closed' } });
+  assert.equal(closed.status, 200);
+  assert.ok(closed.body.resolved_at, 'a direct close counts as resolved at close time');
+  assert.equal(closed.body.resolved_at, closed.body.closed_at);
+  assert.equal(typeof closed.body.resolution_minutes, 'number');
+});
+
+test('MTTR: the first agent reply stamps first_response_at exactly once', async () => {
+  const email = `mttr-emp-${Date.now()}@example.com`;
+  const emp = (
+    await client.post('/api/auth/signup', {
+      body: { name: 'MTTR Employee', email, password: 'EmployeePass!23' },
+    })
+  ).body;
+  const created = await client.post('/api/tickets', {
+    token: emp.token,
+    body: { title: 'MTTR first response', description: 'please help' },
+  });
+  const id = created.body.id;
+
+  // A reply from the reporter is not a response from IT.
+  await client.post(`/api/tickets/${id}/messages`, { token: emp.token, body: { text: 'anyone there?' } });
+  let ticket = (await client.get('/api/tickets', { token: emp.token })).body.find((t) => t.id === id);
+  assert.equal(ticket.first_response_at, null, 'an employee message is not a first response');
+
+  await client.post(`/api/tickets/${id}/messages`, { token: admin.token, body: { text: 'on it now' } });
+  ticket = (await client.get('/api/tickets', { token: emp.token })).body.find((t) => t.id === id);
+  assert.ok(ticket.first_response_at, 'the first agent reply stamps first_response_at');
+
+  const first = ticket.first_response_at;
+  await client.post(`/api/tickets/${id}/messages`, { token: admin.token, body: { text: 'still on it' } });
+  ticket = (await client.get('/api/tickets', { token: emp.token })).body.find((t) => t.id === id);
+  assert.equal(ticket.first_response_at, first, 'later replies must not move the first response');
+});
+
+test('MTTR report aggregates resolution times, and scopes the report to the caller', async () => {
+  const bcrypt = require('bcryptjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sayedfarms-mttr-'));
+  const file = path.join(dir, 'db.json');
+  const now = Date.now();
+  const ago = (ms) => new Date(now - ms).toISOString();
+  const MIN = 60 * 1000;
+  const DAY = 24 * 60 * MIN;
+
+  // Deterministic history: two agents, an employee, and resolved tickets with
+  // known created/resolved deltas. `resolution_minutes` is left unset so the
+  // boot migration computes it from the timestamps.
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      users: [
+        { id: 'mttr-agent', name: 'MTTR Agent', email: 'mttr-agent@sayedfarms.test', role: 'agent', super_admin: false, password: bcrypt.hashSync('AgentPass!2345', 10) },
+        { id: 'mttr-boss', name: 'MTTR Boss', email: 'mttr-boss@sayedfarms.test', role: 'agent', super_admin: true, password: bcrypt.hashSync('BossPass!2345', 10) },
+        { id: 'mttr-emp', name: 'MTTR Employee', email: 'mttr-emp@sayedfarms.test', role: 'user', password: bcrypt.hashSync('EmployeePass!23', 10) },
+      ],
+      tickets: [
+        {
+          id: 'mttr-t1', title: 'Printer fire', description: 'd', category: 'Hardware', priority: 'High',
+          status: 'Resolved', assigned_to: 'MTTR Agent', assigned_to_id: 'mttr-agent',
+          created_by: 'mttr-emp', created_by_name: 'MTTR Employee', messages: [], image: '',
+          created_at: ago(2 * DAY + 240 * MIN), resolved_at: ago(2 * DAY), closed_at: null,
+          first_response_at: ago(2 * DAY + 230 * MIN), reopened_count: 0,
+        },
+        {
+          id: 'mttr-t2', title: 'Old laptop swap', description: 'd', category: 'Hardware', priority: 'Low',
+          status: 'Resolved', assigned_to: 'MTTR Agent', assigned_to_id: 'mttr-agent',
+          created_by: 'mttr-emp', created_by_name: 'MTTR Employee', messages: [], image: '',
+          created_at: ago(40 * DAY + 60 * MIN), resolved_at: ago(40 * DAY), closed_at: null,
+          first_response_at: ago(40 * DAY + 50 * MIN), reopened_count: 1,
+        },
+        {
+          id: 'mttr-t3', title: 'VPN outage', description: 'd', category: 'Network', priority: 'Urgent',
+          status: 'Closed', assigned_to: 'MTTR Boss', assigned_to_id: 'mttr-boss',
+          created_by: 'mttr-emp', created_by_name: 'MTTR Employee', messages: [], image: '',
+          // 120 minutes to resolution (created 125m+1d ago, resolved 5m+1d ago),
+          // first agent reply 30 minutes after creation.
+          created_at: ago(1 * DAY + 125 * MIN), resolved_at: ago(1 * DAY + 5 * MIN), closed_at: ago(1 * DAY),
+          first_response_at: ago(1 * DAY + 95 * MIN), reopened_count: 0,
+        },
+        {
+          // Resolved before MTTR stamps existed: excluded, never estimated.
+          id: 'mttr-t4', title: 'Legacy resolved', description: 'd', category: 'Software', priority: 'Medium',
+          status: 'Resolved', assigned_to: 'MTTR Agent', assigned_to_id: 'mttr-agent',
+          created_by: 'mttr-emp', created_by_name: 'MTTR Employee', messages: [], image: '',
+          created_at: ago(10 * DAY), reopened_count: 0,
+        },
+      ],
+      inventory: [],
+      resetCodes: {},
+    })
+  );
+
+  const s = await startServer(file, await freePort(), { ADMIN_EMAIL: 'nobody@sayedfarms.test' });
+  try {
+    const c = api(s.base);
+    const boss = await login(c, 'mttr-boss@sayedfarms.test', 'BossPass!2345');
+    const agent = await login(c, 'mttr-agent@sayedfarms.test', 'AgentPass!2345');
+    const emp = await login(c, 'mttr-emp@sayedfarms.test', 'EmployeePass!23');
+
+    // Boot migration computed the minutes from the timestamps.
+    const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(onDisk.tickets.find((t) => t.id === 'mttr-t1').resolution_minutes, 240);
+    assert.equal(onDisk.tickets.find((t) => t.id === 'mttr-t3').resolution_minutes, 120);
+
+    // Employees are not ops-reporting users.
+    assert.equal((await c.get('/api/reports/mttr', { token: emp.token })).status, 403);
+    assert.equal((await c.get('/api/reports/mttr')).status, 401);
+    assert.equal((await c.get('/api/reports/mttr?days=0', { token: boss.token })).status, 400);
+    assert.equal((await c.get('/api/reports/mttr?days=soon', { token: boss.token })).status, 400);
+
+    // Super admin, last 7 days: t1 (240m) + t3 (120m). t2 is out of range,
+    // t4 has no honest timestamp and is excluded everywhere.
+    const week = (await c.get('/api/reports/mttr?days=7', { token: boss.token })).body;
+    assert.equal(week.scope, 'all');
+    assert.equal(week.summary.count, 2);
+    assert.equal(week.summary.meanMinutes, 180);
+    assert.equal(week.summary.medianMinutes, 180);
+    assert.equal(week.summary.minMinutes, 120);
+    assert.equal(week.summary.maxMinutes, 240);
+    assert.equal(week.summary.reopenedCount, 0);
+    assert.equal(week.summary.meanFirstResponseMinutes, 20, '(10m + 30m) / 2');
+    assert.equal(week.slowest[0].id, 'mttr-t1');
+    assert.equal(week.slowest[0].minutes, 240);
+    const byAgent = Object.fromEntries(week.byAgent.map((a) => [a.id, a]));
+    assert.equal(byAgent['mttr-agent'].count, 1);
+    assert.equal(byAgent['mttr-agent'].meanMinutes, 240);
+    assert.equal(byAgent['mttr-boss'].meanMinutes, 120);
+    const byCategory = Object.fromEntries(week.byCategory.map((g) => [g.key, g]));
+    assert.equal(byCategory.Hardware.count, 1);
+    assert.equal(byCategory.Network.count, 1);
+    assert.ok(!byCategory.Software, 'the unmeasurable legacy ticket must be excluded');
+    assert.ok(week.trend.every((b) => typeof b.bucket === 'string' && b.count >= 1));
+
+    // All time: t2 (60m) joins in — mean (240+60+120)/3 = 140, and its
+    // reopen is counted.
+    const all = (await c.get('/api/reports/mttr?days=all', { token: boss.token })).body;
+    assert.equal(all.summary.count, 3);
+    assert.equal(all.summary.meanMinutes, 140);
+    assert.equal(all.summary.reopenedCount, 1);
+
+    // A regular agent sees only their own queue's numbers (#36).
+    const own = (await c.get('/api/reports/mttr?days=all', { token: agent.token })).body;
+    assert.equal(own.scope, 'own');
+    assert.equal(own.summary.count, 2, 'only the two tickets assigned to this agent');
+    assert.equal(own.summary.meanMinutes, 150, '(240 + 60) / 2');
+    assert.deepEqual(own.byAgent.map((a) => a.id), ['mttr-agent']);
+    assert.equal(own.slowest.length, 2);
+  } finally {
+    await s.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #asset-categories — the asset-category pick list is server-owned.
+// ---------------------------------------------------------------------------
+test('#asset-categories: every published category is accepted, unknown values are rejected', async () => {
+  const enums = (await client.get('/api/meta/enums', { token: admin.token })).body;
+  assert.ok(Array.isArray(enums.inventoryCategory), 'inventoryCategory must be published through /api/meta/enums');
+  // The categories the farms asked for specifically, plus the originals.
+  for (const wanted of ['Printer', 'Cartridge', 'Toner', 'IP Camera', 'Solar PTZ Camera', 'NVR', 'SSD/HDD', 'Desktop Computer', 'Laptop', 'Monitor']) {
+    assert.ok(enums.inventoryCategory.includes(wanted), `"${wanted}" must be pickable`);
+  }
+
+  for (const category of enums.inventoryCategory) {
+    const serial = `SN-CAT-${category.replace(/\W+/g, '-').toUpperCase()}-${Math.random().toString(36).slice(2, 8)}`;
+    const created = await client.post('/api/inventory', {
+      token: admin.token,
+      body: { name: 'Category Asset', category, serial_number: serial },
+    });
+    assert.equal(created.status, 200, `POST category="${category}" failed: ${JSON.stringify(created.body)}`);
+    assert.equal(created.body.category, category, `category "${category}" must be stored verbatim`);
+
+    const patched = await client.patch(`/api/inventory/${created.body.id}`, { token: admin.token, body: { category } });
+    assert.equal(patched.status, 200, `PATCH category="${category}" was rejected: ${JSON.stringify(patched.body)}`);
+    assert.equal(patched.body.category, category, `category "${category}" must not be rewritten on PATCH`);
+  }
+
+  // Unknown values: an explicit 400, never silently stored or defaulted (#33).
+  const bad = await client.post('/api/inventory', {
+    token: admin.token,
+    body: { name: 'Bad Category', category: 'Toaster', serial_number: `SN-BAD-CAT-${Date.now()}` },
+  });
+  assert.equal(bad.status, 400, 'an unknown category must be rejected on create');
+  assert.match(bad.body.error, /Category must be one of/);
+
+  const created = await client.post('/api/inventory', {
+    token: admin.token,
+    body: { name: 'Recat Asset', category: 'Printer', serial_number: `SN-RECAT-${Date.now()}` },
+  });
+  assert.equal(created.status, 200);
+  const badPatch = await client.patch(`/api/inventory/${created.body.id}`, { token: admin.token, body: { category: 'Toaster' } });
+  assert.equal(badPatch.status, 400, 'an unknown category must be rejected on edit too');
+  const unchanged = (await client.get('/api/inventory', { token: admin.token })).body.find((i) => i.id === created.body.id);
+  assert.equal(unchanged.category, 'Printer', 'a rejected PATCH must leave the row untouched');
+});
+
+test('#asset-categories: legacy "Desktop" assets migrate to "Desktop Computer" on boot', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sayedfarms-assetcat-'));
+  const file = path.join(dir, 'db.json');
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      users: [],
+      tickets: [],
+      // Pre-#asset-categories data: the old form offered "Desktop".
+      inventory: [
+        { id: 'cat-legacy', name: 'Old Desktop', category: 'Desktop', serial_number: 'SN-DESKTOP-OLD', assigned_to: 'Unassigned', assigned_to_id: null, status: 'In Stock' },
+        { id: 'cat-ok', name: 'Fine Laptop', category: 'Laptop', serial_number: 'SN-LAPTOP-OK', assigned_to: 'Unassigned', assigned_to_id: null, status: 'In Stock' },
+      ],
+      resetCodes: {},
+    })
+  );
+
+  const s = await startServer(file, await freePort());
+  try {
+    const c = api(s.base);
+    const token = (await login(c, ADMIN_EMAIL, ADMIN_PASSWORD)).token;
+    const assets = (await c.get('/api/inventory', { token })).body;
+    assert.equal(assets.find((a) => a.id === 'cat-legacy').category, 'Desktop Computer', 'legacy "Desktop" must be renamed into the pick list');
+    assert.equal(assets.find((a) => a.id === 'cat-ok').category, 'Laptop', 'other categories must not be touched');
+
+    const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(onDisk.inventory.find((a) => a.id === 'cat-legacy').category, 'Desktop Computer', 'the migration must be persisted');
+  } finally {
+    await s.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Report generation — MTTR + IT asset reports, CSV exports, stock split.
+// ---------------------------------------------------------------------------
+test('report generation: the asset report splits in stock vs out of stock and exports CSV', async () => {
+  // Employees are not ops-reporting users; bad auth stays 401.
+  const email = `rep-emp-${Date.now()}@example.com`;
+  const emp = (
+    await client.post('/api/auth/signup', {
+      body: { name: 'Report Employee', email, password: 'EmployeePass!23' },
+    })
+  ).body;
+  assert.equal((await client.get('/api/reports/assets', { token: emp.token })).status, 403);
+  assert.equal((await client.get('/api/reports/assets')).status, 401);
+
+  const before = (await client.get('/api/reports/assets', { token: admin.token })).body;
+  const mkAsset = (name, status) =>
+    client.post('/api/inventory', {
+      token: admin.token,
+      body: { name, category: 'Printer', serial_number: `SN-REP-${name.replace(/\W+/g, '-').toUpperCase()}-${Date.now()}`, status },
+    });
+  const inStockRes = await mkAsset('Report Stock Printer', 'In Stock');
+  assert.equal(inStockRes.status, 200, `create failed: ${JSON.stringify(inStockRes.body)}`);
+  const inStockAsset = inStockRes.body;
+  const assignedAsset = (await mkAsset('Report Deployed NVR', 'Assigned')).body;
+  const retiredAsset = (await mkAsset('Report Retired Camera', 'Retired')).body;
+
+  const after = (await client.get('/api/reports/assets', { token: admin.token })).body;
+  // One new 'In Stock', two new out-of-stock (Assigned + Retired).
+  assert.equal(after.summary.inStock, before.summary.inStock + 1);
+  assert.equal(after.summary.outOfStock, before.summary.outOfStock + 2);
+  assert.equal(after.summary.total, before.summary.total + 3);
+
+  const bySerial = (id) => after.rows.find((r) => r.id === id);
+  assert.equal(bySerial(inStockAsset.id).stockState, 'In Stock');
+  assert.equal(bySerial(assignedAsset.id).stockState, 'Out of Stock');
+  assert.equal(bySerial(retiredAsset.id).stockState, 'Out of Stock');
+  const printerCat = after.byCategory.find((c) => c.key === 'Printer');
+  assert.ok(printerCat.inStock >= 1 && printerCat.outOfStock >= 2, 'the category row must carry the split');
+  const retiredStatus = after.byStatus.find((st) => st.key === 'Retired');
+  assert.equal(retiredStatus.stockState, 'Out of Stock', 'retired gear is never "in stock"');
+
+  // CSV export: summary block, per-category split, and one row per asset.
+  const res = await fetch(`${server.base}/api/reports/assets/export`, {
+    headers: { Authorization: `Bearer ${admin.token}` },
+  });
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type') || '', /text\/csv/);
+  assert.match(res.headers.get('content-disposition') || '', /attachment; filename="asset-report-\d{4}-\d{2}-\d{2}\.csv"/);
+  const text = await res.text();
+  for (const wanted of ['In stock', 'Out of stock', 'Stock state', 'Category', 'Serial number', inStockAsset.serial_number, retiredAsset.serial_number]) {
+    assert.ok(text.includes(wanted), `the CSV must contain ${JSON.stringify(wanted)}`);
+  }
+  assert.equal((await fetch(`${server.base}/api/reports/assets/export`)).status, 401);
+});
+
+test('report generation: MTTR CSV export carries the summary and scoped ticket rows', async () => {
+  // Bad range and anonymous access are rejected the same way as the JSON feed.
+  const rawAnon = await fetch(`${server.base}/api/reports/mttr/export`);
+  assert.equal(rawAnon.status, 401);
+  const rawBad = await fetch(`${server.base}/api/reports/mttr/export?days=soon`, {
+    headers: { Authorization: `Bearer ${admin.token}` },
+  });
+  assert.equal(rawBad.status, 400);
+
+  // A ticket title with CSV-hostile characters must come back quoted (RFC 4180).
+  const created = await newTicket({ title: 'Printer, "main" office', description: 'csv escaping check' });
+  const id = created.body.id;
+  await client.patch(`/api/tickets/${id}`, { token: admin.token, body: { status: 'Resolved' } });
+
+  const res = await fetch(`${server.base}/api/reports/mttr/export?days=all`, {
+    headers: { Authorization: `Bearer ${admin.token}` },
+  });
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type') || '', /text\/csv/);
+  assert.match(res.headers.get('content-disposition') || '', /attachment; filename="mttr-report-all-\d{4}-\d{2}-\d{2}\.csv"/);
+  const text = await res.text();
+  assert.ok(text.includes('Mean time to resolve (minutes)'), 'the summary block must be present');
+  assert.ok(text.includes('Time to resolve (minutes)'), 'the per-ticket table must be present');
+  assert.ok(text.includes('"Printer, ""main"" office"'), 'quotes and commas must be RFC-4180 escaped');
+  assert.ok(text.includes(id));
+
+  // Scope (#36): a regular agent's export covers only their own resolved work.
+  const agentEmail = `rep-agent-${Date.now()}@example.com`;
+  const agentUser = (
+    await client.post('/api/auth/signup', {
+      body: { name: 'Report Agent', email: agentEmail, password: 'AgentPass!2345' },
+    })
+  ).body;
+  const promoted = await client.patch(`/api/users/${agentUser.user.id}`, { token: admin.token, body: { role: 'agent' } });
+  assert.equal(promoted.status, 200);
+  const theirs = await newTicket({ title: 'AGENT-OWNED resolved work', assigned_to_id: agentUser.user.id });
+  await client.patch(`/api/tickets/${theirs.body.id}`, { token: admin.token, body: { status: 'Resolved' } });
+
+  const agentSession = await login(client, agentEmail, 'AgentPass!2345');
+  const agentRes = await fetch(`${server.base}/api/reports/mttr/export?days=all`, {
+    headers: { Authorization: `Bearer ${agentSession.token}` },
+  });
+  assert.equal(agentRes.status, 200);
+  const agentCsv = await agentRes.text();
+  assert.ok(agentCsv.includes('AGENT-OWNED resolved work'), 'the agent must see their own resolved ticket');
+  assert.ok(agentCsv.includes('Tickets assigned to me'), 'the export header must state the scope');
+  assert.ok(!agentCsv.includes('Printer, ""main"" office'), "another queue's ticket must never leak into the export");
+});
