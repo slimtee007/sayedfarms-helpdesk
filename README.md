@@ -112,6 +112,8 @@ PDF); the exports are also plain authenticated API endpoints:
 | `GET /api/reports/assets` | IT asset stock report — totals, **in stock / low stock / out of stock**, the restock watchlist, per-category split, per-status counts, and the asset rows with quantities. |
 | `GET /api/reports/assets/export` | The asset report as CSV — summary block, restock watchlist, category and status splits, then one row per asset with quantity, reorder level and stock state. |
 | `GET /api/inventory/low-stock` | The restock watchlist as JSON — store-room lines running out (at/below their reorder level) or already empty, with `lowStock` / `outOfStock` counts. |
+| `GET /api/reports/calls?days=…` | The PBX call report JSON — summary (volumes, answered/missed, talk time, solve rate, mean minutes from call to fix), per-extension / per-hour / per-day splits, and one row per call. Same scoping as the call log. |
+| `GET /api/reports/calls/export?days=…` | The call report as CSV — summary block, splits, then one row per call with direction, duration, ring time, ticket and solved state. |
 
 ### Stock tracking & low-stock alerts
 
@@ -141,6 +143,90 @@ count badge and a restock banner, adjusts quantities in place (− / +) and lets
 you set the alert level per row; **Asset Reports** adds the low-stock KPI,
 watchlist and filter. Legacy rows migrate to `quantity: 1` / no alert level on
 boot, and the CSVs are RFC-4180 quoted (Excel-friendly, with a UTF-8 BOM).
+
+## IP-phone calls → tickets (Panasonic PBX / SMDR)
+
+When someone phones the IT office on the office IP-phone, the call is logged
+automatically and raises a ticket for the IT team. Every call record keeps the
+time the call came in, its direction (incoming / outgoing / internal), the
+extension, who rang, how long it rang, how long the call lasted, and whether
+the issue was solved.
+
+The PBX is a **Panasonic**, so the feed is its **SMDR** call log (KX-NS / NSX /
+TDA / TDE / TD families). Pick whichever wiring matches the site — or leave
+`PBX_TRANSPORT=auto` and let the configured addresses decide:
+
+| `PBX_TRANSPORT` | Use it when | How it works |
+|---|---|---|
+| `tcp-client` | the PBX prints SMDR over the LAN (KX-NS/NSX, port **2300**) | the helpdesk connects to `PBX_HOST:PBX_PORT`, logs in with `PBX_USERNAME` / `PBX_PASSWORD` (`SMDR` / `PCCSMDR` on a factory-fresh PBX) and reads the records |
+| `tcp-server` | a serial-to-IP gateway is wired to the PBX's RS-232C SMDR port, or the PBX pushes records | the helpdesk listens on `PBX_LISTEN_HOST:PBX_LISTEN_PORT` and frames whatever arrives as lines |
+| `webhook` | existing middleware already relays the SMDR text | anything that can POST text to `/api/pbx/calls` with the `X-PBX-Token` secret |
+
+Records can also be entered by hand (**Log a call**) or produced by the
+built-in **Simulate call** button — a development/demo aid that is on outside
+production and only with `PBX_ALLOW_SIMULATOR=true` in it. The simulator prints
+a real console-shaped record, so the wiring can be proven before the PBX is
+connected.
+
+**Which calls raise a ticket.** A call is "for IT" when one of the
+`PBX_IT_EXTENSIONS` is involved — either end of an internal call, or the
+extension that rang. `PBX_TICKET_POLICY` then decides:
+
+| Policy | Tickets raised for |
+|---|---|
+| `all` (default) | every IT call — answered, missed, internal or outgoing |
+| `answered` | only calls that were answered (talk time above `PBX_MIN_CALL_SECONDS`) |
+| `missed` | only calls nobody picked up (ring ≥ `PBX_MIN_RING_SECONDS`) — the "I couldn't reach IT" trail |
+| `off` | never; every call is still logged and an agent can raise a ticket by hand |
+
+A call that is too short to be a real report is logged without a ticket, and
+one click in the call log turns it into a ticket anyway.
+
+**Whose ticket is it?** The extension directory (**Agent Console → Call Log →
+Extension directory**) maps an extension to an employee account. When the
+caller's extension is mapped, the ticket is filed under that account
+(`created_by`), so it appears in that employee's own portal with the "Phone
+call" marker; unmapped extensions are shown by their raw number. Only a super
+admin can change the directory, and deleting an account leaves its extension
+unmapped rather than breaking the log.
+
+**Was it solved?** Two paths, both recorded:
+
+- the linked ticket reaching **Resolved/Closed** marks the call solved and
+  stores how long it took from the moment the call came in (phone-call-to-fix
+  minutes, alongside the ticket's own MTTR stamps). Reopening the ticket puts
+  the call back to **Pending**; cancelling it marks the call **Not solved**.
+- an agent can toggle **Solved / Not solved / Pending** on the call itself
+  (issues fixed over the phone, with or without a ticket) and leave a note.
+  Each call reports its `resolution_source` (`ticket` or `agent`).
+
+**Where to see it.** The Agent Console gains two workspaces:
+
+- **Call Log** — KPIs, filters (day range, direction, outcome, extension,
+  ticketed or not, free text), the manual-entry and simulate buttons, the
+  extension directory, and a live feed: new or updated calls arrive over the
+  socket (`pbx_call_changed`) without a refresh.
+- **Call Reports** — the call report with per-extension, per-hour and per-day
+  breakdowns plus **Export CSV**.
+
+Visibility follows the ticket rules exactly: a super admin sees every call, an
+agent sees their own calls plus the ones nobody has claimed yet. Employees
+never reach the call log (`403`).
+
+Before trusting a new wiring, paste a few lines into **Check the SMDR feed**
+(`POST /api/pbx/parse`): a dry run that shows exactly what the helpdesk would
+read from each line and whether it would raise a ticket, storing nothing.
+`GET /api/pbx/status` reports the transport, connection state, counters and any
+warnings (unreadable records, a date column that looks off, an assumed
+direction). Every `PBX_*` setting is documented with its default in
+`backend/.env.example`.
+
+**Safety.** With `PBX_ENABLED` unset the subsystem is off and the rest of the
+helpdesk behaves exactly as before. The webhook needs `PBX_TOKEN` (or a
+signed-in IT agent), has its own rate limit, and refuses unreadable batches
+with the reason instead of logging garbage. A PBX that disappears is retried
+with backoff and never takes the API down, and the log is pruned to the newest
+`PBX_RETAIN_CALLS` records.
 
 ## Locked out of the super admin account?
 
@@ -179,8 +265,18 @@ cd frontend && npm run lint && npm run build
 `backend/tests/api.test.js` covers the authz guards, the UI/API status contracts,
 id-keyed assignments (rename/duplicate-name/delete/legacy migration), per-agent
 queue scoping and super-admin dispatch (including live socket delivery), the
-persisted reset codes and the rate limiter. `.github/workflows/ci.yml` runs all
-of it on every push and pull request.
+persisted reset codes and the rate limiter.
+
+`backend/tests/pbx.test.js` covers the phone-call feature: every Panasonic SMDR
+record shape the parser claims to read (plus the header/junk noise a real SMDR
+port emits), webhook ingestion with de-duplication and the intercom mirror
+merge, extension mapping and attribution, the solved/not-solved lifecycle in
+both directions, queue scoping, the report and its CSV, the dry-run parser and
+the simulator, the three ticket policies, both TCP feed modes (a stand-in PBX
+connecting to us, and us logging in to it) and a PBX that goes away mid-shift.
+
+`.github/workflows/ci.yml` runs all of it plus the frontend lint and build on
+every push and pull request.
 
 Set `DATA_FILE` to point the server at a different store, and
 `RATE_LIMIT_SCALE` to raise (never disable) every rate-limit budget — useful in
