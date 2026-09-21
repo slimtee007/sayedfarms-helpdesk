@@ -74,7 +74,10 @@ const initialData = {
     }
   ],
   inventory: [
-    { id: '1', name: 'MacBook Pro 16 M2', category: 'Laptop', serial_number: 'SN-8942-X1', assigned_to: 'Unassigned', assigned_to_id: null, status: 'In Stock' }
+    { id: '1', name: 'MacBook Pro 16 M2', category: 'Laptop', serial_number: 'SN-8942-X1', assigned_to: 'Unassigned', assigned_to_id: null, status: 'In Stock', quantity: 1, reorder_level: null },
+    // A consumable stock line (quantity + low-stock alert level) so the
+    // restock feature is visible on a fresh checkout: 4 left, alert at 5.
+    { id: '2', name: 'HP 85A Black Toner Cartridge', category: 'Toner', serial_number: 'BATCH-HP-85A', assigned_to: 'Unassigned', assigned_to_id: null, status: 'In Stock', quantity: 4, reorder_level: 5 }
   ],
   // Persisted password-reset codes (#24) — keyed by normalized email.
   resetCodes: {}
@@ -412,6 +415,24 @@ inventory.forEach((i) => {
   }
 });
 if (categoryMigrated) saveData();
+
+// Stock-tracking migration: rows recorded before quantities existed each
+// describe one physical unit (quantity 1) with no low-stock alerting
+// (reorder_level null). Anything hand-edited into an invalid value is reset
+// the same way rather than crashing the stock report.
+let stockMigrated = false;
+inventory.forEach((i) => {
+  if (!Number.isInteger(i.quantity) || i.quantity < 0) {
+    i.quantity = 1;
+    stockMigrated = true;
+  }
+  const level = i.reorder_level;
+  if (level !== null && level !== undefined && !(Number.isInteger(level) && level >= 0)) {
+    i.reorder_level = null;
+    stockMigrated = true;
+  }
+});
+if (stockMigrated) saveData();
 
 // Append a chat message to a ticket (shared by the REST endpoint and sockets).
 const appendTicketMessage = (ticketId, sender, senderName, text) => {
@@ -1334,12 +1355,55 @@ app.get('/api/reports/mttr/export', requireAgent, (req, res) => {
 
 // ---- IT asset reports -----------------------------------------------------
 //
-// "In stock" is the store room: assets with status "In Stock". Everything else
-// (Assigned, In Repair, Under Maintenance, Retired, Decommissioned) is "out of
-// stock" — not available to hand out. The exact status is always reported
-// alongside the binary split so retired gear is never confused with deployed
-// gear.
-const stockStateOf = (item) => (item.status === 'In Stock' ? 'In Stock' : 'Out of Stock');
+// Three stock states, one rule each:
+//   In Stock     — on the store-room shelf, above its reorder level
+//   Low Stock    — on the shelf but at/below its reorder level (running out)
+//   Out of Stock — shelf empty (quantity 0) or simply not in the store room
+//                  (Assigned, In Repair, Retired, …)
+// The exact status is always reported alongside the split so retired gear is
+// never confused with deployed gear.
+const STOCK_COUNT_MAX = 1000000;
+
+// Accepts 0..1000000 whole numbers, or null/''/undefined (= unset). Anything
+// else is a 400 — a bad stock count must never be silently stored.
+const parseStockCount = (v) => {
+  if (v === undefined || v === null || v === '') return { unset: true };
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0 || n > STOCK_COUNT_MAX) {
+    return { error: `must be a whole number between 0 and ${STOCK_COUNT_MAX}` };
+  }
+  return { value: n };
+};
+
+const itemQuantity = (i) => (Number.isInteger(i.quantity) && i.quantity >= 0 ? i.quantity : 1);
+const itemReorderLevel = (i) =>
+  Number.isInteger(i.reorder_level) && i.reorder_level >= 0 ? i.reorder_level : null;
+
+const stockStateOf = (item) => {
+  if (item.status !== 'In Stock') return 'Out of Stock';
+  const qty = itemQuantity(item);
+  if (qty <= 0) return 'Out of Stock';
+  const level = itemReorderLevel(item);
+  return level !== null && qty <= level ? 'Low Stock' : 'In Stock';
+};
+
+// "Running out of stock" — the restock watchlist: store-room lines at/below
+// their reorder level, or with an empty shelf. Deployed, repaired or retired
+// gear is NOT a restock alert; it is simply not on the shelf.
+const needsRestock = (item) =>
+  item.status === 'In Stock'
+  && (itemQuantity(item) <= 0
+    || (itemReorderLevel(item) !== null && itemQuantity(item) <= itemReorderLevel(item)));
+
+// The stock fields every inventory response carries — computed server-side so
+// the UI, the report and the CSV can never disagree about what "low" means.
+const decorateAsset = (i) => ({
+  ...i,
+  quantity: itemQuantity(i),
+  reorder_level: itemReorderLevel(i),
+  stock_state: stockStateOf(i),
+  needs_restock: needsRestock(i),
+});
 
 const buildAssetReport = (items) => {
   const rows = items.map((i) => ({
@@ -1349,15 +1413,20 @@ const buildAssetReport = (items) => {
     serial: i.serial_number,
     assignedTo: i.assigned_to || 'Unassigned',
     status: i.status || 'In Stock',
+    quantity: itemQuantity(i),
+    reorderLevel: itemReorderLevel(i),
     stockState: stockStateOf(i),
+    needsRestock: needsRestock(i),
   }));
 
   const inStock = rows.filter((r) => r.stockState === 'In Stock').length;
+  const lowStock = rows.filter((r) => r.stockState === 'Low Stock').length;
   const byCategory = new Map();
   rows.forEach((r) => {
-    const g = byCategory.get(r.category) || { key: r.category, total: 0, inStock: 0, outOfStock: 0 };
+    const g = byCategory.get(r.category) || { key: r.category, total: 0, inStock: 0, lowStock: 0, outOfStock: 0 };
     g.total += 1;
     if (r.stockState === 'In Stock') g.inStock += 1;
+    else if (r.stockState === 'Low Stock') g.lowStock += 1;
     else g.outOfStock += 1;
     byCategory.set(r.category, g);
   });
@@ -1369,8 +1438,14 @@ const buildAssetReport = (items) => {
     summary: {
       total: rows.length,
       inStock,
-      outOfStock: rows.length - inStock,
+      lowStock,
+      outOfStock: rows.length - inStock - lowStock,
     },
+    // The actionable list: everything that should be reordered now.
+    restockList: rows
+      .filter((r) => r.needsRestock)
+      .sort((a, b) => a.quantity - b.quantity || a.name.localeCompare(b.name))
+      .map(({ id, name, category, quantity, reorderLevel, stockState }) => ({ id, name, category, quantity, reorderLevel, stockState })),
     byCategory: [...byCategory.values()].sort((a, b) => b.total - a.total || a.key.localeCompare(b.key)),
     byStatus: [...byStatus.entries()].map(([key, count]) => ({ key, count, stockState: stockStateOf({ status: key }) }))
       .sort((a, b) => b.count - a.count || a.key.localeCompare(b.key)),
@@ -1385,8 +1460,8 @@ app.get('/api/reports/assets', requireAgent, (req, res) => {
 });
 
 // GET /api/reports/assets/export — the asset report as a CSV download: a
-// summary block (totals and the in/out-of-stock split per category), then one
-// row per asset with its stock state.
+// summary block (totals and the in/low/out-of-stock split per category), the
+// restock watchlist, then one row per asset with quantities and stock state.
 app.get('/api/reports/assets/export', requireAgent, (req, res) => {
   const report = buildAssetReport(inventory);
   const lines = [];
@@ -1396,26 +1471,51 @@ app.get('/api/reports/assets/export', requireAgent, (req, res) => {
   lines.push(csvRow(['Metric', 'Value']));
   lines.push(csvRow(['Total assets', report.summary.total]));
   lines.push(csvRow(['In stock', report.summary.inStock]));
+  lines.push(csvRow(['Low stock (at/below reorder level)', report.summary.lowStock]));
   lines.push(csvRow(['Out of stock', report.summary.outOfStock]));
   lines.push('');
-  lines.push(csvRow(['Category', 'Total', 'In stock', 'Out of stock']));
-  report.byCategory.forEach((c) => lines.push(csvRow([c.key, c.total, c.inStock, c.outOfStock])));
+  lines.push(csvRow(['Restock watchlist (running out or empty)']));
+  lines.push(csvRow(['Asset', 'Category', 'Quantity on hand', 'Reorder level', 'Stock state']));
+  if (report.restockList.length === 0) lines.push(csvRow(['(nothing to reorder)']));
+  report.restockList.forEach((r) => lines.push(csvRow([r.name, r.category, r.quantity, r.reorderLevel == null ? '' : r.reorderLevel, r.stockState])));
+  lines.push('');
+  lines.push(csvRow(['Category', 'Total', 'In stock', 'Low stock', 'Out of stock']));
+  report.byCategory.forEach((c) => lines.push(csvRow([c.key, c.total, c.inStock, c.lowStock, c.outOfStock])));
   lines.push('');
   lines.push(csvRow(['Status', 'Count', 'Stock state']));
   report.byStatus.forEach((s) => lines.push(csvRow([s.key, s.count, s.stockState])));
   lines.push('');
-  lines.push(csvRow(['Asset ID', 'Name', 'Category', 'Serial number', 'Assigned to', 'Status', 'Stock state']));
-  report.rows.forEach((r) => lines.push(csvRow([r.id, r.name, r.category, r.serial, r.assignedTo, r.status, r.stockState])));
+  lines.push(csvRow(['Asset ID', 'Name', 'Category', 'Serial number', 'Assigned to', 'Status', 'Quantity on hand', 'Reorder level', 'Stock state']));
+  report.rows.forEach((r) => lines.push(csvRow([r.id, r.name, r.category, r.serial, r.assignedTo, r.status, r.quantity, r.reorderLevel == null ? '' : r.reorderLevel, r.stockState])));
 
   sendCsv(res, `asset-report-${exportDate()}.csv`, lines);
 });
 
 app.get('/api/inventory', requireAgent, (req, res) => {
-  res.json(inventory);
+  res.json(inventory.map(decorateAsset));
+});
+
+// GET /api/inventory/low-stock — the restock watchlist: store-room lines that
+// are running out (at/below their reorder level) or already empty. Deployed,
+// repaired or retired gear is not a restock alert.
+app.get('/api/inventory/low-stock', requireAgent, (req, res) => {
+  const alerts = inventory
+    .filter(needsRestock)
+    .map(decorateAsset)
+    .sort((a, b) => a.quantity - b.quantity || a.name.localeCompare(b.name));
+  res.json({
+    generatedAt: new Date().toISOString(),
+    counts: {
+      total: alerts.length,
+      lowStock: alerts.filter((a) => a.stock_state === 'Low Stock').length,
+      outOfStock: alerts.filter((a) => a.stock_state === 'Out of Stock').length,
+    },
+    alerts,
+  });
 });
 
 app.post('/api/inventory', requireAgent, writeRateLimit, (req, res) => {
-  const body = pick(req.body, ['name', 'category', 'serial_number', 'assigned_to_id', 'assigned_to', 'status']);
+  const body = pick(req.body, ['name', 'category', 'serial_number', 'assigned_to_id', 'assigned_to', 'status', 'quantity', 'reorder_level']);
   const missing = requireStrings(body, ['name', 'category', 'serial_number']);
   if (missing) return res.status(400).json({ error: `${missing} is required` });
   const category = String(body.category).trim();
@@ -1432,6 +1532,12 @@ app.post('/api/inventory', requireAgent, writeRateLimit, (req, res) => {
   if (body.status !== undefined && !VALID_INVENTORY_STATUS.has(body.status)) {
     return res.status(400).json({ error: `Status must be one of: ${[...VALID_INVENTORY_STATUS].join(', ')}` });
   }
+  // Stock tracking: quantity defaults to a single unit; the reorder level is
+  // optional (null = no low-stock alerting for this line).
+  const qty = parseStockCount(body.quantity);
+  if (qty.error) return res.status(400).json({ error: `Quantity ${qty.error}` });
+  const level = parseStockCount(body.reorder_level);
+  if (level.error) return res.status(400).json({ error: `Low-stock alert level ${level.error}` });
   const requested = body.assigned_to_id !== undefined ? body.assigned_to_id : body.assigned_to;
   const assignee = resolveAssignee(requested);
   if (assignee.error) return res.status(400).json({ error: assignee.error });
@@ -1443,17 +1549,20 @@ app.post('/api/inventory', requireAgent, writeRateLimit, (req, res) => {
     assigned_to_id: assignee.id || null,
     assigned_to: displayNameForId(assignee.id),
     status: body.status || 'In Stock',
+    quantity: qty.unset ? 1 : qty.value,
+    reorder_level: level.unset ? null : level.value,
   };
   inventory.unshift(newItem);
   saveData();
-  res.json(newItem);
+  // Decorated so callers immediately see the stock state their numbers imply.
+  res.json(decorateAsset(newItem));
 });
 
 app.patch('/api/inventory/:id', requireAgent, writeRateLimit, (req, res) => {
   const item = inventory.find((i) => i.id === req.params.id);
   if (!item) return res.status(404).json({ error: 'Asset not found' });
   // #8 mass-assignment fix: explicit allow-list — id can never be overwritten.
-  const body = pick(req.body, ['name', 'category', 'serial_number', 'assigned_to_id', 'assigned_to', 'status']);
+  const body = pick(req.body, ['name', 'category', 'serial_number', 'assigned_to_id', 'assigned_to', 'status', 'quantity', 'reorder_level']);
   if (body.name !== undefined) {
     const n = String(body.name).trim();
     if (!n) return res.status(400).json({ error: 'Name cannot be empty' });
@@ -1484,6 +1593,18 @@ app.patch('/api/inventory/:id', requireAgent, writeRateLimit, (req, res) => {
     item.status = body.status;
     if (body.status !== 'Assigned') setAssignee(item, null);
   }
+  // Stock tracking: quick quantity adjustments (−/+) and reorder-level edits
+  // come through here. An empty reorder_level clears the alerting (null).
+  if (body.quantity !== undefined) {
+    const qty = parseStockCount(body.quantity);
+    if (qty.error) return res.status(400).json({ error: `Quantity ${qty.error}` });
+    item.quantity = qty.unset ? 1 : qty.value;
+  }
+  if (body.reorder_level !== undefined) {
+    const level = parseStockCount(body.reorder_level);
+    if (level.error) return res.status(400).json({ error: `Low-stock alert level ${level.error}` });
+    item.reorder_level = level.unset ? null : level.value;
+  }
   if (body.assigned_to_id !== undefined || body.assigned_to !== undefined) {
     const requested = body.assigned_to_id !== undefined ? body.assigned_to_id : body.assigned_to;
     const assignee = resolveAssignee(requested);
@@ -1491,7 +1612,8 @@ app.patch('/api/inventory/:id', requireAgent, writeRateLimit, (req, res) => {
     setAssignee(item, assignee.id);
   }
   saveData();
-  res.json(item);
+  // Return the decorated row so callers immediately see the new stock state.
+  res.json(decorateAsset(item));
 });
 
 app.delete('/api/inventory/:id', requireAgent, sensitiveRateLimit, (req, res) => {
