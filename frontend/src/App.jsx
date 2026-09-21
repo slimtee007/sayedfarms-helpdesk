@@ -21,6 +21,10 @@ const FALLBACK_ENUMS = {
   ticketPriority: ['Low', 'Medium', 'High', 'Urgent'],
   ticketCategory: ['Hardware', 'Software', 'Network', 'Access/Security', 'Account', 'Other'],
   inventoryStatus: ['In Stock', 'Assigned', 'In Repair', 'Retired', 'Under Maintenance', 'Decommissioned'],
+  // Server-owned asset-category pick list (#asset-categories). Kept in step
+  // with VALID_INVENTORY_CATEGORY in backend/server.js — the live list comes
+  // from GET /api/meta/enums, this is the offline fallback.
+  inventoryCategory: ['Laptop', 'Desktop Computer', 'Monitor', 'Printer', 'Cartridge', 'Toner', 'IP Camera', 'Solar PTZ Camera', 'NVR', 'SSD/HDD', 'Network Equipment', 'Peripherals', 'Server', 'UPS', 'Other'],
 };
 
 // Human labels for values whose API name is terse.
@@ -56,6 +60,16 @@ const assigneeOptions = (people, current) => {
     opts.push({ value: LEGACY_ASSIGNEE, label: `${currentName} (account no longer exists)` });
   }
   return opts;
+};
+
+/**
+ * Options for an asset-category <select> (#asset-categories). `categories` is
+ * the server-owned list (GET /api/meta/enums); `current` keeps a row whose
+ * stored value predates the list selectable instead of blanking the field.
+ */
+const categoryOptions = (categories, current) => {
+  const list = categories && categories.length ? categories : FALLBACK_ENUMS.inventoryCategory;
+  return current && !list.includes(current) ? [...list, current] : list;
 };
 
 // Super admins see every ticket and own the dispatch/user-management screens
@@ -1973,7 +1987,15 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
                     {inventoryList.map((item) => (
                       <tr key={item.id} className="hover:bg-slate-50 transition">
                         <td className="py-3.5 px-4 font-semibold text-slate-800">{item.name}</td>
-                        <td className="py-3.5 px-4 text-slate-600">{item.category}</td>
+                        <td className="py-3.5 px-4">
+                          {/* Recategorise in place (#asset-categories) — the
+                              server validates against its published list. */}
+                          <select value={item.category} onChange={(e) => handleUpdateAsset(item.id, { category: e.target.value })} title="Change asset category" className="bg-white border border-slate-300 text-slate-700 rounded text-xs p-1 focus:outline-none focus:border-[#0052CC]">
+                            {categoryOptions(enums.inventoryCategory, item.category).map((c) => (
+                              <option key={c} value={c}>{c}</option>
+                            ))}
+                          </select>
+                        </td>
                         <td className="py-3.5 px-4 font-mono text-[#0052CC]">{item.serial_number}</td>
                         <td className="py-3.5 px-4">
                           <select value={item.assigned_to_id || (item.assigned_to && item.assigned_to !== UNASSIGNED ? LEGACY_ASSIGNEE : UNASSIGNED)} onChange={(e) => handleUpdateAsset(item.id, { ...assigneePayload(e.target.value), status: e.target.value === UNASSIGNED ? 'In Stock' : 'Assigned' })} className="bg-white border border-slate-300 text-slate-700 rounded text-xs p-1 focus:outline-none focus:border-[#0052CC]">
@@ -2083,11 +2105,12 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
                     <div>
                       <label className="block text-xs font-semibold text-slate-700 mb-1">Category</label>
                       <select value={newAsset.category} onChange={(e) => setNewAsset({ ...newAsset, category: e.target.value })} className="w-full border border-slate-300 rounded p-2 text-xs focus:border-[#0052CC] focus:outline-none">
-                        <option>Laptop</option>
-                        <option>Desktop</option>
-                        <option>Monitor</option>
-                        <option>Peripherals</option>
-                        <option>Network Equipment</option>
+                        {/* Server-owned pick list (#asset-categories): laptops,
+                            desktops, printers & consumables, IP / solar PTZ
+                            cameras, NVRs, storage, and so on. */}
+                        {categoryOptions(enums.inventoryCategory, newAsset.category).map((c) => (
+                          <option key={c} value={c}>{c}</option>
+                        ))}
                       </select>
                     </div>
                     <div>

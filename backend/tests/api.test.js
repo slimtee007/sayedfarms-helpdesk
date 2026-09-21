@@ -1185,3 +1185,80 @@ test('MTTR report aggregates resolution times, and scopes the report to the call
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// #asset-categories — the asset-category pick list is server-owned.
+// ---------------------------------------------------------------------------
+test('#asset-categories: every published category is accepted, unknown values are rejected', async () => {
+  const enums = (await client.get('/api/meta/enums', { token: admin.token })).body;
+  assert.ok(Array.isArray(enums.inventoryCategory), 'inventoryCategory must be published through /api/meta/enums');
+  // The categories the farms asked for specifically, plus the originals.
+  for (const wanted of ['Printer', 'Cartridge', 'Toner', 'IP Camera', 'Solar PTZ Camera', 'NVR', 'SSD/HDD', 'Desktop Computer', 'Laptop', 'Monitor']) {
+    assert.ok(enums.inventoryCategory.includes(wanted), `"${wanted}" must be pickable`);
+  }
+
+  for (const category of enums.inventoryCategory) {
+    const serial = `SN-CAT-${category.replace(/\W+/g, '-').toUpperCase()}-${Math.random().toString(36).slice(2, 8)}`;
+    const created = await client.post('/api/inventory', {
+      token: admin.token,
+      body: { name: 'Category Asset', category, serial_number: serial },
+    });
+    assert.equal(created.status, 200, `POST category="${category}" failed: ${JSON.stringify(created.body)}`);
+    assert.equal(created.body.category, category, `category "${category}" must be stored verbatim`);
+
+    const patched = await client.patch(`/api/inventory/${created.body.id}`, { token: admin.token, body: { category } });
+    assert.equal(patched.status, 200, `PATCH category="${category}" was rejected: ${JSON.stringify(patched.body)}`);
+    assert.equal(patched.body.category, category, `category "${category}" must not be rewritten on PATCH`);
+  }
+
+  // Unknown values: an explicit 400, never silently stored or defaulted (#33).
+  const bad = await client.post('/api/inventory', {
+    token: admin.token,
+    body: { name: 'Bad Category', category: 'Toaster', serial_number: `SN-BAD-CAT-${Date.now()}` },
+  });
+  assert.equal(bad.status, 400, 'an unknown category must be rejected on create');
+  assert.match(bad.body.error, /Category must be one of/);
+
+  const created = await client.post('/api/inventory', {
+    token: admin.token,
+    body: { name: 'Recat Asset', category: 'Printer', serial_number: `SN-RECAT-${Date.now()}` },
+  });
+  assert.equal(created.status, 200);
+  const badPatch = await client.patch(`/api/inventory/${created.body.id}`, { token: admin.token, body: { category: 'Toaster' } });
+  assert.equal(badPatch.status, 400, 'an unknown category must be rejected on edit too');
+  const unchanged = (await client.get('/api/inventory', { token: admin.token })).body.find((i) => i.id === created.body.id);
+  assert.equal(unchanged.category, 'Printer', 'a rejected PATCH must leave the row untouched');
+});
+
+test('#asset-categories: legacy "Desktop" assets migrate to "Desktop Computer" on boot', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sayedfarms-assetcat-'));
+  const file = path.join(dir, 'db.json');
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      users: [],
+      tickets: [],
+      // Pre-#asset-categories data: the old form offered "Desktop".
+      inventory: [
+        { id: 'cat-legacy', name: 'Old Desktop', category: 'Desktop', serial_number: 'SN-DESKTOP-OLD', assigned_to: 'Unassigned', assigned_to_id: null, status: 'In Stock' },
+        { id: 'cat-ok', name: 'Fine Laptop', category: 'Laptop', serial_number: 'SN-LAPTOP-OK', assigned_to: 'Unassigned', assigned_to_id: null, status: 'In Stock' },
+      ],
+      resetCodes: {},
+    })
+  );
+
+  const s = await startServer(file, await freePort());
+  try {
+    const c = api(s.base);
+    const token = (await login(c, ADMIN_EMAIL, ADMIN_PASSWORD)).token;
+    const assets = (await c.get('/api/inventory', { token })).body;
+    assert.equal(assets.find((a) => a.id === 'cat-legacy').category, 'Desktop Computer', 'legacy "Desktop" must be renamed into the pick list');
+    assert.equal(assets.find((a) => a.id === 'cat-ok').category, 'Laptop', 'other categories must not be touched');
+
+    const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(onDisk.inventory.find((a) => a.id === 'cat-legacy').category, 'Desktop Computer', 'the migration must be persisted');
+  } finally {
+    await s.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

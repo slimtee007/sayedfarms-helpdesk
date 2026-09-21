@@ -159,8 +159,14 @@ tests, or behind a reverse proxy that already limits traffic.
   validated server-side. An unknown value is rejected with `400` — it is never
   silently replaced by a default.
 - **One source of truth for dropdown values:** the frontend renders its status
-  dropdowns from `GET /api/meta/enums`, so the UI can't offer a value the API
-  rejects (or one it quietly rewrites).
+  and category dropdowns from `GET /api/meta/enums`, so the UI can't offer a
+  value the API rejects (or one it quietly rewrites). Asset categories are
+  server-owned (`inventoryCategory`): Laptop, Desktop Computer, Monitor,
+  Printer, Cartridge, Toner, IP Camera, Solar PTZ Camera, NVR, SSD/HDD,
+  Network Equipment, Peripherals, Server, UPS, Other — the Add Asset form and
+  the inventory table both pick from this list, and an unknown value is
+  rejected with `400` (never silently stored). Legacy rows marked `Desktop`
+  are migrated to `Desktop Computer` on boot.
 - **Password-reset codes** are persisted in `db.json` as SHA-256 digests
   (never plaintext), expire after 10 minutes, and are burned after 5 wrong
   attempts. They survive server restarts.

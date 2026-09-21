@@ -400,6 +400,19 @@ tickets.forEach((t) => {
 });
 if (mttrMigrated) saveData();
 
+// Asset-category migration (#asset-categories): the old Add Asset form offered
+// "Desktop"; the server-owned list calls it "Desktop Computer". Map the legacy
+// value so it stays in the published pick list instead of becoming an
+// unselectable oddity in the dropdown.
+let categoryMigrated = false;
+inventory.forEach((i) => {
+  if (i.category === 'Desktop') {
+    i.category = 'Desktop Computer';
+    categoryMigrated = true;
+  }
+});
+if (categoryMigrated) saveData();
+
 // Append a chat message to a ticket (shared by the REST endpoint and sockets).
 const appendTicketMessage = (ticketId, sender, senderName, text) => {
   const ticket = tickets.find((t) => t.id === String(ticketId));
@@ -580,11 +593,35 @@ const VALID_USER_ROLE = new Set(['agent', 'user']);
 // Union of the two asset forms: the console's edit dropdown used In Repair /
 // Retired while the "Add Asset" form used Under Maintenance / Decommissioned.
 const VALID_INVENTORY_STATUS = new Set(['In Stock', 'Assigned', 'In Repair', 'Retired', 'Under Maintenance', 'Decommissioned']);
+// Asset categories (#asset-categories). The Add Asset form used to hardcode
+// five options in the frontend while the API accepted any string; the set is
+// now server-owned and published through GET /api/meta/enums so the picker and
+// the API can never disagree (same contract as ticket categories #32/#33).
+// Covers office IT plus the hardware actually held on the farms: printers and
+// their consumables, IP / solar PTZ cameras, NVRs, storage, and so on.
+const VALID_INVENTORY_CATEGORY = new Set([
+  'Laptop',
+  'Desktop Computer',
+  'Monitor',
+  'Printer',
+  'Cartridge',
+  'Toner',
+  'IP Camera',
+  'Solar PTZ Camera',
+  'NVR',
+  'SSD/HDD',
+  'Network Equipment',
+  'Peripherals',
+  'Server',
+  'UPS',
+  'Other',
+]);
 const ENUMS = {
   ticketStatus: [...VALID_TICKET_STATUS],
   ticketPriority: [...VALID_TICKET_PRIORITY],
   ticketCategory: [...VALID_TICKET_CATEGORY],
   inventoryStatus: [...VALID_INVENTORY_STATUS],
+  inventoryCategory: [...VALID_INVENTORY_CATEGORY],
   userRole: [...VALID_USER_ROLE],
 };
 
@@ -1236,6 +1273,10 @@ app.post('/api/inventory', requireAgent, writeRateLimit, (req, res) => {
   const body = pick(req.body, ['name', 'category', 'serial_number', 'assigned_to_id', 'assigned_to', 'status']);
   const missing = requireStrings(body, ['name', 'category', 'serial_number']);
   if (missing) return res.status(400).json({ error: `${missing} is required` });
+  const category = String(body.category).trim();
+  if (!VALID_INVENTORY_CATEGORY.has(category)) {
+    return res.status(400).json({ error: `Category must be one of: ${[...VALID_INVENTORY_CATEGORY].join(', ')}` });
+  }
   const serial = String(body.serial_number).trim();
   if (inventory.some((i) => String(i.serial_number).toLowerCase() === serial.toLowerCase())) {
     return res.status(400).json({ error: 'An asset with this serial number already exists' });
@@ -1252,7 +1293,7 @@ app.post('/api/inventory', requireAgent, writeRateLimit, (req, res) => {
   const newItem = {
     id: genId('asset-'),
     name: String(body.name).trim(),
-    category: String(body.category).trim(),
+    category,
     serial_number: serial,
     assigned_to_id: assignee.id || null,
     assigned_to: displayNameForId(assignee.id),
@@ -1273,7 +1314,15 @@ app.patch('/api/inventory/:id', requireAgent, writeRateLimit, (req, res) => {
     if (!n) return res.status(400).json({ error: 'Name cannot be empty' });
     item.name = n;
   }
-  if (body.category !== undefined) item.category = String(body.category).trim();
+  if (body.category !== undefined) {
+    // Same contract as ticket categories: an unknown value is a 400, never
+    // silently stored (#asset-categories).
+    const cat = String(body.category).trim();
+    if (!VALID_INVENTORY_CATEGORY.has(cat)) {
+      return res.status(400).json({ error: `Category must be one of: ${[...VALID_INVENTORY_CATEGORY].join(', ')}` });
+    }
+    item.category = cat;
+  }
   if (body.serial_number !== undefined) {
     const s = String(body.serial_number).trim();
     if (!s) return res.status(400).json({ error: 'Serial number cannot be empty' });
