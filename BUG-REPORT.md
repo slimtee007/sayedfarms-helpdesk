@@ -363,6 +363,49 @@ the open PR #9 branch.
 
 ---
 
+### 16. IP-phone call logging (Panasonic PBX) — bugs found while building it — FIXED (this branch)
+
+The phone-call feature (auto-ticket from the office IP-phone) shipped with its own
+regression suite, `backend/tests/pbx.test.js` (37 tests). Building it against a real
+booted server turned up these, all reproduced first and all covered by a test now:
+
+1. **Every unset `PBX_*` integer silently became 0.** `Number('')` is `0`, so the
+   intercom de-duplication window was 0 s — the two records Panasonic prints for one
+   internal call never merged — and `PBX_RETAIN_CALLS` would have pruned the log to
+   100 records. `pbx/config.js` now falls back to the documented default for an empty
+   string. *(mirror-merge test)*
+2. **The whole PBX REST block sat after the SPA catch-all 404 route**, so
+   `GET /api/pbx/status` and friends answered with the fallback page. Relocated before
+   the catch-all. *(status test)*
+3. **Ingested calls raised no tickets.** `shouldRaiseTicket` tested `call.ticketable`,
+   a field that only exists inside the classification result — the stored call carries
+   `is_helpdesk_call`. *(every ingestion test)*
+4. **`POST /api/pbx/parse` only accepted string bodies**, so the console's dry run
+   returned `400` for `{ text }` / `{ lines }` payloads. Now normalised.
+5. **Three record shapes the consoles actually print were misread.** A JSON payload
+   whose keys are `date`/`time`/`ext`/`co` looked exactly like a Panasonic header row
+   and was thrown away; a talk time printed as `H'MM'SS` (`0'00'45`) was not
+   recognised, so the *ring* column before it was taken as the duration — every call
+   was logged seconds long; a delimited row with no header row was not recognised at
+   all. *(parser unit tests + both TCP feed tests)*
+6. **The LAN feed's login banner and prompt were fed into the record pipeline**, glued
+   to the first record of every connection (`Password: 21/09/26 …`), so that call was
+   dropped. The handshake text is now stripped (including prompts split across
+   packets). *(tcp-client test)*
+7. **Unclaimed calls were invisible in an agent's call log.** A call whose ticket had
+   been raised but not dispatched counted as "claimed", so no agent could see or pick
+   it up. Scoping now treats an unassigned ticket as unclaimed, in the list, the
+   detail view and the report. *(visibility + report-scoping tests)*
+8. Cosmetic but misleading: the ticket description showed the ISO stamp instead of the
+   PBX wall clock (`21/09/2025 15:10`), the simulator printed the caller number after
+   the duration instead of in the Dial Number column, and a ticket resolved from the
+   queue recorded no solver when nobody owned it. All fixed.
+
+`cd backend && npm test` → 74/74 green (37 pre-existing + 37 new); `cd frontend &&
+npm run lint && npm run build` → 0 errors, build OK.
+
+---
+
 ## OPEN — security (fix before any real deployment)
 
 | # | Finding | Evidence |

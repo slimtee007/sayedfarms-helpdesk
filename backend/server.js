@@ -8,6 +8,9 @@ const fs = require('fs');
 const path = require('path');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+// Call logging for the Panasonic PBX: SMDR parsing, the extension directory,
+// call-to-ticket creation and the call report all live in ./pbx.
+const pbx = require('./pbx');
 
 const app = express();
 
@@ -80,7 +83,11 @@ const initialData = {
     { id: '2', name: 'HP 85A Black Toner Cartridge', category: 'Toner', serial_number: 'BATCH-HP-85A', assigned_to: 'Unassigned', assigned_to_id: null, status: 'In Stock', quantity: 4, reorder_level: 5 }
   ],
   // Persisted password-reset codes (#24) — keyed by normalized email.
-  resetCodes: {}
+  resetCodes: {},
+  // Call records read from the PBX (Panasonic SMDR) and the extension →
+  // person directory that maps a ringing extension back to an account.
+  calls: [],
+  extensions: []
 };
 
 // Load persistent data from JSON file
@@ -103,6 +110,11 @@ let inventory = db.inventory || [];
 // Reset codes survive restarts (#24) — a restart used to void every pending
 // code, which looked like "the code you just emailed me is wrong".
 let resetCodes = db.resetCodes && typeof db.resetCodes === 'object' ? db.resetCodes : {};
+// Call records + extension directory for the PBX call-to-ticket feature. The
+// PBX module owns these arrays; loading them here (before the first saveData
+// call, which happens during the migrations below) means a boot-time write
+// can never wipe the call log.
+pbx.loadData(db);
 
 // Monotonic id generator (#18). Date.now() primary keys collided under
 // concurrent writes: 6 simultaneous signups produced the same id, and
@@ -120,7 +132,16 @@ const normalizeEmail = (email) => (email || '').trim().toLowerCase();
 
 // Save state to disk
 const saveData = () => {
-  fs.writeFileSync(DATA_FILE, JSON.stringify({ users, tickets, inventory, resetCodes }, null, 2));
+  fs.writeFileSync(DATA_FILE, JSON.stringify({
+    users,
+    tickets,
+    inventory,
+    resetCodes,
+    // Owned by the PBX module; `pbx.getCalls()` returns an empty array until
+    // `pbx.loadData()` has run, which happens immediately after loadData().
+    calls: pbx.getCalls(),
+    extensions: pbx.getExtensions(),
+  }, null, 2));
 };
 
 // ------------------------------------------------------------------
@@ -312,6 +333,90 @@ inventory.forEach((i) => {
   }
 });
 if (ticketsMigrated) saveData();
+
+// ------------------------------------------------------------------
+// Ticket factory (shared by the portal API and the PBX call logger).
+//
+// A ticket raised by an IP-phone call must be indistinguishable from one
+// raised in the portal: same fields, same MTTR stamps, same dispatch
+// notification. Both paths therefore go through `newTicketRecord` +
+// `addTicket` below — the PBX module receives them as dependencies instead of
+// re-implementing ticket creation.
+//
+// `source` ('portal' | 'pbx_call') and `call_id` are additive: they record
+// where the request came from without changing any existing field.
+// ------------------------------------------------------------------
+const newTicketRecord = ({
+  title,
+  description,
+  category = 'Hardware',
+  priority = 'Medium',
+  assigned_to_id = null,
+  created_by = null,
+  created_by_name = '',
+  image = '',
+  source = 'portal',
+  call_id = null,
+}) => ({
+  id: genId('ticket-'),
+  title,
+  description,
+  category,
+  priority,
+  status: 'Open',
+  assigned_to_id,
+  assigned_to: displayNameForId(assigned_to_id),
+  created_by,
+  created_by_name,
+  image,
+  messages: [],
+  source,
+  call_id,
+  created_at: new Date().toISOString(),
+  // MTTR lifecycle stamps (#mttr). Resolution time is measured
+  // created_at -> resolved_at and snapshotted into `resolution_minutes`.
+  // All null until the ticket actually reaches a resolved/closed state.
+  first_response_at: null,
+  resolved_at: null,
+  closed_at: null,
+  resolution_minutes: null,
+  reopened_count: 0,
+});
+
+/** Insert a ticket, persist it and alert the dispatch queue. */
+const addTicket = (ticket) => {
+  tickets.unshift(ticket);
+  saveData();
+  // #36: alert the super admin that there is something to dispatch. Regular
+  // agents hear nothing about tickets they do not own.
+  io.to('role_super_admin').emit('ticket_created', { ticketId: ticket.id });
+  return ticket;
+};
+
+// ------------------------------------------------------------------
+// PBX call logging (Panasonic SMDR).
+//
+// Injects the helpers the call logger needs. Records can arrive from a TCP
+// feed (client or server mode), the webhook, manual entry or the simulator —
+// all of them end up in the same `calls` store and, per PBX_TICKET_POLICY,
+// in the ticket queue.
+// ------------------------------------------------------------------
+pbx.init({
+  genId,
+  saveData,
+  getUsers: () => users,
+  getTickets: () => tickets,
+  newTicketRecord,
+  addTicket,
+  io,
+});
+if (pbx.pbxConfig.enabled) {
+  console.log(`[PBX] Call logging enabled — ${pbx.describeConfig()}`);
+  if (!pbx.pbxConfig.itExtensions.length) {
+    console.warn('[PBX] PBX_IT_EXTENSIONS is not set: calls will be logged but no tickets raised. Set it to the IT office extension(s), e.g. PBX_IT_EXTENSIONS=204,205');
+  }
+}
+
 
 // ------------------------------------------------------------------
 // MTTR (mean time to resolution) lifecycle stamps.
@@ -637,6 +742,12 @@ const VALID_INVENTORY_CATEGORY = new Set([
   'UPS',
   'Other',
 ]);
+// PBX call log vocabularies. Published here so the console's filters offer
+// exactly what the API accepts, same contract as the ticket/asset enums.
+const VALID_CALL_DIRECTION = new Set(['Incoming', 'Outgoing', 'Internal']);
+const VALID_CALL_OUTCOME = new Set(['Solved', 'Not solved', 'Pending']);
+const VALID_PBX_TICKET_POLICY = new Set(['all', 'answered', 'missed', 'off']);
+
 const ENUMS = {
   ticketStatus: [...VALID_TICKET_STATUS],
   ticketPriority: [...VALID_TICKET_PRIORITY],
@@ -644,6 +755,9 @@ const ENUMS = {
   inventoryStatus: [...VALID_INVENTORY_STATUS],
   inventoryCategory: [...VALID_INVENTORY_CATEGORY],
   userRole: [...VALID_USER_ROLE],
+  callDirection: [...VALID_CALL_DIRECTION],
+  callOutcome: [...VALID_CALL_OUTCOME],
+  pbxTicketPolicy: [...VALID_PBX_TICKET_POLICY],
 };
 
 const { sendOtpEmail, isSmtpConfigured } = require('./utils/sendEmail');
@@ -903,6 +1017,9 @@ app.delete('/api/users/:id', requireSuperAdmin, sensitiveRateLimit, (req, res) =
     }
   });
   users = users.filter((u) => u.id !== target.id);
+  // The PBX extension directory points at accounts too: unlink the deleted
+  // person so an extension never resolves to a ghost.
+  pbx.onUserDeleted(target.id);
   saveData();
   res.json({ success: true });
 });
@@ -1010,34 +1127,17 @@ app.post('/api/tickets', requireAuth, writeRateLimit, (req, res) => {
   if (body.image && !image) {
     return res.status(400).json({ error: 'Attached image is too large (max ~1.5 MB after encoding). Please remove it and try again.' });
   }
-  const newTicket = {
-    id: genId('ticket-'),
+  const newTicket = addTicket(newTicketRecord({
     title: String(body.title).trim(),
     description: String(body.description).trim(),
     category,
     priority,
-    status: 'Open',
     assigned_to_id: assignee.id || null,
-    assigned_to: displayNameForId(assignee.id),
     created_by: req.user.id,
     created_by_name: req.user.name,
     image,
-    messages: [],
-    created_at: new Date().toISOString(),
-    // MTTR lifecycle stamps (#mttr). Resolution time is measured
-    // created_at -> resolved_at and snapshotted into `resolution_minutes`.
-    // All null until the ticket actually reaches a resolved/closed state.
-    first_response_at: null,
-    resolved_at: null,
-    closed_at: null,
-    resolution_minutes: null,
-    reopened_count: 0,
-  };
-  tickets.unshift(newTicket);
-  saveData();
-  // #36: alert the super admin that there is something to dispatch. Regular
-  // agents hear nothing about tickets they do not own.
-  io.to('role_super_admin').emit('ticket_created', { ticketId: newTicket.id });
+    source: 'portal',
+  }));
   res.json(newTicket);
 });
 
@@ -1055,6 +1155,8 @@ app.patch('/api/tickets/:id', requireAuth, writeRateLimit, (req, res) => {
     }
     applyTicketStatus(ticket, 'Cancelled');
     saveData();
+    // A call-raised ticket that is cancelled means the issue was not solved.
+    pbx.syncCallFromTicket(ticket, req.user.name);
     return res.json(ticket);
   }
   // #36: a regular agent only works on the tickets assigned to them. The
@@ -1117,6 +1219,10 @@ app.patch('/api/tickets/:id', requireAuth, writeRateLimit, (req, res) => {
     ticket.image = typeof body.image === 'string' ? body.image : '';
   }
   saveData();
+  // Keep the phone call that raised this ticket in step: resolving the ticket
+  // marks the call's issue solved and records how long the fix took from the
+  // moment the call came in; reopening it puts the call back to pending.
+  pbx.syncCallFromTicket(ticket, req.user.name);
   // A reassignment moves the ticket between agents: the previous owner must
   // stop receiving it and the new one must start, live (#36).
   if (assigneeChanged) resyncUserSockets(ticket.assigned_to_id);
@@ -1624,6 +1730,365 @@ app.delete('/api/inventory/:id', requireAgent, sensitiveRateLimit, (req, res) =>
   res.json({ success: true });
 });
 
+// ==================================================================
+// PBX call logging (Panasonic SMDR) — REST API
+//
+// An IP-phone call to the IT office becomes a call record here and, per
+// PBX_TICKET_POLICY, a ticket. Employees never reach these endpoints: the call
+// log is operational data for the IT console.
+// ==================================================================
+
+// A busy PBX can post a record per call; the generic write limiter (60/min)
+// would throttle that, so the ingestion endpoint gets its own, larger budget.
+const pbxIngestRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  max: 600,
+  message: 'Too many call records received. If the PBX is retrying, check its SMDR configuration.',
+});
+
+const timingSafeEqual = (a, b) => {
+  const bufA = Buffer.from(String(a || ''), 'utf8');
+  const bufB = Buffer.from(String(b || ''), 'utf8');
+  if (bufA.length !== bufB.length || bufA.length === 0) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+};
+
+/** True when the request may ingest calls: a signed-in agent, or the shared PBX token. */
+const isPbxIngestAuthorized = (req) => {
+  const expected = pbx.pbxConfig.token;
+  const presented = req.headers['x-pbx-token'] || (req.query && req.query.token);
+  if (expected && timingSafeEqual(presented, expected)) return { ok: true, actor: 'pbx-token' };
+  const header = req.headers.authorization || '';
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  if (match) {
+    try {
+      const payload = jwt.verify(match[1].trim(), JWT_SECRET);
+      const user = users.find((u) => u.id === payload.id);
+      if (user && user.role === 'agent') return { ok: true, actor: user.id };
+    } catch (err) { /* fall through to 401 */ }
+  }
+  return { ok: false };
+};
+
+// GET /api/pbx/status — is the feed up, which extensions are the IT office,
+// which policy is in force, and what needs attention.
+app.get('/api/pbx/status', requireAgent, (req, res) => {
+  res.json(pbx.status());
+});
+
+// GET /api/pbx/calls — the call log. Scoping follows the ticket rules: a super
+// admin sees every call, a regular agent their own calls plus unclaimed ones.
+app.get('/api/pbx/calls', requireAgent, (req, res) => {
+  const range = pbx.parseRange({ days: req.query.days === 'all' ? 'all' : (req.query.days || 'all') });
+  if (range.error) return res.status(400).json({ error: range.error });
+  const now = Date.now();
+  const scoped = pbx.visibleCallsFor(req.user);
+  let rows = pbx.filterByDays(scoped, range.days, now).map((c) => pbx.decorate(c));
+
+  const { direction, outcome, extension, ticket, q } = req.query;
+  if (direction) {
+    if (!VALID_CALL_DIRECTION.has(direction)) {
+      return res.status(400).json({ error: 'direction must be Incoming, Outgoing or Internal' });
+    }
+    rows = rows.filter((c) => c.direction === direction);
+  }
+  if (outcome) {
+    if (!VALID_CALL_OUTCOME.has(outcome)) {
+      return res.status(400).json({ error: 'outcome must be "Solved", "Not solved" or "Pending"' });
+    }
+    rows = rows.filter((c) => c.resolution_outcome === outcome);
+  }
+  if (extension) {
+    const needle = String(extension).trim();
+    rows = rows.filter((c) => [c.extension, c.caller_extension, c.target_extension, c.it_extension]
+      .some((v) => v && String(v).includes(needle)));
+  }
+  if (ticket === 'yes' || ticket === 'no') {
+    rows = rows.filter((c) => (ticket === 'yes' ? Boolean(c.ticket_id) : !c.ticket_id));
+  }
+  if (q) {
+    const needle = String(q).trim().toLowerCase();
+    rows = rows.filter((c) => [c.caller_label, c.caller_display_name, c.dialed_number, c.caller_number, c.notes]
+      .some((v) => v && String(v).toLowerCase().includes(needle)));
+  }
+  res.json({
+    range: { days: range.days },
+    scope: isSuperAdmin(req.user) ? 'all' : 'own',
+    total: rows.length,
+    calls: rows,
+  });
+});
+
+// POST /api/pbx/calls — the ingestion endpoint.
+//
+// Accepts either raw SMDR text (text/plain — what a PBX, a serial-to-IP
+// gateway or `PANASONIC-` middleware can post) or JSON (a single record, an
+// array of them, or `{ records: [...] }`). Authorised by the shared
+// X-PBX-Token secret, or by a signed-in agent's Bearer token.
+app.post(
+  '/api/pbx/calls',
+  pbxIngestRateLimit,
+  express.text({ type: ['text/plain', 'text/csv', 'application/csv'], limit: '2mb' }),
+  (req, res) => {
+    const auth = isPbxIngestAuthorized(req);
+    if (!auth.ok) {
+      return res.status(401).json({
+        error: pbx.pbxConfig.token
+          ? 'Send the PBX shared secret in the X-PBX-Token header (or sign in as an IT agent).'
+          : 'This endpoint needs the PBX shared secret (set PBX_TOKEN on the server) or an IT agent session.',
+      });
+    }
+    let text = '';
+    if (typeof req.body === 'string') {
+      text = req.body;
+    } else if (req.body && typeof req.body === 'object') {
+      const payload = Array.isArray(req.body) ? req.body : (req.body.records !== undefined ? req.body.records : req.body);
+      text = JSON.stringify(payload);
+    } else {
+      return res.status(400).json({ error: 'Send the SMDR records as text/plain or JSON.' });
+    }
+
+    // A JSON payload may be an array of records: parse each independently so
+    // one bad element does not discard the batch.
+    const result = (() => {
+      if (text.trim().startsWith('[')) {
+        let list;
+        try { list = JSON.parse(text); } catch { return { parsed: 0, skipped: [{ reason: 'bad-json' }], duplicates: 0, calls: [], tickets: [] }; }
+        const combined = { parsed: 0, skipped: [], duplicates: 0, calls: [], tickets: [] };
+        list.forEach((item) => {
+          const one = pbx.ingestText(JSON.stringify(item), { source: 'webhook' });
+          combined.parsed += one.parsed;
+          combined.skipped.push(...one.skipped);
+          combined.duplicates += one.duplicates;
+          combined.calls.push(...one.calls);
+          combined.tickets.push(...one.tickets);
+        });
+        return combined;
+      }
+      return pbx.ingestText(text, { source: 'webhook' });
+    })();
+
+    if (!result.parsed && result.skipped.length) {
+      return res.status(400).json({
+        error: 'No usable SMDR records in that payload.',
+        skipped: result.skipped,
+        hint: 'POST one record per line (text/plain). Use POST /api/pbx/parse to test a sample first.',
+      });
+    }
+    res.status(202).json({
+      accepted: true,
+      actor: auth.actor,
+      parsed: result.parsed,
+      duplicates: result.duplicates,
+      skipped: result.skipped,
+      callIds: result.calls,
+      ticketIds: result.tickets,
+    });
+  }
+);
+
+// POST /api/pbx/calls/manual — log a call by hand (phone rang while the feed
+// was down, or a site where SMDR is not wired yet).
+app.post('/api/pbx/calls/manual', requireAgent, writeRateLimit, (req, res) => {
+  const body = pick(req.body, [
+    'extension', 'direction', 'call_at', 'time', 'duration', 'duration_seconds',
+    'dialed_number', 'caller_number', 'ring_seconds', 'condition_code', 'notes', 'answered',
+  ]);
+  const result = pbx.logManualCall(body, { source: 'manual' });
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.json({ call: pbx.decorate(result.call), ticket: result.ticket || null, duplicate: result.duplicate });
+});
+
+// POST /api/pbx/calls/simulate — push a realistic SMDR record through the real
+// pipeline, so the wiring (and this feature) can be demonstrated before the
+// PBX is connected. Development feature: off in production unless
+// PBX_ALLOW_SIMULATOR=true.
+app.post('/api/pbx/calls/simulate', requireAgent, writeRateLimit, (req, res) => {
+  const body = pick(req.body, ['extension', 'direction', 'seconds', 'ring', 'answered', 'dialed_number', 'caller_number']);
+  const result = pbx.simulateCall(body);
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.json({
+    call: pbx.decorate(result.call),
+    ticket: result.ticket || null,
+    raw: result.raw,
+  });
+});
+
+// POST /api/pbx/parse — dry run: paste raw SMDR lines and see exactly what the
+// helpdesk would make of them. Nothing is stored. This is how a site tunes
+// PBX_* settings without flooding the call log.
+app.post('/api/pbx/parse', requireAgent, writeRateLimit, express.text({ type: ['text/plain', 'text/csv'], limit: '1mb' }), (req, res) => {
+  // Raw SMDR as text/plain (what the console sends), or `{ text }` / `{ lines }`
+  // / a single JSON record for scripts.
+  const body = typeof req.body === 'string'
+    ? req.body
+    : (req.body && typeof req.body === 'object'
+      ? (typeof req.body.text === 'string' ? req.body.text
+        : Array.isArray(req.body.lines) ? req.body.lines.join('\n')
+          : JSON.stringify(req.body))
+      : '');
+  if (!body.trim()) return res.status(400).json({ error: 'Paste at least one raw SMDR line.' });
+  const results = pbx.parsePreview(body);
+  res.json({
+    model: pbx.status().model,
+    itExtensions: pbx.pbxConfig.itExtensions,
+    ticketPolicy: pbx.pbxConfig.ticketPolicy,
+    parsed: results.filter((r) => r.ok).length,
+    skipped: results.filter((r) => !r.ok).length,
+    results,
+  });
+});
+
+// ---- Call records: read, annotate, link, raise a ticket -------------------
+const findScopedCall = (req, res) => {
+  const call = pbx.getCalls().find((c) => c.id === req.params.id);
+  if (!call) {
+    res.status(404).json({ error: 'Call not found' });
+    return null;
+  }
+  if (!pbx.canAccessCall(req.user, call)) {
+    res.status(403).json({ error: 'This call belongs to another agent\'s ticket. Ask a super admin to reassign it if you need access.' });
+    return null;
+  }
+  return call;
+};
+
+app.get('/api/pbx/calls/:id', requireAgent, (req, res) => {
+  const call = findScopedCall(req, res);
+  if (!call) return;
+  res.json(pbx.decorate(call));
+});
+
+// PATCH /api/pbx/calls/:id — notes, the caller's extension (to attribute the
+// ticket to the right employee), and the solved / not-solved state.
+app.patch('/api/pbx/calls/:id', requireAgent, writeRateLimit, (req, res) => {
+  const call = findScopedCall(req, res);
+  if (!call) return;
+  const body = pick(req.body, ['issue_resolved', 'notes', 'caller_extension', 'direction', 'duration_seconds', 'ticket_id']);
+
+  if (body.ticket_id !== undefined) {
+    const linked = pbx.linkTicket(call, body.ticket_id);
+    if (linked.error) return res.status(400).json({ error: linked.error });
+  }
+  if (body.issue_resolved !== undefined) {
+    const resolved = pbx.setCallResolved(call, body.issue_resolved, req.user.name);
+    if (resolved.error) return res.status(400).json({ error: resolved.error });
+  }
+  const rest = pick(body, ['notes', 'caller_extension', 'direction', 'duration_seconds']);
+  if (Object.keys(rest).length) {
+    const updated = pbx.updateCall(call, rest);
+    if (updated.error) return res.status(400).json({ error: updated.error });
+  }
+  res.json(pbx.decorate(call));
+});
+
+// POST /api/pbx/calls/:id/ticket — raise the ticket for a call (used when the
+// policy skipped it, or when the PBX record arrived before the extension was
+// mapped to an employee).
+app.post('/api/pbx/calls/:id/ticket', requireAgent, writeRateLimit, (req, res) => {
+  const call = findScopedCall(req, res);
+  if (!call) return;
+  const result = pbx.createTicketForCall(call, { force: true });
+  if (result.error) return res.status(400).json({ error: result.error });
+  notifyTicketChanged(result.ticket);
+  res.json({ call: pbx.decorate(result.call), ticket: result.ticket });
+});
+
+// ---- Extension directory (which extension belongs to whom) ----------------
+// Agents read it (the call log shows names); only a super admin edits it,
+// because it decides whose account a phone-raised ticket is filed under.
+app.get('/api/pbx/extensions', requireAgent, (req, res) => {
+  res.json(pbx.listDirectory());
+});
+
+app.post('/api/pbx/extensions', requireSuperAdmin, writeRateLimit, (req, res) => {
+  const body = pick(req.body, ['extension', 'user_id', 'name', 'department', 'note']);
+  const result = pbx.upsertDirectoryEntry(body);
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.status(201).json(pbx.listDirectory().find((e) => e.id === result.entry.id));
+});
+
+app.patch('/api/pbx/extensions/:id', requireSuperAdmin, writeRateLimit, (req, res) => {
+  const body = pick(req.body, ['extension', 'user_id', 'name', 'department', 'note']);
+  const result = pbx.upsertDirectoryEntry({ id: req.params.id, ...body });
+  if (result.error) return res.status(400).json({ error: result.error });
+  res.json(pbx.listDirectory().find((e) => e.id === result.entry.id));
+});
+
+app.delete('/api/pbx/extensions/:id', requireSuperAdmin, sensitiveRateLimit, (req, res) => {
+  const result = pbx.deleteDirectoryEntry(req.params.id);
+  if (result.error) return res.status(404).json({ error: result.error });
+  res.json({ success: true });
+});
+
+// ---- Call reports ---------------------------------------------------------
+app.get('/api/reports/calls', requireAgent, (req, res) => {
+  const range = pbx.parseRange(req.query);
+  if (range.error) return res.status(400).json({ error: range.error });
+  const report = pbx.buildCallReport(pbx.visibleCallsFor(req.user), { days: range.days, now: Date.now() });
+  report.scope = isSuperAdmin(req.user) ? 'all' : 'own';
+  report.range.label = rangeLabel(range.days);
+  res.json(report);
+});
+
+// CSV export: summary block, per-day and per-extension splits, then one row
+// per call — the same shape as the MTTR and asset exports.
+app.get('/api/reports/calls/export', requireAgent, (req, res) => {
+  const range = pbx.parseRange(req.query);
+  if (range.error) return res.status(400).json({ error: range.error });
+  const report = pbx.buildCallReport(pbx.visibleCallsFor(req.user), { days: range.days, now: Date.now() });
+  const s = report.summary;
+
+  const lines = [];
+  lines.push(csvRow(['PBX Call Report', rangeLabel(range.days)]));
+  lines.push(csvRow(['PBX', report.model]));
+  lines.push(csvRow(['Scope', isSuperAdmin(req.user) ? 'All calls' : 'My calls and unclaimed calls']));
+  lines.push(csvRow(['IT office extensions', report.itExtensions.join(' ') || 'not configured']));
+  lines.push(csvRow(['Ticket policy', report.ticketPolicy]));
+  lines.push(csvRow(['Generated', report.generatedAt]));
+  lines.push('');
+  lines.push(csvRow(['Metric', 'Value']));
+  lines.push(csvRow(['Calls logged', s.total]));
+  lines.push(csvRow(['Calls involving the IT office', s.helpdeskCalls]));
+  lines.push(csvRow(['Incoming', s.incoming]));
+  lines.push(csvRow(['Outgoing', s.outgoing]));
+  lines.push(csvRow(['Internal', s.internal]));
+  lines.push(csvRow(['Answered', s.answered]));
+  lines.push(csvRow(['Not answered', s.missed]));
+  lines.push(csvRow(['Total talk time (seconds)', s.totalTalkSeconds]));
+  lines.push(csvRow(['Average call duration (seconds)', fmtNum(s.avgDurationSeconds)]));
+  lines.push(csvRow(['Median call duration (seconds)', fmtNum(s.medianDurationSeconds)]));
+  lines.push(csvRow(['Calls with a ticket', s.ticketed]));
+  lines.push(csvRow(['Calls without a ticket', s.unticketed]));
+  lines.push(csvRow(['Issue solved', s.solved]));
+  lines.push(csvRow(['Issue not solved', s.unsolved]));
+  lines.push(csvRow(['Still pending', s.pending]));
+  lines.push(csvRow(['Solve rate (%)', fmtNum(s.solveRatePercent)]));
+  lines.push(csvRow(['Average phone-call-to-fix (minutes)', fmtNum(s.meanMinutesToSolve)]));
+  lines.push('');
+  lines.push(csvRow(['Calls per day', 'Calls', 'Solved', 'Not answered', 'Average duration (seconds)']));
+  report.byDay.forEach((d) => lines.push(csvRow([d.key, d.calls, d.solved, d.missed, fmtNum(d.avgDurationSeconds)])));
+  lines.push('');
+  lines.push(csvRow(['Extension', 'Name', 'Calls', 'Solved', 'Not solved', 'Average duration (seconds)']));
+  report.byExtension.forEach((e) => lines.push(csvRow([e.key, e.name, e.calls, e.solved, e.unsolved, fmtNum(e.avgDurationSeconds)])));
+  lines.push('');
+  lines.push(csvRow([
+    'Call ID', 'Call time', 'Day', 'Time', 'Direction', 'Extension', 'Caller', 'Target extension',
+    'Trunk', 'Dialed number', 'Caller number', 'Ring (s)', 'Duration (s)', 'Answered', 'Condition code',
+    'IT office call', 'Ticket ID', 'Ticket status', 'Issue solved', 'Resolved at', 'Minutes to solve', 'Notes', 'Raw record',
+  ]));
+  report.rows.forEach((r) => lines.push(csvRow([
+    r.id, r.call_at, r.call_day, r.call_time, r.direction, r.extension, r.caller_display_name || r.caller_name || '',
+    r.target_extension, r.trunk, r.dialed_number, r.caller_number,
+    fmtNum(r.ring_seconds), fmtNum(r.duration_seconds),
+    r.answered === true ? 'Yes' : r.answered === false ? 'No' : '',
+    r.condition_code, r.is_helpdesk_call ? 'Yes' : 'No', r.ticket_id, r.ticket_status,
+    r.resolution_outcome, r.resolved_at, fmtNum(r.resolution_minutes), r.notes, r.raw,
+  ])));
+
+  sendCsv(res, `call-report-${range.raw}-${exportDate()}.csv`, lines);
+});
+
 // 404 JSON handler for any unmatched /api route (#24).
 app.use('/api', (req, res) => {
   res.status(404).json({ error: `Unknown API endpoint: ${req.method} ${req.path}` });
@@ -1662,6 +2127,10 @@ const syncTicketRooms = (socket) => {
   if (!member) return;
   if (isSuperAdmin(member)) socket.join('role_super_admin');
   else socket.leave('role_super_admin');
+  // Everyone in the IT console joins the agent room: it carries queue-level
+  // notifications that are not tied to one ticket (a new call logged from the
+  // PBX), never ticket or call details.
+  socket.join('role_agent');
   // Reassignment moves a ticket between agents: re-derive the rooms from
   // scratch so nobody keeps receiving a queue that is no longer theirs.
   const allowed = new Set(visibleTicketsFor(member).map((t) => `ticket_${t.id}`));
@@ -1771,6 +2240,15 @@ process.on('unhandledRejection', (reason) => {
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
+  // Start reading call records only after the HTTP server is up, so a PBX that
+  // is slow to answer can never delay boot. No-op unless PBX_ENABLED=true.
+  const pbxState = pbx.start();
+  if (pbxState && pbxState.status !== 'disabled') {
+    console.log(`[PBX] SMDR transport: ${pbxState.status} — ${pbxState.detail}`);
+  }
+  if (pbx.pbxConfig.enabled && pbx.pbxConfig.allowSimulator) {
+    console.log('[PBX] Call simulator is available (Agent Console → Call Log → Simulate call).');
+  }
 });
 
 // A second `npm start` used to die with a raw EADDRINUSE stack trace, which

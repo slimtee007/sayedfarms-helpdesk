@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, Navigate, Link, useLocation } from 'react-router-dom';
 import { io } from 'socket.io-client';
-import { Activity, Plus, ShieldCheck, User, LogOut, Image as ImageIcon, X, Paperclip, Users, Ticket, UserPlus, Copy, Check, Trash2, Box, PackagePlus, ChevronRight, Search, Headphones, KeyRound, AlertCircle, Monitor, Laptop, FilePlus, ChevronDown, Filter, MessageSquare, Send, Timer, FileText, Download, Printer } from 'lucide-react';
+import { Activity, Plus, ShieldCheck, User, LogOut, Image as ImageIcon, X, Paperclip, Users, Ticket, UserPlus, Copy, Check, Trash2, Box, PackagePlus, ChevronRight, Search, Headphones, KeyRound, AlertCircle, Monitor, Laptop, FilePlus, ChevronDown, Filter, MessageSquare, Send, Timer, FileText, Download, Printer, Phone, PhoneCall, RefreshCw, ClipboardList, BarChart3 } from 'lucide-react';
 import ForgotPassword from './pages/ForgotPassword.jsx';
 
 // Same-origin by default: in dev, Vite proxies /api and /socket.io to the
@@ -205,6 +205,52 @@ const printKpis = (pairs) => `
 const printHeader = (title, metaLines) => `
   <h1>${escHtml(title)}</h1>
   <div class="meta">${metaLines.map(escHtml).join(' · ')}</div>`;
+
+// ---- PBX call log helpers -------------------------------------------------
+// Every IP-phone call the Panasonic PBX reports (SMDR) is stored as a call
+// record; the ones that rang in the IT office raise a ticket. These helpers
+// only format what the server already computed — the duration, the direction
+// and the solved / not-solved state all come from the API.
+
+const CALL_DIRECTION_STYLES = {
+  Incoming: 'bg-blue-50 text-blue-700 border-blue-200',
+  Outgoing: 'bg-amber-50 text-amber-700 border-amber-200',
+  Internal: 'bg-slate-100 text-slate-600 border-slate-200',
+};
+
+const CALL_OUTCOME_STYLES = {
+  Solved: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  'Not solved': 'bg-red-50 text-red-700 border-red-200',
+  Pending: 'bg-amber-50 text-amber-700 border-amber-200',
+};
+
+const CALL_OUTCOMES = ['Solved', 'Not solved', 'Pending'];
+
+// `2025-09-21` + `15:10:00` -> `21/09/2025 15:10` (the PBX's own wall clock).
+const callStamp = (call) => {
+  const [y, m, d] = String(call.call_day || '').split('-');
+  const time = String(call.call_time || '').slice(0, 5);
+  if (!y || !m || !d) return `${call.call_day || ''} ${time}`.trim();
+  return `${d}/${m}/${y} ${time}`;
+};
+
+const callDateLabel = (call) => {
+  const day = String(call.call_day || '');
+  const today = new Date();
+  const todayKey = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+  if (day === todayKey) return 'Today';
+  const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
+  const yKey = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`;
+  return day === yKey ? 'Yesterday' : day;
+};
+
+// A phone-raised ticket, marked wherever tickets are listed so an agent can
+// tell a call request from a portal one at a glance.
+const PhoneSourceBadge = () => (
+  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-200" title="Raised from an IP-phone call (Panasonic PBX)">
+    <Phone className="h-2.5 w-2.5" /> Phone
+  </span>
+);
 
 // Catches any render-time exception and shows a recoverable message instead of
 // unmounting the whole app into a blank page.
@@ -1232,7 +1278,10 @@ function CustomerPortal({ user, tickets, agentsList = [], enums = FALLBACK_ENUMS
                     tickets.map(t => (
                       <tr key={t.id} className="hover:bg-slate-50">
                         <td className="py-3">
-                          <div className="font-medium text-slate-800">{t.title}</div>
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-medium text-slate-800">{t.title}</span>
+                            {t.source === 'pbx_call' && <PhoneSourceBadge />}
+                          </div>
                           {/* MTTR: how long the resolution took (or how old the request still is). */}
                           {ticketElapsed(t) && (
                             <div className="text-[10px] text-slate-400 mt-0.5">{ticketElapsed(t)}</div>
@@ -2009,6 +2058,1006 @@ function AssetReports({ token }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// PBX call log — every IP-phone call the Panasonic PBX reported, and the
+// tickets the IT office calls raised.
+// ---------------------------------------------------------------------------
+
+/** Connection banner: is the PBX feed up, and what needs configuring? */
+function PbxStatusBar({ status, onRefresh, onSimulate, onParsePreview }) {
+  if (!status) return null;
+  const conn = status.connection || {};
+  const ok = conn.status === 'connected' || conn.status === 'listening';
+  const tone = ok ? 'border-emerald-200 bg-emerald-50' : conn.status === 'disabled' ? 'border-slate-200 bg-slate-50' : 'border-amber-200 bg-amber-50';
+  const dot = ok ? 'bg-emerald-500' : conn.status === 'disabled' ? 'bg-slate-400' : 'bg-amber-500';
+  const stats = status.stats || {};
+  return (
+    <div className={`mb-4 border rounded-md p-4 ${tone}`}>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex items-start gap-3">
+          <span className={`mt-1.5 w-2.5 h-2.5 rounded-full ${dot} ${ok ? 'animate-pulse' : ''}`} />
+          <div>
+            <div className="text-xs font-bold text-slate-900">
+              {status.model} — {ok ? 'connected' : conn.status === 'disabled' ? 'not connected' : conn.status}
+              <span className="ml-2 font-normal text-slate-500">{conn.detail}</span>
+            </div>
+            <div className="text-[11px] text-slate-600 mt-0.5">
+              IT office extensions: <span className="font-semibold">{status.itExtensions.length ? status.itExtensions.join(', ') : 'not set (PBX_IT_EXTENSIONS)'}</span>
+              {' · '}Tickets: <span className="font-semibold">{
+                status.ticketPolicy === 'all' ? 'every call'
+                  : status.ticketPolicy === 'answered' ? 'answered calls only'
+                    : status.ticketPolicy === 'missed' ? 'missed calls only'
+                      : 'off (log only)'
+              }</span>
+              {' · '}Calls logged: <span className="font-semibold">{stats.storedCalls ?? 0}</span>
+              {stats.lastRecordAt ? ` · last ${new Date(stats.lastRecordAt).toLocaleTimeString()}` : ''}
+            </div>
+            {(status.warnings || []).length > 0 && (
+              <ul className="mt-1.5 space-y-0.5">
+                {status.warnings.slice(0, 3).map((w, i) => (
+                  <li key={i} className="text-[11px] text-amber-800 flex items-start gap-1">
+                    <AlertCircle className="h-3 w-3 mt-0.5 shrink-0" /> {w}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          {status.allowSimulator && (
+            <button onClick={onSimulate} className="px-2.5 py-1.5 text-[11px] font-medium bg-white border border-slate-300 rounded text-slate-700 hover:bg-slate-100 transition" title="Push a realistic SMDR record through the real pipeline">
+              Simulate call
+            </button>
+          )}
+          <button onClick={onParsePreview} className="px-2.5 py-1.5 text-[11px] font-medium bg-white border border-slate-300 rounded text-slate-700 hover:bg-slate-100 transition" title="Paste a raw SMDR line and see how the helpdesk reads it">
+            Test a record
+          </button>
+          <button onClick={onRefresh} className="p-1.5 bg-white border border-slate-300 rounded text-slate-600 hover:bg-slate-100 transition" title="Refresh">
+            <RefreshCw className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Extension → person map. Agents read it; a super admin edits it. */
+function ExtensionDirectory({ token, superAdmin, directory, people, onChanged }) {
+  const [form, setForm] = useState({ extension: '', user_id: '', name: '', department: '' });
+  const [busy, setBusy] = useState(false);
+
+  const send = async (method, path, body) => {
+    setBusy(true);
+    const res = await fetch(`${API_URL}${path}`, {
+      method,
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json().catch(() => ({}));
+    setBusy(false);
+    if (!res.ok) {
+      alert(data.error || `Could not save the extension (HTTP ${res.status}).`);
+      return false;
+    }
+    onChanged();
+    return true;
+  };
+
+  return (
+    <div className="bg-white border border-slate-200 rounded-md shadow-sm p-4">
+      <div className="flex items-start justify-between gap-3 mb-3">
+        <div>
+          <h3 className="text-xs font-bold text-slate-900 flex items-center gap-1.5">
+            <ClipboardList className="h-3.5 w-3.5 text-[#0052CC]" /> Extension directory
+          </h3>
+          <p className="text-[11px] text-slate-500 mt-0.5">
+            Maps a PBX extension to the person who sits at it, so a phone-raised ticket is filed under their account
+            (they then see it in their own portal) instead of showing a bare number.
+          </p>
+        </div>
+      </div>
+
+      <div className="overflow-x-auto">
+        <table className="w-full text-left text-xs">
+          <thead className="bg-slate-50 border-y border-slate-200 text-slate-500 font-semibold uppercase">
+            <tr>
+              <th className="py-2 px-3">Extension</th>
+              <th className="py-2 px-3">Person</th>
+              <th className="py-2 px-3">Department</th>
+              {superAdmin && <th className="py-2 px-3 text-right">Actions</th>}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {directory.length === 0 && (
+              <tr><td colSpan={superAdmin ? 4 : 3} className="py-6 text-center text-slate-400">No extensions mapped yet.</td></tr>
+            )}
+            {directory.map((e) => (
+              <tr key={e.id} className="hover:bg-slate-50 transition">
+                <td className="py-2 px-3 font-mono font-semibold text-[#0052CC]">{e.extension}</td>
+                <td className="py-2 px-3">
+                  {superAdmin ? (
+                    <select
+                      value={e.user_id || ''}
+                      onChange={(ev) => send('PATCH', `/api/pbx/extensions/${e.id}`, { user_id: ev.target.value || null })}
+                      className="bg-white border border-slate-300 text-slate-700 rounded text-xs p-1 focus:outline-none focus:border-[#0052CC]"
+                    >
+                      <option value="">— not linked —</option>
+                      {people.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                    </select>
+                  ) : (
+                    <span className="text-slate-700">{e.user_name || e.name || <span className="text-slate-400">not linked</span>}</span>
+                  )}
+                </td>
+                <td className="py-2 px-3 text-slate-600">{e.department || '—'}</td>
+                {superAdmin && (
+                  <td className="py-2 px-3 text-right">
+                    <button
+                      onClick={() => { if (confirm(`Remove extension ${e.extension} from the directory?`)) send('DELETE', `/api/pbx/extensions/${e.id}`); }}
+                      className="p-1 text-slate-400 hover:text-red-600 transition"
+                      title="Remove"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  </td>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {superAdmin && (
+        <form
+          onSubmit={async (ev) => {
+            ev.preventDefault();
+            const done = await send('POST', '/api/pbx/extensions', {
+              extension: form.extension,
+              user_id: form.user_id || null,
+              name: form.name,
+              department: form.department,
+            });
+            if (done) setForm({ extension: '', user_id: '', name: '', department: '' });
+          }}
+          className="mt-3 flex flex-wrap items-end gap-2 border-t border-slate-100 pt-3"
+        >
+          <label className="text-[11px] text-slate-600">
+            Extension
+            <input value={form.extension} onChange={(e) => setForm({ ...form, extension: e.target.value })} placeholder="210" className="block mt-1 w-24 border border-slate-300 rounded p-1.5 text-xs focus:outline-none focus:border-[#0052CC]" />
+          </label>
+          <label className="text-[11px] text-slate-600">
+            Person
+            <select value={form.user_id} onChange={(e) => setForm({ ...form, user_id: e.target.value })} className="block mt-1 w-48 bg-white border border-slate-300 rounded p-1.5 text-xs focus:outline-none focus:border-[#0052CC]">
+              <option value="">— not linked —</option>
+              {people.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          </label>
+          <label className="text-[11px] text-slate-600">
+            Department
+            <input value={form.department} onChange={(e) => setForm({ ...form, department: e.target.value })} placeholder="Farm Ops" className="block mt-1 w-40 border border-slate-300 rounded p-1.5 text-xs focus:outline-none focus:border-[#0052CC]" />
+          </label>
+          <button type="submit" disabled={busy || !form.extension} className="px-3 py-1.5 bg-[#0052CC] hover:bg-blue-700 disabled:opacity-50 text-white text-xs font-medium rounded transition">
+            Map extension
+          </button>
+        </form>
+      )}
+    </div>
+  );
+}
+
+/** Log a call by hand — for sites where the SMDR feed is not wired yet. */
+function ManualCallModal({ token, itExtensions, directory, onClose, onLogged }) {
+  const now = new Date();
+  const localStamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}T${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  const [form, setForm] = useState({
+    extension: itExtensions[0] || '',
+    direction: 'Incoming',
+    call_at: localStamp,
+    minutes: 3,
+    seconds: 0,
+    notAnswered: false,
+    ring_seconds: 8,
+    caller_number: '',
+    dialed_number: '',
+    notes: '',
+  });
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    const duration_seconds = form.notAnswered ? 0 : (Number(form.minutes) || 0) * 60 + (Number(form.seconds) || 0);
+    const res = await fetch(`${API_URL}/api/pbx/calls/manual`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({
+        extension: form.extension,
+        direction: form.direction,
+        call_at: new Date(form.call_at).toISOString(),
+        duration_seconds,
+        ring_seconds: form.ring_seconds === '' ? null : Number(form.ring_seconds),
+        caller_number: form.caller_number,
+        dialed_number: form.dialed_number,
+        notes: form.notes,
+        answered: !form.notAnswered,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    setBusy(false);
+    if (!res.ok) return alert(data.error || `Could not log the call (HTTP ${res.status}).`);
+    onLogged(data);
+  };
+
+  return (
+    <div className="fixed inset-0 bg-slate-900/40 flex items-center justify-center p-4 z-50">
+      <form onSubmit={submit} className="bg-white rounded-lg shadow-xl border border-slate-200 w-full max-w-lg p-5 max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2"><PhoneCall className="h-4 w-4 text-[#0052CC]" /> Log a phone call</h3>
+          <button type="button" onClick={onClose} className="text-slate-400 hover:text-slate-600"><X className="h-4 w-4" /></button>
+        </div>
+        <p className="text-[11px] text-slate-500 mb-4">
+          Use this when the PBX feed is not connected yet, or when a call was missed while the server was down.
+          A ticket is raised for calls to the IT office, exactly as it would be from the SMDR feed.
+        </p>
+
+        <div className="grid grid-cols-2 gap-3">
+          <label className="text-[11px] text-slate-600">
+            Extension
+            <input
+              list="pbx-extension-options"
+              value={form.extension}
+              onChange={(e) => setForm({ ...form, extension: e.target.value })}
+              required
+              className="block mt-1 w-full border border-slate-300 rounded p-2 text-xs focus:outline-none focus:border-[#0052CC]"
+            />
+            <datalist id="pbx-extension-options">
+              {[...new Set([...itExtensions, ...directory.map((d) => d.extension)])].map((x) => <option key={x} value={x} />)}
+            </datalist>
+          </label>
+          <label className="text-[11px] text-slate-600">
+            Direction
+            <select value={form.direction} onChange={(e) => setForm({ ...form, direction: e.target.value })} className="block mt-1 w-full bg-white border border-slate-300 rounded p-2 text-xs focus:outline-none focus:border-[#0052CC]">
+              <option value="Incoming">Incoming (someone called the IT office)</option>
+              <option value="Internal">Internal (an employee extension called IT)</option>
+              <option value="Outgoing">Outgoing (IT called someone)</option>
+            </select>
+          </label>
+          <label className="text-[11px] text-slate-600">
+            Call time
+            <input type="datetime-local" value={form.call_at} onChange={(e) => setForm({ ...form, call_at: e.target.value })} className="block mt-1 w-full border border-slate-300 rounded p-2 text-xs focus:outline-none focus:border-[#0052CC]" />
+          </label>
+          <label className="text-[11px] text-slate-600 flex items-end gap-2">
+            <span className="flex-1">
+              Duration
+              <span className="mt-1 flex items-center gap-1">
+                <input type="number" min="0" max="1440" value={form.minutes} disabled={form.notAnswered} onChange={(e) => setForm({ ...form, minutes: e.target.value })} className="w-16 border border-slate-300 rounded p-2 text-xs disabled:bg-slate-100 focus:outline-none focus:border-[#0052CC]" />
+                <span className="text-slate-400">min</span>
+                <input type="number" min="0" max="59" value={form.seconds} disabled={form.notAnswered} onChange={(e) => setForm({ ...form, seconds: e.target.value })} className="w-14 border border-slate-300 rounded p-2 text-xs disabled:bg-slate-100 focus:outline-none focus:border-[#0052CC]" />
+                <span className="text-slate-400">sec</span>
+              </span>
+            </span>
+          </label>
+          <label className="text-[11px] text-slate-600 flex items-center gap-2 col-span-2">
+            <input type="checkbox" checked={form.notAnswered} onChange={(e) => setForm({ ...form, notAnswered: e.target.checked })} />
+            The call was not answered (the ticket asks for a call-back)
+          </label>
+          <label className="text-[11px] text-slate-600">
+            Ring time (seconds)
+            <input type="number" min="0" max="3600" value={form.ring_seconds} onChange={(e) => setForm({ ...form, ring_seconds: e.target.value })} className="block mt-1 w-full border border-slate-300 rounded p-2 text-xs focus:outline-none focus:border-[#0052CC]" />
+          </label>
+          <label className="text-[11px] text-slate-600">
+            Caller number (external)
+            <input value={form.caller_number} onChange={(e) => setForm({ ...form, caller_number: e.target.value })} placeholder="08035550123" className="block mt-1 w-full border border-slate-300 rounded p-2 text-xs focus:outline-none focus:border-[#0052CC]" />
+          </label>
+          <label className="text-[11px] text-slate-600 col-span-2">
+            What was the issue? (goes on the ticket)
+            <textarea value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} rows="3" placeholder="Printer in the accounts office is not printing." className="block mt-1 w-full border border-slate-300 rounded p-2 text-xs focus:outline-none focus:border-[#0052CC]" />
+          </label>
+        </div>
+
+        <div className="flex justify-end gap-2 mt-5">
+          <button type="button" onClick={onClose} className="px-3 py-2 text-xs font-medium text-slate-600 bg-slate-100 hover:bg-slate-200 rounded transition">Cancel</button>
+          <button type="submit" disabled={busy} className="px-4 py-2 text-xs font-medium text-white bg-[#0052CC] hover:bg-blue-700 disabled:opacity-50 rounded transition">
+            {busy ? 'Logging…' : 'Log call'}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+/** Dry-run a raw SMDR line against the parser — nothing is stored. */
+function ParsePreviewModal({ token, onClose }) {
+  const [text, setText] = useState('');
+  const [result, setResult] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const run = async () => {
+    setBusy(true);
+    const res = await fetch(`${API_URL}/api/pbx/parse`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain', Authorization: `Bearer ${token}` },
+      body: text,
+    });
+    const data = await res.json().catch(() => ({}));
+    setBusy(false);
+    if (!res.ok) return alert(data.error || `Could not parse that (HTTP ${res.status}).`);
+    setResult(data);
+  };
+
+  return (
+    <div className="fixed inset-0 bg-slate-900/40 flex items-center justify-center p-4 z-50">
+      <div className="bg-white rounded-lg shadow-xl border border-slate-200 w-full max-w-3xl p-5 max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2"><FileText className="h-4 w-4 text-[#0052CC]" /> Test a PBX record</h3>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X className="h-4 w-4" /></button>
+        </div>
+        <p className="text-[11px] text-slate-500 mb-3">
+          Paste one or more raw SMDR lines from the PBX (as they appear in the SMDR port or the maintenance console&apos;s test view).
+          Nothing is saved — this only shows what the helpdesk would read, and whether a ticket would be raised.
+        </p>
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          rows="5"
+          spellCheck="false"
+          placeholder={"21/09/25 14:32:10 204 01 +2348031234567 0'12 00:03'45 AN"}
+          className="w-full border border-slate-300 rounded p-2 text-xs font-mono focus:outline-none focus:border-[#0052CC]"
+        />
+        <div className="flex justify-end mt-2">
+          <button onClick={run} disabled={busy || !text.trim()} className="px-4 py-2 text-xs font-medium text-white bg-[#0052CC] hover:bg-blue-700 disabled:opacity-50 rounded transition">
+            {busy ? 'Reading…' : 'Read records'}
+          </button>
+        </div>
+
+        {result && (
+          <div className="mt-4 space-y-2">
+            <div className="text-[11px] text-slate-600">
+              {result.parsed} record(s) understood · {result.skipped} skipped · IT office extensions {result.itExtensions.join(', ') || 'not set'}
+            </div>
+            {result.results.map((r, i) => (
+              <div key={i} className={`border rounded p-2 text-[11px] ${r.ok ? 'border-slate-200 bg-slate-50' : 'border-red-200 bg-red-50'}`}>
+                <div className="font-mono text-[10px] text-slate-500 break-all mb-1">{r.raw}</div>
+                {r.ok ? (
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-1 text-slate-700">
+                    <div><span className="text-slate-400">When:</span> {r.record.call_day} {r.record.call_time}</div>
+                    <div><span className="text-slate-400">Direction:</span> {r.record.direction}</div>
+                    <div><span className="text-slate-400">Ext:</span> {r.record.extension || '—'}</div>
+                    <div><span className="text-slate-400">Trunk:</span> {r.record.trunk || '—'}</div>
+                    <div><span className="text-slate-400">Number:</span> {r.record.dialed_number || '—'}</div>
+                    <div><span className="text-slate-400">Ring:</span> {r.record.ring_display || '—'}</div>
+                    <div><span className="text-slate-400">Duration:</span> {r.record.duration_display}</div>
+                    <div><span className="text-slate-400">Answered:</span> {r.record.answered === true ? 'yes' : r.record.answered === false ? 'no' : 'unknown'}</div>
+                    <div className="col-span-2 sm:col-span-4">
+                      <span className="text-slate-400">Ticket:</span>{' '}
+                      {r.would_raise_ticket
+                        ? <span className="font-semibold text-emerald-700">would be raised</span>
+                        : <span className="text-slate-600">no ticket — {r.record.is_helpdesk_call ? 'the ticket policy or duration threshold filtered it out' : 'this call did not involve the IT office extensions'}</span>}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-red-700">Skipped: {r.reason === 'header' || r.reason === 'separator' ? 'header/separator line' : r.reason === 'unparsed' ? 'not recognised as an SMDR record' : r.reason}</div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Notes on a call — what was said on the phone. */
+function CallNotesModal({ token, call, onClose, onSaved }) {
+  const [notes, setNotes] = useState(call.notes || '');
+  const [busy, setBusy] = useState(false);
+  const save = async () => {
+    setBusy(true);
+    const res = await fetch(`${API_URL}/api/pbx/calls/${call.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ notes }),
+    });
+    const data = await res.json().catch(() => ({}));
+    setBusy(false);
+    if (!res.ok) return alert(data.error || `Could not save the notes (HTTP ${res.status}).`);
+    onSaved(data);
+  };
+  return (
+    <div className="fixed inset-0 bg-slate-900/40 flex items-center justify-center p-4 z-50">
+      <div className="bg-white rounded-lg shadow-xl border border-slate-200 w-full max-w-lg p-5">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-bold text-slate-900">Call notes — {callStamp(call)}</h3>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600"><X className="h-4 w-4" /></button>
+        </div>
+        <p className="text-[11px] text-slate-500 mb-2">{call.caller_label} · {call.duration_display} · {call.direction}</p>
+        <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows="5" placeholder="What the caller reported, what was done, follow-up needed…" className="w-full border border-slate-300 rounded p-2 text-xs focus:outline-none focus:border-[#0052CC]" />
+        <div className="flex justify-end gap-2 mt-3">
+          <button onClick={onClose} className="px-3 py-2 text-xs font-medium text-slate-600 bg-slate-100 hover:bg-slate-200 rounded transition">Cancel</button>
+          <button onClick={save} disabled={busy} className="px-4 py-2 text-xs font-medium text-white bg-[#0052CC] hover:bg-blue-700 disabled:opacity-50 rounded transition">
+            {busy ? 'Saving…' : 'Save notes'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The call log: every call the PBX reported, what happened on it, and the
+ * ticket it raised.
+ */
+function CallLog({ token, user, usersList = [], tickets = [], onOpenTicketChat }) {
+  const superAdmin = isSuperAdmin(user);
+  const [data, setData] = useState({ calls: [], total: 0, scope: 'own' });
+  const [status, setStatus] = useState(null);
+  const [directory, setDirectory] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [filters, setFilters] = useState({ days: '30', direction: '', outcome: '', ticket: '', extension: '', q: '' });
+  const [searchInput, setSearchInput] = useState('');
+  const [showManual, setShowManual] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
+  const [notesCall, setNotesCall] = useState(null);
+  const [showDirectory, setShowDirectory] = useState(false);
+  const [busyId, setBusyId] = useState(null);
+  const [notice, setNotice] = useState('');
+
+  const load = React.useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const params = new URLSearchParams({ days: filters.days });
+      if (filters.direction) params.set('direction', filters.direction);
+      if (filters.outcome) params.set('outcome', filters.outcome);
+      if (filters.ticket) params.set('ticket', filters.ticket);
+      if (filters.extension) params.set('extension', filters.extension);
+      if (filters.q) params.set('q', filters.q);
+      const [callsRes, statusRes, dirRes] = await Promise.all([
+        fetch(`${API_URL}/api/pbx/calls?${params.toString()}`, { headers: { Authorization: `Bearer ${token}` } }),
+        fetch(`${API_URL}/api/pbx/status`, { headers: { Authorization: `Bearer ${token}` } }),
+        fetch(`${API_URL}/api/pbx/extensions`, { headers: { Authorization: `Bearer ${token}` } }),
+      ]);
+      const callsData = await callsRes.json().catch(() => ({}));
+      if (!callsRes.ok) {
+        setError(callsData.error || `Could not load the call log (HTTP ${callsRes.status}).`);
+        setData({ calls: [], total: 0, scope: 'own' });
+      } else {
+        setData(callsData);
+      }
+      if (statusRes.ok) setStatus(await statusRes.json());
+      if (dirRes.ok) setDirectory(await dirRes.json());
+    } catch {
+      setError('Network error — could not reach the server.');
+    } finally {
+      setLoading(false);
+    }
+  }, [token, filters]);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Live: a new call lands, or a call's ticket changes state elsewhere.
+  useEffect(() => {
+    const handler = () => { load(); };
+    socket.on('pbx_call_changed', handler);
+    return () => { socket.off('pbx_call_changed', handler); };
+  }, [load]);
+
+  const patchCall = async (id, body) => {
+    setBusyId(id);
+    const res = await fetch(`${API_URL}/api/pbx/calls/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+    const updated = await res.json().catch(() => ({}));
+    setBusyId(null);
+    if (!res.ok) {
+      alert(updated.error || `Could not update this call (HTTP ${res.status}).`);
+      return;
+    }
+    setData((prev) => ({ ...prev, calls: prev.calls.map((c) => (c.id === id ? updated : c)) }));
+  };
+
+  const raiseTicket = async (call) => {
+    setBusyId(call.id);
+    const res = await fetch(`${API_URL}/api/pbx/calls/${call.id}/ticket`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const payload = await res.json().catch(() => ({}));
+    setBusyId(null);
+    if (!res.ok) return alert(payload.error || `Could not raise the ticket (HTTP ${res.status}).`);
+    setNotice(`Ticket raised for the call from ${call.caller_label}.`);
+    load();
+  };
+
+  const simulate = async () => {
+    const res = await fetch(`${API_URL}/api/pbx/calls/simulate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ direction: 'Incoming', seconds: 95, ring: 8 }),
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) return alert(payload.error || `Could not simulate a call (HTTP ${res.status}).`);
+    setNotice(`Simulated an SMDR record: "${payload.raw}"`);
+    load();
+  };
+
+  const calls = data.calls || [];
+  const kpi = {
+    total: calls.length,
+    helpdesk: calls.filter((c) => c.is_helpdesk_call).length,
+    incoming: calls.filter((c) => c.direction === 'Incoming').length,
+    missed: calls.filter((c) => c.answered === false).length,
+    ticketed: calls.filter((c) => c.ticket_id).length,
+    solved: calls.filter((c) => c.resolution_outcome === 'Solved').length,
+    notSolved: calls.filter((c) => c.resolution_outcome === 'Not solved').length,
+    pending: calls.filter((c) => c.resolution_outcome === 'Pending').length,
+    talkSeconds: calls.reduce((a, c) => a + (Number.isFinite(c.duration_seconds) ? c.duration_seconds : 0), 0),
+  };
+
+  return (
+    <div>
+      <PbxStatusBar status={status} onRefresh={load} onSimulate={simulate} onParsePreview={() => setShowPreview(true)} />
+
+      {notice && (
+        <div className="mb-3 px-3 py-2 bg-blue-50 border border-blue-200 rounded text-[11px] text-blue-800 flex items-start justify-between gap-3">
+          <span>{notice}</span>
+          <button onClick={() => setNotice('')} className="text-blue-500 hover:text-blue-800"><X className="h-3.5 w-3.5" /></button>
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3 mb-4">
+        {[
+          ['Calls in view', kpi.total],
+          ['To the IT office', kpi.helpdesk],
+          ['Incoming', kpi.incoming],
+          ['Not answered', kpi.missed],
+          ['Tickets raised', kpi.ticketed],
+          ['Talk time', formatDuration(Math.round(kpi.talkSeconds / 60))],
+        ].map(([label, value]) => (
+          <div key={label} className="bg-white border border-slate-200 rounded-md p-3 shadow-sm">
+            <div className="text-[10px] font-bold uppercase tracking-wide text-slate-400">{label}</div>
+            <div className="text-lg font-bold text-slate-900 mt-0.5">{value}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="bg-white border border-slate-200 rounded-md shadow-sm mb-4 p-3 flex flex-wrap items-center gap-2">
+        <select value={filters.days} onChange={(e) => setFilters({ ...filters, days: e.target.value })} className="bg-white border border-slate-300 text-slate-700 rounded text-xs p-1.5 focus:outline-none focus:border-[#0052CC]">
+          <option value="1">Today</option>
+          <option value="7">Last 7 days</option>
+          <option value="30">Last 30 days</option>
+          <option value="90">Last 90 days</option>
+          <option value="all">All time</option>
+        </select>
+        <select value={filters.direction} onChange={(e) => setFilters({ ...filters, direction: e.target.value })} className="bg-white border border-slate-300 text-slate-700 rounded text-xs p-1.5 focus:outline-none focus:border-[#0052CC]">
+          <option value="">All directions</option>
+          <option value="Incoming">Incoming</option>
+          <option value="Internal">Internal</option>
+          <option value="Outgoing">Outgoing</option>
+        </select>
+        <select value={filters.outcome} onChange={(e) => setFilters({ ...filters, outcome: e.target.value })} className="bg-white border border-slate-300 text-slate-700 rounded text-xs p-1.5 focus:outline-none focus:border-[#0052CC]">
+          <option value="">Any outcome</option>
+          <option value="Solved">Solved</option>
+          <option value="Not solved">Not solved</option>
+          <option value="Pending">Pending</option>
+        </select>
+        <select value={filters.ticket} onChange={(e) => setFilters({ ...filters, ticket: e.target.value })} className="bg-white border border-slate-300 text-slate-700 rounded text-xs p-1.5 focus:outline-none focus:border-[#0052CC]">
+          <option value="">With or without a ticket</option>
+          <option value="yes">Has a ticket</option>
+          <option value="no">No ticket yet</option>
+        </select>
+        <input
+          value={filters.extension}
+          onChange={(e) => setFilters({ ...filters, extension: e.target.value })}
+          placeholder="Extension"
+          className="w-24 border border-slate-300 rounded p-1.5 text-xs focus:outline-none focus:border-[#0052CC]"
+        />
+        <form onSubmit={(e) => { e.preventDefault(); setFilters({ ...filters, q: searchInput }); }} className="flex items-center gap-1">
+          <input
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.target.value)}
+            placeholder="Search caller, number, notes…"
+            className="w-52 border border-slate-300 rounded p-1.5 text-xs focus:outline-none focus:border-[#0052CC]"
+          />
+          <button type="submit" className="p-1.5 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded text-slate-600 transition" title="Search"><Search className="h-3.5 w-3.5" /></button>
+        </form>
+        <div className="flex-1" />
+        <button onClick={() => setShowDirectory((v) => !v)} className="px-2.5 py-1.5 text-[11px] font-medium bg-white border border-slate-300 rounded text-slate-700 hover:bg-slate-100 transition">
+          {showDirectory ? 'Hide' : 'Show'} extension directory
+        </button>
+        <button onClick={() => setShowManual(true)} className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium bg-[#0052CC] hover:bg-blue-700 text-white rounded transition">
+          <Plus className="h-3.5 w-3.5" /> Log a call
+        </button>
+      </div>
+
+      {showDirectory && (
+        <div className="mb-4">
+          <ExtensionDirectory
+            token={token}
+            superAdmin={superAdmin}
+            directory={directory}
+            people={superAdmin ? usersList : []}
+            onChanged={load}
+          />
+        </div>
+      )}
+
+      {error && <div className="mb-4 px-3 py-2 bg-red-50 border border-red-200 rounded text-xs text-red-700">{error}</div>}
+
+      <div className="bg-white border border-slate-200 rounded-md shadow-sm">
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs">
+            <thead className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold uppercase">
+              <tr>
+                <th className="py-3 px-4">When</th>
+                <th className="py-3 px-4">Caller</th>
+                <th className="py-3 px-4">Direction</th>
+                <th className="py-3 px-4">Ring</th>
+                <th className="py-3 px-4">Duration</th>
+                <th className="py-3 px-4">Ticket</th>
+                <th className="py-3 px-4">Issue solved?</th>
+                <th className="py-3 px-4 text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {loading && calls.length === 0 && (
+                <tr><td colSpan="8" className="py-8 text-center text-slate-400">Loading calls…</td></tr>
+              )}
+              {!loading && calls.length === 0 && (
+                <tr>
+                  <td colSpan="8" className="py-8 text-center text-slate-400">
+                    No calls in this view yet.
+                    {status && !status.enabled && ' Connect the PBX feed (PBX_ENABLED/PBX_TRANSPORT) or log calls by hand.'}
+                  </td>
+                </tr>
+              )}
+              {calls.map((call) => {
+                const linkedTicket = call.ticket_id ? tickets.find((t) => t.id === call.ticket_id) : null;
+                return (
+                  <tr key={call.id} className={`hover:bg-slate-50 transition ${busyId === call.id ? 'opacity-60' : ''}`}>
+                    <td className="py-3 px-4 whitespace-nowrap">
+                      <div className="font-semibold text-slate-800">{call.call_time ? call.call_time.slice(0, 5) : '—'}</div>
+                      <div className="text-slate-400 text-[10px]">{callDateLabel(call)}</div>
+                    </td>
+                    <td className="py-3 px-4">
+                      <div className="font-medium text-slate-800">{call.caller_label}</div>
+                      <div className="text-[10px] text-slate-400">
+                        {call.caller_display_name && call.caller_display_name !== call.caller_label ? `${call.caller_display_name} · ` : ''}
+                        Ext {call.extension || '—'}{call.trunk ? ` · CO ${call.trunk}` : ''}
+                        {call.answered === false ? ' · not answered' : ''}
+                      </div>
+                      {call.notes && <div className="text-[10px] text-slate-500 mt-0.5 line-clamp-1">Note: {call.notes}</div>}
+                      {call.mirrored_records > 1 && (
+                        <div className="text-[10px] text-slate-400">{call.mirrored_records} SMDR records merged</div>
+                      )}
+                    </td>
+                    <td className="py-3 px-4">
+                      <span className={`px-2 py-0.5 rounded border text-[10px] font-bold ${CALL_DIRECTION_STYLES[call.direction] || 'bg-slate-100 text-slate-600 border-slate-200'}`}>
+                        {call.direction}
+                      </span>
+                      {call.is_helpdesk_call && (
+                        <div className="text-[10px] text-[#0052CC] mt-0.5">IT office{call.it_extension ? ` · Ext ${call.it_extension}` : ''}</div>
+                      )}
+                    </td>
+                    <td className="py-3 px-4 text-slate-600">{call.ring_display || '—'}</td>
+                    <td className="py-3 px-4">
+                      <span className="font-medium text-slate-800">{call.answered === false ? '—' : call.duration_display}</span>
+                    </td>
+                    <td className="py-3 px-4">
+                      {call.ticket_id ? (
+                        linkedTicket ? (
+                          <button
+                            onClick={() => onOpenTicketChat && onOpenTicketChat(linkedTicket.id)}
+                            className="px-2 py-1 text-[11px] bg-blue-50 hover:bg-blue-100 text-[#0052CC] border border-blue-300 rounded font-medium transition"
+                            title={linkedTicket.title}
+                          >
+                            Open ticket
+                          </button>
+                        ) : (
+                          <span className="text-[11px] text-slate-500" title={call.ticket_title || ''}>
+                            {call.ticket_status || 'Ticket'}{call.ticket_assignee && call.ticket_assignee !== UNASSIGNED ? ` · ${call.ticket_assignee}` : ''}
+                          </span>
+                        )
+                      ) : (
+                        <button
+                          onClick={() => raiseTicket(call)}
+                          disabled={busyId === call.id}
+                          className="px-2 py-1 text-[11px] bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-300 rounded font-medium transition"
+                          title="Raise a helpdesk ticket for this call"
+                        >
+                          Raise ticket
+                        </button>
+                      )}
+                    </td>
+                    <td className="py-3 px-4">
+                      <select
+                        value={call.resolution_outcome}
+                        onChange={(e) => {
+                          const outcome = e.target.value;
+                          patchCall(call.id, { issue_resolved: outcome === 'Solved' ? true : outcome === 'Not solved' ? false : null });
+                        }}
+                        disabled={busyId === call.id}
+                        title="Was the issue raised on this call solved?"
+                        className={`rounded text-xs p-1 font-bold border focus:outline-none ${CALL_OUTCOME_STYLES[call.resolution_outcome] || 'bg-slate-50 text-slate-600 border-slate-300'}`}
+                      >
+                        {CALL_OUTCOMES.map((o) => <option key={o} value={o}>{o}</option>)}
+                      </select>
+                      {call.resolution_minutes != null && (
+                        <div className="text-[10px] text-slate-400 mt-0.5">Call → fix: {formatDuration(call.resolution_minutes)}</div>
+                      )}
+                      {call.resolved_by && <div className="text-[10px] text-slate-400">by {call.resolved_by}</div>}
+                    </td>
+                    <td className="py-3 px-4 text-right whitespace-nowrap">
+                      <button onClick={() => setNotesCall(call)} className="px-2 py-1 text-[11px] bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 rounded font-medium transition">
+                        Notes
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <div className="border-t border-slate-100 px-4 py-2 text-[10px] text-slate-400 flex flex-wrap items-center justify-between gap-2">
+          <span>
+            {data.total} call(s) · scope: {data.scope === 'all' ? 'every call' : 'your calls and unclaimed calls'}
+            {status ? ` · source: ${status.model} (${status.transport})` : ''}
+          </span>
+          <span>“Call → fix” is measured from the moment the phone rang to the ticket being resolved.</span>
+        </div>
+      </div>
+
+      {showManual && (
+        <ManualCallModal
+          token={token}
+          itExtensions={status ? status.itExtensions : []}
+          directory={directory}
+          onClose={() => setShowManual(false)}
+          onLogged={(payload) => {
+            setShowManual(false);
+            setNotice(payload.ticket
+              ? `Call logged and ticket ${payload.ticket.id} raised.`
+              : 'Call logged.');
+            load();
+          }}
+        />
+      )}
+      {showPreview && <ParsePreviewModal token={token} onClose={() => setShowPreview(false)} />}
+      {notesCall && (
+        <CallNotesModal
+          token={token}
+          call={notesCall}
+          onClose={() => setNotesCall(null)}
+          onSaved={(updated) => {
+            setNotesCall(null);
+            setData((prev) => ({ ...prev, calls: prev.calls.map((c) => (c.id === updated.id ? updated : c)) }));
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Call reporting: volume, durations, who phones, and what got fixed. */
+function CallReports({ token }) {
+  const [report, setReport] = useState(null);
+  const [days, setDays] = useState('30');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError('');
+      try {
+        const res = await fetch(`${API_URL}/api/reports/calls?days=${days}`, { headers: { Authorization: `Bearer ${token}` } });
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!res.ok) {
+          setReport(null);
+          setError(data.error || `Could not load the call report (HTTP ${res.status}).`);
+        } else {
+          setReport(data);
+        }
+      } catch {
+        if (!cancelled) {
+          setReport(null);
+          setError('Network error — could not reach the server.');
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [token, days]);
+
+  const summary = report && report.summary;
+  const maxHour = report ? Math.max(1, ...report.byHour.map((h) => h.calls)) : 1;
+
+  const handlePrint = () => {
+    if (!report) return;
+    let body = printHeader('PBX Call Report', [
+      `${report.model} · ${report.range.label}`,
+      `Scope: ${report.scope === 'all' ? 'all calls' : 'my calls and unclaimed calls'}`,
+      `IT office extensions: ${report.itExtensions.join(', ') || 'not configured'}`,
+      `Generated ${new Date(report.generatedAt).toLocaleString()}`,
+    ]);
+    body += printKpis([
+      ['Calls', String(summary.total)],
+      ['To the IT office', String(summary.helpdeskCalls)],
+      ['Answered', String(summary.answered)],
+      ['Not answered', String(summary.missed)],
+      ['With a ticket', String(summary.ticketed)],
+      ['Solved', String(summary.solved)],
+      ['Not solved', String(summary.unsolved)],
+      ['Pending', String(summary.pending)],
+    ]);
+    body += '<h2>Calls per day</h2>' + printTable(
+      ['Day', 'Calls', 'Solved', 'Not answered', 'Average duration (s)'],
+      report.byDay.map((d) => [d.key, d.calls, d.solved, d.missed, d.avgDurationSeconds == null ? '—' : d.avgDurationSeconds]),
+      [1, 2, 3, 4],
+    );
+    body += '<h2>By extension</h2>' + printTable(
+      ['Extension', 'Person', 'Calls', 'Solved', 'Not solved', 'Average duration (s)'],
+      report.byExtension.map((e) => [e.key, e.name || '—', e.calls, e.solved, e.unsolved, e.avgDurationSeconds == null ? '—' : e.avgDurationSeconds]),
+      [2, 3, 4, 5],
+    );
+    body += '<h2>Calls by hour</h2>' + printTable(
+      ['Hour', 'Calls'],
+      report.byHour.map((h) => [`${String(h.hour).padStart(2, '0')}:00`, h.calls]),
+      [1],
+    );
+    body += '<h2>Calls</h2>' + printTable(
+      ['When', 'Caller', 'Direction', 'Ring', 'Duration', 'Ticket', 'Solved'],
+      report.rows.map((r) => [`${r.call_day} ${r.call_time}`, r.caller_label, r.direction, r.ring_display || '—', r.duration_display, r.ticket_id ? 'yes' : 'no', r.resolution_outcome]),
+    );
+    openPrintableReport('PBX Call Report', body);
+  };
+
+  return (
+    <div>
+      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <div className="flex items-center gap-2">
+          <label className="text-[11px] text-slate-500">Range</label>
+          <select value={days} onChange={(e) => setDays(e.target.value)} className="bg-white border border-slate-300 text-slate-700 rounded text-xs p-1.5 focus:outline-none focus:border-[#0052CC]">
+            <option value="7">Last 7 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="365">Last 365 days</option>
+            <option value="all">All time</option>
+          </select>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => downloadCsv(token, `${API_URL}/api/reports/calls/export?days=${days}`, `call-report-${days}.csv`)}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-300 rounded text-xs font-medium text-slate-700 hover:bg-slate-100 transition"
+          >
+            <Download className="h-3.5 w-3.5" /> Export CSV
+          </button>
+          <button onClick={handlePrint} disabled={!report} className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-slate-300 rounded text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 transition">
+            <Printer className="h-3.5 w-3.5" /> Print
+          </button>
+        </div>
+      </div>
+
+      {loading && <div className="py-10 text-center text-slate-400 text-xs">Loading the call report…</div>}
+      {error && <div className="px-3 py-2 bg-red-50 border border-red-200 rounded text-xs text-red-700">{error}</div>}
+
+      {report && !loading && (
+        <div className="space-y-4">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            {[
+              ['Calls logged', summary.total, `${summary.helpdeskCalls} involved the IT office`],
+              ['Answered', summary.answered, `${summary.missed} not answered`],
+              ['Average call', summary.avgDurationSeconds == null ? '—' : formatDuration(summary.avgDurationSeconds / 60), `median ${summary.medianDurationSeconds == null ? '—' : formatDuration(summary.medianDurationSeconds / 60)}`],
+              ['Total talk time', formatDuration(Math.round(summary.totalTalkSeconds / 60)), 'time on the phone'],
+              ['Calls with a ticket', summary.ticketed, `${summary.unticketed} without`],
+              ['Issue solved', summary.solved, `${summary.pending} pending · ${summary.unsolved} not solved`],
+              ['Solve rate', summary.solveRatePercent == null ? '—' : `${summary.solveRatePercent}%`, 'of calls in range'],
+              ['Call → fix (average)', summary.meanMinutesToSolve == null ? '—' : formatDuration(summary.meanMinutesToSolve), `median ${summary.medianMinutesToSolve == null ? '—' : formatDuration(summary.medianMinutesToSolve)}`],
+            ].map(([label, value, sub]) => (
+              <div key={label} className="bg-white border border-slate-200 rounded-md p-4 shadow-sm">
+                <div className="text-[10px] font-bold uppercase tracking-wide text-slate-400">{label}</div>
+                <div className="text-xl font-bold text-slate-900 mt-1">{value}</div>
+                <div className="text-[10px] text-slate-500 mt-0.5">{sub}</div>
+              </div>
+            ))}
+          </div>
+
+          <div className="bg-white border border-slate-200 rounded-md shadow-sm p-4">
+            <h3 className="text-xs font-bold text-slate-900 mb-3">When the phone rings</h3>
+            <div className="flex items-end gap-1 h-24">
+              {report.byHour.map((h) => (
+                <div key={h.hour} className="flex-1 flex flex-col items-center justify-end h-full" title={`${String(h.hour).padStart(2, '0')}:00 — ${h.calls} call(s)`}>
+                  <div className="w-full bg-[#0052CC]/80 rounded-t" style={{ height: `${Math.round((h.calls / maxHour) * 100)}%`, minHeight: h.calls ? 3 : 1 }} />
+                  <span className="text-[9px] text-slate-400 mt-1">{String(h.hour).padStart(2, '0')}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="bg-white border border-slate-200 rounded-md shadow-sm p-4">
+              <h3 className="text-xs font-bold text-slate-900 mb-3">By extension</h3>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="text-slate-500 font-semibold uppercase border-b border-slate-200">
+                    <tr>
+                      <th className="py-2">Extension</th>
+                      <th className="py-2">Person</th>
+                      <th className="py-2 text-right">Calls</th>
+                      <th className="py-2 text-right">Solved</th>
+                      <th className="py-2 text-right">Not solved</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {report.byExtension.length === 0 && <tr><td colSpan="5" className="py-4 text-center text-slate-400">No calls in this range.</td></tr>}
+                    {report.byExtension.map((e) => (
+                      <tr key={e.key}>
+                        <td className="py-2 font-mono text-[#0052CC]">{e.key}</td>
+                        <td className="py-2 text-slate-600">{e.name || '—'}</td>
+                        <td className="py-2 text-right font-medium">{e.calls}</td>
+                        <td className="py-2 text-right text-emerald-700">{e.solved}</td>
+                        <td className="py-2 text-right text-red-600">{e.unsolved}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="bg-white border border-slate-200 rounded-md shadow-sm p-4">
+              <h3 className="text-xs font-bold text-slate-900 mb-3">Call volume per day</h3>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="text-slate-500 font-semibold uppercase border-b border-slate-200">
+                    <tr>
+                      <th className="py-2">Day</th>
+                      <th className="py-2 text-right">Calls</th>
+                      <th className="py-2 text-right">Solved</th>
+                      <th className="py-2 text-right">Not answered</th>
+                      <th className="py-2 text-right">Avg duration</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {report.byDay.length === 0 && <tr><td colSpan="5" className="py-4 text-center text-slate-400">No calls in this range.</td></tr>}
+                    {report.byDay.slice(-14).map((d) => (
+                      <tr key={d.key}>
+                        <td className="py-2 text-slate-600">{d.key}</td>
+                        <td className="py-2 text-right font-medium">{d.calls}</td>
+                        <td className="py-2 text-right text-emerald-700">{d.solved}</td>
+                        <td className="py-2 text-right text-amber-700">{d.missed}</td>
+                        <td className="py-2 text-right text-slate-500">{d.avgDurationSeconds == null ? '—' : formatDuration(d.avgDurationSeconds / 60)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-white border border-slate-200 rounded-md shadow-sm p-4">
+            <h3 className="text-xs font-bold text-slate-900 mb-3">Outcome</h3>
+            <div className="flex flex-wrap gap-3">
+              {report.byOutcome.map((o) => (
+                <div key={o.key} className={`px-3 py-2 border rounded text-xs ${CALL_OUTCOME_STYLES[o.key] || 'bg-slate-50 border-slate-200 text-slate-600'}`}>
+                  <span className="font-bold">{o.calls}</span> {o.key.toLowerCase()}
+                </div>
+              ))}
+              <div className="px-3 py-2 border rounded text-xs bg-slate-50 border-slate-200 text-slate-600" title="One intercom call is printed twice by Panasonic (once per extension) and merged into a single call here">
+                <span className="font-bold">{summary.mirroredIntercomRecords}</span> duplicate intercom record(s) merged
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBACK_ENUMS, peopleList = [], fetchTickets, fetchUsers, fetchInventory, handleLogout, token, onChatTicketChange }) {
   const superAdmin = isSuperAdmin(user);
   // Who can be picked in the asset-assignment dropdowns: super admins have the
@@ -2022,6 +3071,10 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
   // Without this declaration the console threw `chatTicketId is not defined`
   // on every render and the whole Agent Console was a blank page.
   const [chatTicketId, setChatTicketId] = useState(null);
+  // Sidebar badge: calls in the last 30 days whose issue is still pending —
+  // the IT office's "somebody phoned and it is not closed yet" count. Kept
+  // light (one small request) and refreshed live when a call lands.
+  const [pendingCallCount, setPendingCallCount] = useState(0);
   // Id of the ticket whose per-ticket chat thread is open (null = closed).
   // Mirror it up to MainRouter so the live-refresh handler can skip a full
   // refetch while a thread is open (#36).
@@ -2053,9 +3106,12 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
   const emptyShelfCount = restockAlerts.filter((a) => a.stock_state === 'Out of Stock').length;
 
   const location = useLocation();
-  // Order matters: /agent/asset-reports also contains "reports".
+  // Order matters: /agent/asset-reports also contains "reports", and
+  // /agent/call-reports contains "reports" too.
   const currentTab = location.pathname.includes('asset-reports') ? 'asset-reports'
+    : location.pathname.includes('call-reports') ? 'call-reports'
     : location.pathname.includes('reports') ? 'reports'
+    : location.pathname.includes('calls') ? 'calls'
     : location.pathname.includes('inventory') ? 'inventory'
     : location.pathname.includes('users') ? 'users'
     : 'tickets';
@@ -2070,6 +3126,31 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
     socket.on('receive_message', handler);
     return () => { socket.off('receive_message', handler); };
   }, []);
+
+  // PBX badge: how many logged calls still have an open issue. Refreshed when
+  // the server reports a new call (payload carries ids only, no call data).
+  useEffect(() => {
+    let cancelled = false;
+    const fetchPendingCalls = async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/pbx/calls?days=30&outcome=Pending`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled) setPendingCallCount(Array.isArray(data.calls) ? data.calls.length : 0);
+      } catch {
+        /* the badge is not worth an error dialog */
+      }
+    };
+    fetchPendingCalls();
+    const handler = () => { fetchPendingCalls(); };
+    socket.on('pbx_call_changed', handler);
+    return () => {
+      cancelled = true;
+      socket.off('pbx_call_changed', handler);
+    };
+  }, [token, tickets]);
 
   useEffect(() => {
     if (isChatOpen) {
@@ -2274,6 +3355,17 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
               <Link to="/agent/tickets" className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition ${currentTab === 'tickets' ? 'bg-blue-50 text-[#0052CC] font-semibold border-l-2 border-[#0052CC]' : 'text-slate-600 hover:bg-slate-100'}`}>
                 <Ticket className="h-4 w-4" /> Queues & Tickets
               </Link>
+              <Link to="/agent/calls" className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition ${currentTab === 'calls' ? 'bg-blue-50 text-[#0052CC] font-semibold border-l-2 border-[#0052CC]' : 'text-slate-600 hover:bg-slate-100'}`} title="IP-phone calls logged from the Panasonic PBX, and the tickets they raised">
+                <Phone className="h-4 w-4" /> Call Log
+                {pendingCallCount > 0 && (
+                  <span className="ml-auto px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[10px] font-bold" title={`${pendingCallCount} call(s) with an open issue`}>
+                    {pendingCallCount}
+                  </span>
+                )}
+              </Link>
+              <Link to="/agent/call-reports" className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition ${currentTab === 'call-reports' ? 'bg-blue-50 text-[#0052CC] font-semibold border-l-2 border-[#0052CC]' : 'text-slate-600 hover:bg-slate-100'}`} title="Call volume, durations and how many phone-raised issues got solved">
+                <BarChart3 className="h-4 w-4" /> Call Reports
+              </Link>
               <Link to="/agent/reports" className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition ${currentTab === 'reports' ? 'bg-blue-50 text-[#0052CC] font-semibold border-l-2 border-[#0052CC]' : 'text-slate-600 hover:bg-slate-100'}`} title="Mean time to resolution and first-reply metrics">
                 <Timer className="h-4 w-4" /> MTTR Reports
               </Link>
@@ -2302,6 +3394,8 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
             <div>
               <h1 className="text-xl font-bold text-slate-900">
                 {currentTab === 'tickets' ? (superAdmin ? 'Service Desk Queues' : 'My Assigned Tickets')
+                  : currentTab === 'calls' ? 'PBX Call Log'
+                  : currentTab === 'call-reports' ? 'PBX Call Report'
                   : currentTab === 'reports' ? 'Resolution Time (MTTR)'
                   : currentTab === 'asset-reports' ? 'Asset Stock Report'
                   : currentTab === 'inventory' ? 'Asset Inventory' : 'User Directory'}
@@ -2311,6 +3405,10 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
                   ? (superAdmin
                     ? 'Every request across the helpdesk — dispatch, reassign, and resolve.'
                     : 'The requests assigned to you. A super admin dispatches work to this queue.')
+                  : currentTab === 'calls'
+                    ? 'Every IP-phone call the Panasonic PBX reported: when it came in, how long it lasted, whether it was answered — and the ticket it raised.'
+                  : currentTab === 'call-reports'
+                    ? 'Call volume, talk time, who phones the IT office, and how many of those issues were solved.'
                   : currentTab === 'reports'
                     ? (superAdmin
                       ? 'How quickly requests are resolved across the helpdesk — mean, median, and trends.'
@@ -2330,7 +3428,26 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
                 <PackagePlus className="h-4 w-4" /> Add IT Asset
               </button>
             )}
+            {currentTab === 'calls' && (
+              <Link to="/agent/call-reports" className="flex items-center gap-2 bg-white border border-slate-300 hover:bg-slate-100 text-slate-700 px-3.5 py-2 rounded text-xs font-medium transition shadow-sm">
+                <BarChart3 className="h-4 w-4" /> Call reports
+              </Link>
+            )}
           </header>
+
+          {currentTab === 'calls' && (
+            <CallLog
+              token={token}
+              user={user}
+              usersList={usersList}
+              tickets={tickets}
+              onOpenTicketChat={openTicketChat}
+            />
+          )}
+
+          {currentTab === 'call-reports' && (
+            <CallReports token={token} />
+          )}
 
           {currentTab === 'reports' && (
             <MttrReports token={token} />
@@ -2364,7 +3481,10 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
                       tickets.map((t) => (
                         <tr key={t.id} className="hover:bg-slate-50 transition">
                           <td className="py-3.5 px-4">
-                            <div className="font-semibold text-blue-600 hover:underline cursor-pointer">{t.title}</div>
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-semibold text-blue-600 hover:underline cursor-pointer">{t.title}</span>
+                              {t.source === 'pbx_call' && <PhoneSourceBadge />}
+                            </div>
                             <div className="text-slate-500 text-[11px] line-clamp-1">{t.description}</div>
                             <div className="text-slate-400 text-[10px] mt-0.5">Reporter: <span className="font-medium text-slate-600">{t.created_by_name}</span></div>
                             {/* MTTR: resolved-in time once done, running age while active,
