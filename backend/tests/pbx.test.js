@@ -146,17 +146,32 @@ test('SMDR parser: duration formats, and JSON/delimited payloads from middleware
 // API harness (same shape as api.test.js: a real server on a scratch store)
 // ---------------------------------------------------------------------------
 
-const freePort = () =>
-  new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.on('error', reject);
-    srv.listen(0, '127.0.0.1', () => {
-      const { port } = srv.address();
-      srv.close(() => resolve(port));
+/**
+ * A free port for this test file's servers.
+ *
+ * `node --test` runs the two test files in parallel, so a port handed out by
+ * the OS for one file can be handed to the other before the first one binds it
+ * (their servers then die with EADDRINUSE). Ports are therefore drawn from a
+ * private range, and each candidate is probe-bound before it is handed over.
+ */
+const freePort = () => {
+  const probe = () =>
+    new Promise((resolve, reject) => {
+      const srv = net.createServer();
+      srv.on('error', reject);
+      const port = 24000 + Math.floor(Math.random() * 8000);
+      srv.listen(port, '127.0.0.1', () => {
+        srv.close(() => resolve(port));
+      });
     });
+  const attempt = (n) => probe().catch((err) => {
+    if (n <= 0) throw err;
+    return attempt(n - 1);
   });
+  return attempt(20);
+};
 
-const startServer = async (dataFile, port, extraEnv = {}) => {
+const spawnServer = async (dataFile, port, extraEnv = {}) => {
   const proc = spawn(process.execPath, [SERVER], {
     env: {
       ...process.env,
@@ -202,6 +217,21 @@ const startServer = async (dataFile, port, extraEnv = {}) => {
         proc.kill('SIGKILL');
       }),
   };
+};
+
+/** Boot a server, retrying on another port if that port was taken meanwhile. */
+const startServer = async (dataFile, port, extraEnv = {}) => {
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const usePort = attempt === 0 ? port : await freePort();
+    try {
+      return await spawnServer(dataFile, usePort, extraEnv);
+    } catch (err) {
+      lastError = err;
+      if (!/EADDRINUSE|address already in use/i.test(String((err && err.message) || err))) throw err;
+    }
+  }
+  throw lastError;
 };
 
 const api = (base) => {
@@ -865,16 +895,24 @@ test('PBX_TRANSPORT=tcp-server: records the PBX (or a serial-to-IP gateway) push
     socket.write(`${line.slice(0, 20)}`);
     await new Promise((r) => setTimeout(r, 120));
     socket.write(`${line.slice(20)}\r\n${smdr('310', '08037770002', { ring: "0'04", duration: "0'00'20" })}\r\n`);
-    await new Promise((r) => setTimeout(r, 400));
+
+    // Wait for both records to land rather than trusting a fixed delay — a CI
+    // runner is slower than a laptop.
+    let status = null;
+    let calls = [];
+    const deadline = Date.now() + 10000;
+    for (;;) {
+      status = (await c.get('/api/pbx/status', { token: adminSession.token })).body;
+      calls = (await c.get('/api/pbx/calls?days=all', { token: adminSession.token })).body.calls;
+      if (calls.length >= 2 || Date.now() > deadline) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
     socket.end();
 
-    const status = (await c.get('/api/pbx/status', { token: adminSession.token })).body;
     assert.equal(status.transport, 'tcp-server');
     assert.equal(status.connection.status, 'connected');
     assert.ok(status.stats.recordsReceived >= 2, `records received: ${status.stats.recordsReceived}`);
     assert.equal(status.stats.linesReceived, undefined, 'line counters live under connection');
-
-    const calls = (await c.get('/api/pbx/calls?days=all', { token: adminSession.token })).body.calls;
     assert.equal(calls.length, 2, `expected two calls, got ${JSON.stringify(calls.map((x) => x.extension))}`);
     const itCall = calls.find((x) => x.extension === '204');
     assert.equal(itCall.caller_number, '08037770001');
@@ -924,7 +962,7 @@ test('PBX_TRANSPORT=tcp-client: we connect to the PBX SMDR port, authenticate an
 
     // Wait for the record to arrive over the socket.
     let call = null;
-    const deadline = Date.now() + 8000;
+    const deadline = Date.now() + 15000;
     while (!call && Date.now() < deadline) {
       const calls = (await c.get('/api/pbx/calls?days=all', { token: adminSession.token })).body.calls;
       call = calls.find((x) => x.extension === '204');
