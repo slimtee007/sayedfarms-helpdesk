@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, Navigate, Link, useLocation } from 'react-router-dom';
 import { io } from 'socket.io-client';
-import { Activity, Plus, ShieldCheck, User, LogOut, Image as ImageIcon, X, Paperclip, Users, Ticket, UserPlus, Copy, Check, Trash2, Box, PackagePlus, ChevronRight, Search, Headphones, KeyRound, AlertCircle, Monitor, Laptop, FilePlus, ChevronDown, Filter, MessageSquare, Send } from 'lucide-react';
+import { Activity, Plus, ShieldCheck, User, LogOut, Image as ImageIcon, X, Paperclip, Users, Ticket, UserPlus, Copy, Check, Trash2, Box, PackagePlus, ChevronRight, Search, Headphones, KeyRound, AlertCircle, Monitor, Laptop, FilePlus, ChevronDown, Filter, MessageSquare, Send, Timer } from 'lucide-react';
 import ForgotPassword from './pages/ForgotPassword.jsx';
 
 // Same-origin by default: in dev, Vite proxies /api and /socket.io to the
@@ -66,6 +66,39 @@ const isSuperAdmin = (user) => Boolean(user && user.role === 'agent' && user.sup
 const assigneePayload = (value) => {
   if (!value || value === UNASSIGNED || value === LEGACY_ASSIGNEE) return { assigned_to_id: null };
   return { assigned_to_id: value };
+};
+
+// ---- MTTR (mean time to resolution) display helpers -----------------------
+// `resolution_minutes` is stamped server-side when a ticket is resolved
+// (resolved_at − created_at). Formatting is shared by the ticket tables and
+// the MTTR report.
+const formatDuration = (minutes) => {
+  if (minutes == null || !Number.isFinite(Number(minutes))) return '—';
+  const m = Math.max(0, Math.round(Number(minutes)));
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  if (h < 24) return rem ? `${h}h ${rem}m` : `${h}h`;
+  const d = Math.floor(h / 24);
+  const rh = h % 24;
+  return rh ? `${d}d ${rh}h` : `${d}d`;
+};
+
+// A one-line timing summary for a ticket row: how long resolution took, or how
+// old the request still is while it is being worked.
+const ticketElapsed = (t) => {
+  if (t.resolution_minutes != null) return `Resolved in ${formatDuration(t.resolution_minutes)}`;
+  if (t.status === 'Cancelled') return null;
+  const created = Date.parse(t.created_at);
+  if (!Number.isFinite(created)) return null;
+  return `Age ${formatDuration((Date.now() - created) / 60000)}`;
+};
+
+// Report bucket keys come back as YYYY-MM-DD (day), YYYY-MM-DD week starts
+// (week) or YYYY-MM (month).
+const bucketLabel = (bucket) => {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(bucket)) return bucket.slice(5).replace('-', '/');
+  return bucket;
 };
 
 // Catches any render-time exception and shows a recoverable message instead of
@@ -1093,7 +1126,13 @@ function CustomerPortal({ user, tickets, agentsList = [], enums = FALLBACK_ENUMS
                   ) : (
                     tickets.map(t => (
                       <tr key={t.id} className="hover:bg-slate-50">
-                        <td className="py-3 font-medium text-slate-800">{t.title}</td>
+                        <td className="py-3">
+                          <div className="font-medium text-slate-800">{t.title}</div>
+                          {/* MTTR: how long the resolution took (or how old the request still is). */}
+                          {ticketElapsed(t) && (
+                            <div className="text-[10px] text-slate-400 mt-0.5">{ticketElapsed(t)}</div>
+                          )}
+                        </td>
                         <td className="py-3 text-slate-500">{t.category}</td>
                         <td className="py-3 text-slate-600 font-medium">{t.assigned_to}</td>
                         <td className="py-3">
@@ -1253,6 +1292,266 @@ function CustomerPortal({ user, tickets, agentsList = [], enums = FALLBACK_ENUMS
   );
 }
 
+/**
+ * MTTR (mean time to resolution) report — the agent-facing analytics screen.
+ *
+ * Feeds on GET /api/reports/mttr: the server aggregates the per-ticket
+ * lifecycle stamps (created_at → resolved_at) and scopes the numbers to the
+ * caller — a super admin sees the whole helpdesk, a regular agent the tickets
+ * assigned to them. Charts are hand-rolled SVG, so there is no charting
+ * dependency to ship or audit.
+ */
+function MttrReports({ token }) {
+  const RANGES = [
+    { value: '7', label: '7 days' },
+    { value: '30', label: '30 days' },
+    { value: '90', label: '90 days' },
+    { value: '365', label: '12 months' },
+    { value: 'all', label: 'All time' },
+  ];
+  const [days, setDays] = useState('30');
+  const [report, setReport] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError('');
+      try {
+        const res = await fetch(`${API_URL}/api/reports/mttr?days=${days}`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!res.ok) {
+          setReport(null);
+          setError(data.error || `Could not load the MTTR report (HTTP ${res.status}).`);
+        } else {
+          setReport(data);
+        }
+      } catch {
+        if (!cancelled) {
+          setReport(null);
+          setError('Network error — could not reach the server.');
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [days, token]);
+
+  const s = report && report.summary;
+
+  const kpi = (label, value, hint) => (
+    <div className="bg-white border border-slate-200 rounded-md p-3.5 shadow-sm">
+      <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">{label}</div>
+      <div className="text-lg font-bold text-slate-900 mt-1">{value}</div>
+      {hint ? <div className="text-[10px] text-slate-400 mt-0.5">{hint}</div> : null}
+    </div>
+  );
+
+  return (
+    <div className="space-y-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-xs text-slate-500 max-w-xl">
+          Mean time to resolution (MTTR) measures how long resolved tickets take from creation
+          to resolution — including any time spent reopened. Cancelled and not-yet-resolved
+          tickets are excluded. {report && report.scope === 'own' ? 'These numbers cover the tickets assigned to you.' : 'These numbers cover the whole helpdesk.'}
+        </p>
+        <div className="flex items-center gap-1 bg-white border border-slate-200 rounded-md p-1 shadow-sm">
+          {RANGES.map((r) => (
+            <button
+              key={r.value}
+              onClick={() => setDays(r.value)}
+              className={`px-2.5 py-1 rounded text-[11px] font-medium transition ${days === r.value ? 'bg-[#0052CC] text-white' : 'text-slate-600 hover:bg-slate-100'}`}
+            >
+              {r.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {loading && (
+        <div className="bg-white border border-slate-200 rounded-md p-10 text-center text-xs text-slate-400 shadow-sm">
+          Loading resolution-time metrics…
+        </div>
+      )}
+      {!loading && error && (
+        <div className="bg-red-50 border border-red-200 rounded-md p-4 text-xs text-red-700">
+          {error}
+        </div>
+      )}
+
+      {!loading && !error && report && s && (
+        <>
+          {s.count === 0 ? (
+            <div className="bg-white border border-slate-200 rounded-md p-10 text-center shadow-sm">
+              <Timer className="h-6 w-6 text-slate-300 mx-auto mb-2" />
+              <p className="text-xs text-slate-500">No tickets were resolved in this period.</p>
+              <p className="text-[11px] text-slate-400 mt-1">Resolve a ticket (or widen the range) and its resolution time will show up here.</p>
+            </div>
+          ) : (
+            <>
+              <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
+                {kpi('MTTR', formatDuration(s.meanMinutes), 'mean time to resolve')}
+                {kpi('Median', formatDuration(s.medianMinutes), 'middle of the pack')}
+                {kpi('Fastest', formatDuration(s.minMinutes), 'quickest resolution')}
+                {kpi('Slowest', formatDuration(s.maxMinutes), 'longest resolution')}
+                {kpi('Resolved', String(s.count), s.reopenedCount > 0 ? `${s.reopenedCount} reopen${s.reopenedCount === 1 ? '' : 's'} along the way` : 'in this period')}
+                {kpi('First reply', s.meanFirstResponseMinutes == null ? '—' : formatDuration(s.meanFirstResponseMinutes), `avg · ${s.firstResponseCount} ticket${s.firstResponseCount === 1 ? '' : 's'}`)}
+              </div>
+
+              <div className="bg-white border border-slate-200 rounded-md p-4 shadow-sm">
+                <h3 className="text-sm font-bold text-slate-800 mb-1">MTTR trend</h3>
+                <p className="text-[11px] text-slate-400 mb-3">Mean time to resolve per {report.bucket}. Hover a bar for the count behind it.</p>
+                <MttrTrendChart trend={report.trend} />
+              </div>
+
+              <div className="grid md:grid-cols-2 gap-4">
+                <MttrBreakdown title="By category" rows={report.byCategory} />
+                <MttrBreakdown title="By priority" rows={report.byPriority} />
+              </div>
+
+              {Array.isArray(report.byAgent) && report.byAgent.length > 0 && (
+                <div className="bg-white border border-slate-200 rounded-md p-4 shadow-sm">
+                  <h3 className="text-sm font-bold text-slate-800 mb-3">By agent</h3>
+                  <table className="w-full text-left text-xs">
+                    <thead className="text-slate-400 font-semibold uppercase text-[10px] border-b border-slate-100">
+                      <tr>
+                        <th className="py-2 pr-2">Agent</th>
+                        <th className="py-2 pr-2">Resolved</th>
+                        <th className="py-2 pr-2">MTTR</th>
+                        <th className="py-2 pr-2">Median</th>
+                        <th className="py-2">Slowest</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-50">
+                      {report.byAgent.map((a) => (
+                        <tr key={a.id || 'unassigned'}>
+                          <td className="py-2 pr-2 font-medium text-slate-700">{a.name}</td>
+                          <td className="py-2 pr-2 text-slate-600">{a.count}</td>
+                          <td className="py-2 pr-2 text-slate-800 font-semibold">{formatDuration(a.meanMinutes)}</td>
+                          <td className="py-2 pr-2 text-slate-600">{formatDuration(a.medianMinutes)}</td>
+                          <td className="py-2 text-slate-600">{formatDuration(a.maxMinutes)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {report.slowest.length > 0 && (
+                <div className="bg-white border border-slate-200 rounded-md p-4 shadow-sm">
+                  <h3 className="text-sm font-bold text-slate-800 mb-3">Slowest resolved tickets</h3>
+                  <table className="w-full text-left text-xs">
+                    <thead className="text-slate-400 font-semibold uppercase text-[10px] border-b border-slate-100">
+                      <tr>
+                        <th className="py-2 pr-2">Ticket</th>
+                        <th className="py-2 pr-2">Category</th>
+                        <th className="py-2 pr-2">Priority</th>
+                        <th className="py-2 pr-2">Agent</th>
+                        <th className="py-2 text-right">Time to resolve</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-50">
+                      {report.slowest.map((t) => (
+                        <tr key={t.id}>
+                          <td className="py-2 pr-2 font-medium text-slate-700">{t.title}</td>
+                          <td className="py-2 pr-2 text-slate-500">{t.category}</td>
+                          <td className="py-2 pr-2 text-slate-500">{t.priority}</td>
+                          <td className="py-2 pr-2 text-slate-500">{t.agentName}</td>
+                          <td className="py-2 text-right font-semibold text-slate-800">{formatDuration(t.minutes)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// Mean-MTTR-per-bucket bars, plain SVG. Bar height = mean minutes, the number
+// over each bar is how many tickets were resolved in that bucket.
+function MttrTrendChart({ trend }) {
+  if (!trend || trend.length === 0) {
+    return <p className="text-[11px] text-slate-400">No trend data for this range.</p>;
+  }
+  const W = 640, H = 170, PAD_L = 44, PAD_R = 10, PAD_T = 20, PAD_B = 24;
+  const max = Math.max(...trend.map((b) => b.meanMinutes || 0), 1);
+  const innerW = W - PAD_L - PAD_R;
+  const innerH = H - PAD_T - PAD_B;
+  const slot = innerW / trend.length;
+  const barW = Math.max(4, Math.min(28, slot * 0.6));
+  return (
+    <div className="overflow-x-auto">
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full min-w-[480px]" role="img" aria-label="MTTR trend">
+        {[0, 0.5, 1].map((f) => (
+          <g key={f}>
+            <line x1={PAD_L} x2={W - PAD_R} y1={PAD_T + innerH * f} y2={PAD_T + innerH * f} stroke="#e2e8f0" strokeWidth="1" />
+            <text x={PAD_L - 6} y={PAD_T + innerH * f + 3} textAnchor="end" className="fill-slate-400" fontSize="9">
+              {formatDuration(max * (1 - f))}
+            </text>
+          </g>
+        ))}
+        {trend.map((b, i) => {
+          const h = Math.max(2, ((b.meanMinutes || 0) / max) * innerH);
+          const x = PAD_L + i * slot + (slot - barW) / 2;
+          const y = PAD_T + innerH - h;
+          return (
+            <g key={b.bucket}>
+              <rect x={x} y={y} width={barW} height={h} rx="2" fill="#0052CC">
+                <title>{`${b.bucket}: ${formatDuration(b.meanMinutes)} across ${b.count} ticket${b.count === 1 ? '' : 's'}`}</title>
+              </rect>
+              <text x={x + barW / 2} y={y - 4} textAnchor="middle" className="fill-slate-500" fontSize="9">{b.count}</text>
+              <text x={x + barW / 2} y={H - 8} textAnchor="middle" className="fill-slate-400" fontSize="8.5">{bucketLabel(b.bucket)}</text>
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+function MttrBreakdown({ title, rows }) {
+  return (
+    <div className="bg-white border border-slate-200 rounded-md p-4 shadow-sm">
+      <h3 className="text-sm font-bold text-slate-800 mb-3">{title}</h3>
+      <table className="w-full text-left text-xs">
+        <thead className="text-slate-400 font-semibold uppercase text-[10px] border-b border-slate-100">
+          <tr>
+            <th className="py-2 pr-2">&nbsp;</th>
+            <th className="py-2 pr-2">Resolved</th>
+            <th className="py-2 pr-2">MTTR</th>
+            <th className="py-2 pr-2">Median</th>
+            <th className="py-2">Slowest</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-50">
+          {rows.length === 0 ? (
+            <tr><td colSpan="5" className="py-4 text-center text-slate-400">No data.</td></tr>
+          ) : rows.map((r) => (
+            <tr key={r.key}>
+              <td className="py-2 pr-2 font-medium text-slate-700">{r.key}</td>
+              <td className="py-2 pr-2 text-slate-600">{r.count}</td>
+              <td className="py-2 pr-2 text-slate-800 font-semibold">{formatDuration(r.meanMinutes)}</td>
+              <td className="py-2 pr-2 text-slate-600">{formatDuration(r.medianMinutes)}</td>
+              <td className="py-2 text-slate-600">{formatDuration(r.maxMinutes)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBACK_ENUMS, peopleList = [], fetchTickets, fetchUsers, fetchInventory, handleLogout, token, onChatTicketChange }) {
   const superAdmin = isSuperAdmin(user);
   // Who can be picked in the asset-assignment dropdowns: super admins have the
@@ -1289,7 +1588,10 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
   });
 
   const location = useLocation();
-  const currentTab = location.pathname.includes('inventory') ? 'inventory' : location.pathname.includes('users') ? 'users' : 'tickets';
+  const currentTab = location.pathname.includes('reports') ? 'reports'
+    : location.pathname.includes('inventory') ? 'inventory'
+    : location.pathname.includes('users') ? 'users'
+    : 'tickets';
 
   useEffect(() => {
     // Named handler so cleanup detaches only THIS listener (#22) — the socket
@@ -1495,6 +1797,9 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
               <Link to="/agent/tickets" className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition ${currentTab === 'tickets' ? 'bg-blue-50 text-[#0052CC] font-semibold border-l-2 border-[#0052CC]' : 'text-slate-600 hover:bg-slate-100'}`}>
                 <Ticket className="h-4 w-4" /> Queues & Tickets
               </Link>
+              <Link to="/agent/reports" className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition ${currentTab === 'reports' ? 'bg-blue-50 text-[#0052CC] font-semibold border-l-2 border-[#0052CC]' : 'text-slate-600 hover:bg-slate-100'}`} title="Mean time to resolution and first-reply metrics">
+                <Timer className="h-4 w-4" /> MTTR Reports
+              </Link>
               <Link to="/agent/inventory" className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition ${currentTab === 'inventory' ? 'bg-blue-50 text-[#0052CC] font-semibold border-l-2 border-[#0052CC]' : 'text-slate-600 hover:bg-slate-100'}`}>
                 <Box className="h-4 w-4" /> IT Assets
               </Link>
@@ -1516,14 +1821,20 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
           <header className="flex justify-between items-center mb-6 pb-4 border-b border-slate-200">
             <div>
               <h1 className="text-xl font-bold text-slate-900">
-                {currentTab === 'tickets' ? (superAdmin ? 'Service Desk Queues' : 'My Assigned Tickets') : currentTab === 'inventory' ? 'Asset Inventory' : 'User Directory'}
+                {currentTab === 'tickets' ? (superAdmin ? 'Service Desk Queues' : 'My Assigned Tickets')
+                  : currentTab === 'reports' ? 'Resolution Time (MTTR)'
+                  : currentTab === 'inventory' ? 'Asset Inventory' : 'User Directory'}
               </h1>
               <p className="text-slate-500 text-xs mt-0.5">
                 {currentTab === 'tickets'
                   ? (superAdmin
                     ? 'Every request across the helpdesk — dispatch, reassign, and resolve.'
                     : 'The requests assigned to you. A super admin dispatches work to this queue.')
-                  : currentTab === 'inventory' ? 'Track hardware assignments, serials, and equipment status.' : 'View registered users and invite agents or team members.'}
+                  : currentTab === 'reports'
+                    ? (superAdmin
+                      ? 'How quickly requests are resolved across the helpdesk — mean, median, and trends.'
+                      : 'How quickly your assigned requests are resolved — mean, median, and trends.')
+                    : currentTab === 'inventory' ? 'Track hardware assignments, serials, and equipment status.' : 'View registered users and invite agents or team members.'}
               </p>
             </div>
             {currentTab === 'users' && (
@@ -1537,6 +1848,10 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
               </button>
             )}
           </header>
+
+          {currentTab === 'reports' && (
+            <MttrReports token={token} />
+          )}
 
           {currentTab === 'tickets' && (
             <div className="bg-white border border-slate-200 rounded-md shadow-sm">
@@ -1565,6 +1880,15 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
                             <div className="font-semibold text-blue-600 hover:underline cursor-pointer">{t.title}</div>
                             <div className="text-slate-500 text-[11px] line-clamp-1">{t.description}</div>
                             <div className="text-slate-400 text-[10px] mt-0.5">Reporter: <span className="font-medium text-slate-600">{t.created_by_name}</span></div>
+                            {/* MTTR: resolved-in time once done, running age while active,
+                                and a marker when work resumed after a resolution. */}
+                            {(ticketElapsed(t) || t.reopened_count > 0) && (
+                              <div className="text-slate-400 text-[10px] mt-0.5">
+                                {ticketElapsed(t)}
+                                {ticketElapsed(t) && t.reopened_count > 0 ? ' · ' : ''}
+                                {t.reopened_count > 0 ? `Reopened ×${t.reopened_count}` : ''}
+                              </div>
+                            )}
                           </td>
                           <td className="py-3.5 px-4">
                             {t.image ? (

@@ -309,6 +309,97 @@ inventory.forEach((i) => {
   }
 });
 if (ticketsMigrated) saveData();
+
+// ------------------------------------------------------------------
+// MTTR (mean time to resolution) lifecycle stamps.
+//
+// Every ticket carries the timestamps the reporting endpoint aggregates:
+//   first_response_at   — first reply posted by an IT agent (one per ticket)
+//   resolved_at         — when the ticket reached "Resolved" (or "Closed"
+//                         directly); re-stamped on re-resolution after a
+//                         reopen so the final cycle is measured
+//   closed_at           — when the ticket reached "Closed"
+//   resolution_minutes  — resolved_at − created_at, in minutes (total
+//                         elapsed time to resolution, reopens included)
+//   reopened_count      — how many times work resumed after a resolution
+//
+// Tickets that were already resolved before these stamps existed (or before
+// created_at existed) keep null stamps and are simply excluded from the
+// aggregates rather than counted with fabricated numbers.
+// ------------------------------------------------------------------
+const minutesBetween = (fromIso, toIso) => {
+  const from = Date.parse(fromIso);
+  const to = Date.parse(toIso);
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to < from) return null;
+  return Math.round(((to - from) / 60000) * 10) / 10;
+};
+
+const RESOLUTION_STATUSES = new Set(['Resolved', 'Closed']);
+
+/**
+ * Move a ticket to `nextStatus` while maintaining its MTTR stamps.
+ * Returns true when the status actually changed.
+ *
+ *   Open/In Progress/Pending -> Resolved/Closed : stamp resolution
+ *   Resolved <-> Closed                          : keep resolve time, stamp/unstamp close time
+ *   Resolved/Closed -> Open/In Progress/Pending  : reopen (count it, measure the next cycle fresh)
+ *   Resolved/Closed -> Cancelled                 : abandoned, not a resolution (stamps cleared, not a reopen)
+ */
+const applyTicketStatus = (ticket, nextStatus) => {
+  const prev = ticket.status;
+  if (prev === nextStatus) return false;
+  const wasResolved = RESOLUTION_STATUSES.has(prev);
+  const isResolved = RESOLUTION_STATUSES.has(nextStatus);
+  const nowIso = new Date().toISOString();
+
+  if (isResolved && !wasResolved) {
+    // Entering a resolution state. Closing straight from an active state
+    // counts as resolved at close time; re-resolving after a reopen
+    // re-stamps the whole cycle (resolution stays "total elapsed").
+    ticket.resolved_at = nowIso;
+    if (nextStatus === 'Closed') ticket.closed_at = nowIso;
+  } else if (isResolved && wasResolved) {
+    // Resolved <-> Closed keeps the original resolve time.
+    if (nextStatus === 'Closed') {
+      if (!ticket.resolved_at) ticket.resolved_at = nowIso;
+      if (!ticket.closed_at) ticket.closed_at = nowIso;
+    } else {
+      ticket.closed_at = null; // un-closing back to Resolved
+    }
+  } else if (wasResolved && !isResolved) {
+    if (nextStatus !== 'Cancelled') {
+      // Work resumed after a resolution — that is a reopen.
+      ticket.reopened_count = (ticket.reopened_count || 0) + 1;
+    }
+    // Measure the next resolution cycle fresh.
+    ticket.resolved_at = null;
+    ticket.closed_at = null;
+    ticket.resolution_minutes = null;
+  }
+
+  ticket.status = nextStatus;
+  if (ticket.resolved_at) {
+    ticket.resolution_minutes = minutesBetween(ticket.created_at, ticket.resolved_at);
+  }
+  return true;
+};
+
+// Backfill the MTTR fields for tickets written before they existed. Timestamps
+// that cannot be reconstructed honestly stay null (and are excluded from the
+// report) — a guessed "resolved_at" would poison every average downstream.
+let mttrMigrated = false;
+tickets.forEach((t) => {
+  if (t.first_response_at === undefined) { t.first_response_at = null; mttrMigrated = true; }
+  if (t.resolved_at === undefined) { t.resolved_at = null; mttrMigrated = true; }
+  if (t.closed_at === undefined) { t.closed_at = null; mttrMigrated = true; }
+  if (t.resolution_minutes === undefined) {
+    t.resolution_minutes = t.resolved_at ? minutesBetween(t.created_at, t.resolved_at) : null;
+    mttrMigrated = true;
+  }
+  if (t.reopened_count === undefined) { t.reopened_count = 0; mttrMigrated = true; }
+});
+if (mttrMigrated) saveData();
+
 // Append a chat message to a ticket (shared by the REST endpoint and sockets).
 const appendTicketMessage = (ticketId, sender, senderName, text) => {
   const ticket = tickets.find((t) => t.id === String(ticketId));
@@ -322,6 +413,11 @@ const appendTicketMessage = (ticketId, sender, senderName, text) => {
     time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
   };
   ticket.messages.push(message);
+  // MTTR sibling metric: the first reply from an IT agent is the ticket's
+  // first response. Stamped once — later replies never move it.
+  if (message.sender === 'agent' && !ticket.first_response_at) {
+    ticket.first_response_at = new Date().toISOString();
+  }
   saveData();
   return { ticket, message };
 };
@@ -870,6 +966,14 @@ app.post('/api/tickets', requireAuth, writeRateLimit, (req, res) => {
     image,
     messages: [],
     created_at: new Date().toISOString(),
+    // MTTR lifecycle stamps (#mttr). Resolution time is measured
+    // created_at -> resolved_at and snapshotted into `resolution_minutes`.
+    // All null until the ticket actually reaches a resolved/closed state.
+    first_response_at: null,
+    resolved_at: null,
+    closed_at: null,
+    resolution_minutes: null,
+    reopened_count: 0,
   };
   tickets.unshift(newTicket);
   saveData();
@@ -891,7 +995,7 @@ app.patch('/api/tickets/:id', requireAuth, writeRateLimit, (req, res) => {
     if (Object.keys(body).length !== 1 || body.status !== 'Cancelled') {
       return res.status(403).json({ error: 'You can only cancel your own requests' });
     }
-    ticket.status = 'Cancelled';
+    applyTicketStatus(ticket, 'Cancelled');
     saveData();
     return res.json(ticket);
   }
@@ -938,7 +1042,9 @@ app.patch('/api/tickets/:id', requireAuth, writeRateLimit, (req, res) => {
     if (!VALID_TICKET_STATUS.has(body.status)) {
       return res.status(400).json({ error: `Status must be one of: ${[...VALID_TICKET_STATUS].join(', ')}` });
     }
-    ticket.status = body.status;
+    // Keeps the MTTR stamps (resolved_at / closed_at / reopened_count) in
+    // step with the status instead of leaving them to be recomputed later.
+    applyTicketStatus(ticket, body.status);
   }
   if (body.assigned_to_id !== undefined || body.assigned_to !== undefined) {
     // `assigned_to_id` is canonical; `assigned_to` is still accepted so older
@@ -985,6 +1091,141 @@ app.post('/api/tickets/:id/messages', requireAuth, writeRateLimit, (req, res) =>
   });
   notifyTicketChanged(result.ticket);
   res.json(result.message);
+});
+
+// ------------------------------------------------------------------
+// MTTR reporting.
+//
+// Aggregates the resolution lifecycle stamps maintained by
+// `applyTicketStatus` above. Visibility follows the ticket-visibility rules
+// (#36) exactly: a super admin's report covers every ticket, a regular
+// agent's covers only the tickets assigned to them.
+//
+// Resolution time is `resolved_at - created_at` in minutes (total elapsed,
+// reopens included). Tickets resolved before the stamps existed keep null
+// timestamps and are excluded rather than estimated.
+// ------------------------------------------------------------------
+const round1 = (n) => Math.round(n * 10) / 10;
+
+const statsFromMinutes = (values) => {
+  if (!values.length) return { count: 0, meanMinutes: null, medianMinutes: null, minMinutes: null, maxMinutes: null };
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  const mean = values.reduce((a, b) => a + b, 0) / values.length;
+  return {
+    count: values.length,
+    meanMinutes: round1(mean),
+    medianMinutes: round1(median),
+    minMinutes: round1(sorted[0]),
+    maxMinutes: round1(sorted[sorted.length - 1]),
+  };
+};
+
+const groupStats = (rows, keyOf) => {
+  const groups = new Map();
+  rows.forEach((r) => {
+    const key = keyOf(r);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(r.minutes);
+  });
+  return [...groups.entries()]
+    .map(([key, mins]) => ({ key, ...statsFromMinutes(mins) }))
+    .sort((a, b) => b.count - a.count || String(a.key).localeCompare(String(b.key)));
+};
+
+const isoDay = (iso) => iso.slice(0, 10);
+const isoWeekStart = (iso) => {
+  const d = new Date(`${iso.slice(0, 10)}T00:00:00Z`);
+  const day = (d.getUTCDay() + 6) % 7; // Monday = 0
+  d.setUTCDate(d.getUTCDate() - day);
+  return d.toISOString().slice(0, 10);
+};
+
+const buildMttrReport = (scopeTickets, { days, now }) => {
+  const cutoff = days === 'all' ? -Infinity : now - days * 24 * 60 * 60 * 1000;
+  const inRange = scopeTickets.filter((t) => {
+    if (!RESOLUTION_STATUSES.has(t.status)) return false;
+    const resolved = Date.parse(t.resolved_at);
+    return Number.isFinite(resolved) && resolved >= cutoff;
+  });
+
+  // One measurement per resolved ticket: total elapsed minutes to resolution.
+  const rows = inRange
+    .map((t) => ({
+      id: t.id,
+      title: t.title,
+      priority: t.priority,
+      category: t.category,
+      agentId: t.assigned_to_id || null,
+      agentName: t.assigned_to || 'Unassigned',
+      resolvedAt: t.resolved_at,
+      closedAt: t.closed_at || null,
+      minutes: t.resolution_minutes != null ? t.resolution_minutes : minutesBetween(t.created_at, t.resolved_at),
+      firstResponseMinutes: t.first_response_at ? minutesBetween(t.created_at, t.first_response_at) : null,
+      reopenedCount: t.reopened_count || 0,
+    }))
+    .filter((r) => r.minutes != null);
+
+  const summary = {
+    ...statsFromMinutes(rows.map((r) => r.minutes)),
+    // Companion to MTTR: how long the reporter waited for the first agent reply.
+    firstResponseCount: rows.filter((r) => r.firstResponseMinutes != null).length,
+    meanFirstResponseMinutes: (() => {
+      const fr = rows.map((r) => r.firstResponseMinutes).filter((v) => v != null);
+      return fr.length ? round1(fr.reduce((a, b) => a + b, 0) / fr.length) : null;
+    })(),
+    reopenedCount: rows.reduce((a, r) => a + r.reopenedCount, 0),
+  };
+
+  // Trend buckets: days while the range is short, ISO weeks, then months.
+  const bucketOf = days !== 'all' && days <= 30
+    ? (iso) => isoDay(iso)
+    : days !== 'all' && days <= 365
+      ? isoWeekStart
+      : (iso) => iso.slice(0, 7);
+  const bucketLabel = days !== 'all' && days <= 30 ? 'day' : days !== 'all' && days <= 365 ? 'week' : 'month';
+  const trend = groupStats(rows, (r) => bucketOf(r.resolvedAt))
+    .sort((a, b) => String(a.key).localeCompare(String(b.key)))
+    .map((g) => ({ bucket: g.key, count: g.count, meanMinutes: g.meanMinutes, medianMinutes: g.medianMinutes }));
+
+  const agentGroups = groupStats(rows, (r) => r.agentId || 'unassigned');
+  const nameById = new Map(rows.map((r) => [r.agentId || 'unassigned', r.agentName]));
+  const byAgent = agentGroups.map((g) => ({ id: g.key === 'unassigned' ? null : g.key, name: nameById.get(g.key) || 'Unassigned', count: g.count, meanMinutes: g.meanMinutes, medianMinutes: g.medianMinutes, maxMinutes: g.maxMinutes }));
+
+  const slowest = [...rows]
+    .sort((a, b) => b.minutes - a.minutes)
+    .slice(0, 5)
+    .map(({ firstResponseMinutes: _fr, reopenedCount: _rc, ...rest }) => rest);
+
+  return {
+    range: { days, from: cutoff === -Infinity ? null : new Date(cutoff).toISOString(), to: new Date(now).toISOString() },
+    bucket: bucketLabel,
+    summary,
+    trend,
+    byCategory: groupStats(rows, (r) => r.category || 'Other'),
+    byPriority: groupStats(rows, (r) => r.priority || 'Medium'),
+    byAgent,
+    slowest,
+  };
+};
+
+// GET /api/reports/mttr?days=30|7|90|365|all — the MTTR dashboard feed.
+// Agents: metrics over the tickets assigned to them. Super admins: the whole
+// helpdesk (plus the per-agent breakdown). Employees are not ops-reporting
+// users and get a 403 from requireAgent.
+app.get('/api/reports/mttr', requireAgent, (req, res) => {
+  const raw = String((req.query.days ?? '30')).trim().toLowerCase();
+  let days = 30;
+  if (raw !== 'all') {
+    days = Number(raw);
+    if (!Number.isInteger(days) || days < 1 || days > 365) {
+      return res.status(400).json({ error: 'days must be an integer between 1 and 365, or "all"' });
+    }
+  }
+  const report = buildMttrReport(visibleTicketsFor(req.user), { days: raw === 'all' ? 'all' : days, now: Date.now() });
+  report.scope = isSuperAdmin(req.user) ? 'all' : 'own';
+  res.json(report);
 });
 
 app.get('/api/inventory', requireAgent, (req, res) => {

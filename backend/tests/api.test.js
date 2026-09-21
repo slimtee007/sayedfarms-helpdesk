@@ -976,3 +976,212 @@ test('#36: --demote enforces a single dispatcher, and refuses to leave none', as
 
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// MTTR — resolution-time tracking and reporting.
+// ---------------------------------------------------------------------------
+test('MTTR: resolving stamps resolved_at/resolution_minutes; close, un-close and reopen keep the lifecycle honest', async () => {
+  const created = await newTicket({ title: 'MTTR lifecycle' });
+  assert.equal(created.status, 200);
+  const id = created.body.id;
+  assert.equal(created.body.resolved_at, null, 'a fresh ticket has no resolution stamp');
+  assert.equal(created.body.reopened_count, 0);
+
+  // Resolve: the resolve time is stamped and measured against created_at.
+  const resolved = await client.patch(`/api/tickets/${id}`, { token: admin.token, body: { status: 'Resolved' } });
+  assert.equal(resolved.status, 200);
+  assert.ok(resolved.body.resolved_at, 'Resolved must stamp resolved_at');
+  assert.equal(typeof resolved.body.resolution_minutes, 'number', 'Resolved must snapshot resolution_minutes');
+  assert.ok(resolved.body.resolution_minutes >= 0);
+  assert.equal(resolved.body.closed_at, null);
+
+  const resolvedAt1 = resolved.body.resolved_at;
+
+  // Close: closed_at is stamped, the resolve time is kept.
+  const closed = await client.patch(`/api/tickets/${id}`, { token: admin.token, body: { status: 'Closed' } });
+  assert.equal(closed.status, 200);
+  assert.ok(closed.body.closed_at, 'Closed must stamp closed_at');
+  assert.equal(closed.body.resolved_at, resolvedAt1, 'closing must not move the resolve time');
+
+  // Un-close back to Resolved: still one resolution cycle, no reopen counted.
+  const unClosed = await client.patch(`/api/tickets/${id}`, { token: admin.token, body: { status: 'Resolved' } });
+  assert.equal(unClosed.body.closed_at, null, 'un-closing clears closed_at');
+  assert.equal(unClosed.body.resolved_at, resolvedAt1);
+  assert.equal(unClosed.body.reopened_count, 0, 'Resolved <-> Closed is not a reopen');
+
+  // Reopen to active work: counted, and the next cycle is measured fresh.
+  const reopened = await client.patch(`/api/tickets/${id}`, { token: admin.token, body: { status: 'In Progress' } });
+  assert.equal(reopened.body.reopened_count, 1, 'resuming work after a resolution is a reopen');
+  assert.equal(reopened.body.resolved_at, null);
+  assert.equal(reopened.body.closed_at, null);
+  assert.equal(reopened.body.resolution_minutes, null);
+
+  // Re-resolve: a fresh resolve stamp for the new cycle.
+  const reresolved = await client.patch(`/api/tickets/${id}`, { token: admin.token, body: { status: 'Resolved' } });
+  assert.ok(reresolved.body.resolved_at, 're-resolving re-stamps resolved_at');
+  assert.notEqual(reresolved.body.resolved_at, resolvedAt1);
+  assert.equal(typeof reresolved.body.resolution_minutes, 'number');
+  assert.equal(reresolved.body.reopened_count, 1, 're-resolving does not add a reopen');
+
+  // Cancelling after a resolution abandons it — cleared, but not a reopen.
+  const cancelled = await client.patch(`/api/tickets/${id}`, { token: admin.token, body: { status: 'Cancelled' } });
+  assert.equal(cancelled.body.resolved_at, null);
+  assert.equal(cancelled.body.resolution_minutes, null);
+  assert.equal(cancelled.body.reopened_count, 1, 'cancelling is not resuming work');
+});
+
+test('MTTR: closing straight from an active status counts as resolved at close time', async () => {
+  const created = await newTicket({ title: 'MTTR direct close' });
+  const id = created.body.id;
+  const closed = await client.patch(`/api/tickets/${id}`, { token: admin.token, body: { status: 'Closed' } });
+  assert.equal(closed.status, 200);
+  assert.ok(closed.body.resolved_at, 'a direct close counts as resolved at close time');
+  assert.equal(closed.body.resolved_at, closed.body.closed_at);
+  assert.equal(typeof closed.body.resolution_minutes, 'number');
+});
+
+test('MTTR: the first agent reply stamps first_response_at exactly once', async () => {
+  const email = `mttr-emp-${Date.now()}@example.com`;
+  const emp = (
+    await client.post('/api/auth/signup', {
+      body: { name: 'MTTR Employee', email, password: 'EmployeePass!23' },
+    })
+  ).body;
+  const created = await client.post('/api/tickets', {
+    token: emp.token,
+    body: { title: 'MTTR first response', description: 'please help' },
+  });
+  const id = created.body.id;
+
+  // A reply from the reporter is not a response from IT.
+  await client.post(`/api/tickets/${id}/messages`, { token: emp.token, body: { text: 'anyone there?' } });
+  let ticket = (await client.get('/api/tickets', { token: emp.token })).body.find((t) => t.id === id);
+  assert.equal(ticket.first_response_at, null, 'an employee message is not a first response');
+
+  await client.post(`/api/tickets/${id}/messages`, { token: admin.token, body: { text: 'on it now' } });
+  ticket = (await client.get('/api/tickets', { token: emp.token })).body.find((t) => t.id === id);
+  assert.ok(ticket.first_response_at, 'the first agent reply stamps first_response_at');
+
+  const first = ticket.first_response_at;
+  await client.post(`/api/tickets/${id}/messages`, { token: admin.token, body: { text: 'still on it' } });
+  ticket = (await client.get('/api/tickets', { token: emp.token })).body.find((t) => t.id === id);
+  assert.equal(ticket.first_response_at, first, 'later replies must not move the first response');
+});
+
+test('MTTR report aggregates resolution times, and scopes the report to the caller', async () => {
+  const bcrypt = require('bcryptjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sayedfarms-mttr-'));
+  const file = path.join(dir, 'db.json');
+  const now = Date.now();
+  const ago = (ms) => new Date(now - ms).toISOString();
+  const MIN = 60 * 1000;
+  const DAY = 24 * 60 * MIN;
+
+  // Deterministic history: two agents, an employee, and resolved tickets with
+  // known created/resolved deltas. `resolution_minutes` is left unset so the
+  // boot migration computes it from the timestamps.
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      users: [
+        { id: 'mttr-agent', name: 'MTTR Agent', email: 'mttr-agent@sayedfarms.test', role: 'agent', super_admin: false, password: bcrypt.hashSync('AgentPass!2345', 10) },
+        { id: 'mttr-boss', name: 'MTTR Boss', email: 'mttr-boss@sayedfarms.test', role: 'agent', super_admin: true, password: bcrypt.hashSync('BossPass!2345', 10) },
+        { id: 'mttr-emp', name: 'MTTR Employee', email: 'mttr-emp@sayedfarms.test', role: 'user', password: bcrypt.hashSync('EmployeePass!23', 10) },
+      ],
+      tickets: [
+        {
+          id: 'mttr-t1', title: 'Printer fire', description: 'd', category: 'Hardware', priority: 'High',
+          status: 'Resolved', assigned_to: 'MTTR Agent', assigned_to_id: 'mttr-agent',
+          created_by: 'mttr-emp', created_by_name: 'MTTR Employee', messages: [], image: '',
+          created_at: ago(2 * DAY + 240 * MIN), resolved_at: ago(2 * DAY), closed_at: null,
+          first_response_at: ago(2 * DAY + 230 * MIN), reopened_count: 0,
+        },
+        {
+          id: 'mttr-t2', title: 'Old laptop swap', description: 'd', category: 'Hardware', priority: 'Low',
+          status: 'Resolved', assigned_to: 'MTTR Agent', assigned_to_id: 'mttr-agent',
+          created_by: 'mttr-emp', created_by_name: 'MTTR Employee', messages: [], image: '',
+          created_at: ago(40 * DAY + 60 * MIN), resolved_at: ago(40 * DAY), closed_at: null,
+          first_response_at: ago(40 * DAY + 50 * MIN), reopened_count: 1,
+        },
+        {
+          id: 'mttr-t3', title: 'VPN outage', description: 'd', category: 'Network', priority: 'Urgent',
+          status: 'Closed', assigned_to: 'MTTR Boss', assigned_to_id: 'mttr-boss',
+          created_by: 'mttr-emp', created_by_name: 'MTTR Employee', messages: [], image: '',
+          // 120 minutes to resolution (created 125m+1d ago, resolved 5m+1d ago),
+          // first agent reply 30 minutes after creation.
+          created_at: ago(1 * DAY + 125 * MIN), resolved_at: ago(1 * DAY + 5 * MIN), closed_at: ago(1 * DAY),
+          first_response_at: ago(1 * DAY + 95 * MIN), reopened_count: 0,
+        },
+        {
+          // Resolved before MTTR stamps existed: excluded, never estimated.
+          id: 'mttr-t4', title: 'Legacy resolved', description: 'd', category: 'Software', priority: 'Medium',
+          status: 'Resolved', assigned_to: 'MTTR Agent', assigned_to_id: 'mttr-agent',
+          created_by: 'mttr-emp', created_by_name: 'MTTR Employee', messages: [], image: '',
+          created_at: ago(10 * DAY), reopened_count: 0,
+        },
+      ],
+      inventory: [],
+      resetCodes: {},
+    })
+  );
+
+  const s = await startServer(file, await freePort(), { ADMIN_EMAIL: 'nobody@sayedfarms.test' });
+  try {
+    const c = api(s.base);
+    const boss = await login(c, 'mttr-boss@sayedfarms.test', 'BossPass!2345');
+    const agent = await login(c, 'mttr-agent@sayedfarms.test', 'AgentPass!2345');
+    const emp = await login(c, 'mttr-emp@sayedfarms.test', 'EmployeePass!23');
+
+    // Boot migration computed the minutes from the timestamps.
+    const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(onDisk.tickets.find((t) => t.id === 'mttr-t1').resolution_minutes, 240);
+    assert.equal(onDisk.tickets.find((t) => t.id === 'mttr-t3').resolution_minutes, 120);
+
+    // Employees are not ops-reporting users.
+    assert.equal((await c.get('/api/reports/mttr', { token: emp.token })).status, 403);
+    assert.equal((await c.get('/api/reports/mttr')).status, 401);
+    assert.equal((await c.get('/api/reports/mttr?days=0', { token: boss.token })).status, 400);
+    assert.equal((await c.get('/api/reports/mttr?days=soon', { token: boss.token })).status, 400);
+
+    // Super admin, last 7 days: t1 (240m) + t3 (120m). t2 is out of range,
+    // t4 has no honest timestamp and is excluded everywhere.
+    const week = (await c.get('/api/reports/mttr?days=7', { token: boss.token })).body;
+    assert.equal(week.scope, 'all');
+    assert.equal(week.summary.count, 2);
+    assert.equal(week.summary.meanMinutes, 180);
+    assert.equal(week.summary.medianMinutes, 180);
+    assert.equal(week.summary.minMinutes, 120);
+    assert.equal(week.summary.maxMinutes, 240);
+    assert.equal(week.summary.reopenedCount, 0);
+    assert.equal(week.summary.meanFirstResponseMinutes, 20, '(10m + 30m) / 2');
+    assert.equal(week.slowest[0].id, 'mttr-t1');
+    assert.equal(week.slowest[0].minutes, 240);
+    const byAgent = Object.fromEntries(week.byAgent.map((a) => [a.id, a]));
+    assert.equal(byAgent['mttr-agent'].count, 1);
+    assert.equal(byAgent['mttr-agent'].meanMinutes, 240);
+    assert.equal(byAgent['mttr-boss'].meanMinutes, 120);
+    const byCategory = Object.fromEntries(week.byCategory.map((g) => [g.key, g]));
+    assert.equal(byCategory.Hardware.count, 1);
+    assert.equal(byCategory.Network.count, 1);
+    assert.ok(!byCategory.Software, 'the unmeasurable legacy ticket must be excluded');
+    assert.ok(week.trend.every((b) => typeof b.bucket === 'string' && b.count >= 1));
+
+    // All time: t2 (60m) joins in — mean (240+60+120)/3 = 140, and its
+    // reopen is counted.
+    const all = (await c.get('/api/reports/mttr?days=all', { token: boss.token })).body;
+    assert.equal(all.summary.count, 3);
+    assert.equal(all.summary.meanMinutes, 140);
+    assert.equal(all.summary.reopenedCount, 1);
+
+    // A regular agent sees only their own queue's numbers (#36).
+    const own = (await c.get('/api/reports/mttr?days=all', { token: agent.token })).body;
+    assert.equal(own.scope, 'own');
+    assert.equal(own.summary.count, 2, 'only the two tickets assigned to this agent');
+    assert.equal(own.summary.meanMinutes, 150, '(240 + 60) / 2');
+    assert.deepEqual(own.byAgent.map((a) => a.id), ['mttr-agent']);
+    assert.equal(own.slowest.length, 2);
+  } finally {
+    await s.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

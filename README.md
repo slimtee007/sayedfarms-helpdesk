@@ -71,6 +71,36 @@ Default admin sign-in (development only — override via `ADMIN_EMAIL` /
   emits from unauthenticated sockets and ticket-room joins for tickets you
   don't own are ignored.
 
+## MTTR — mean time to resolution
+
+Tickets carry the stamps the reports aggregate (all set by the server, never
+by a client):
+
+| Field | Meaning |
+|---|---|
+| `created_at` | when the request was raised (start of the clock) |
+| `first_response_at` | the first reply posted by an IT agent (stamped once) |
+| `resolved_at` | when the ticket reached **Resolved** (or **Closed** directly); re-stamped when a reopened ticket is resolved again |
+| `closed_at` | when the ticket reached **Closed** |
+| `resolution_minutes` | `resolved_at − created_at` in minutes — total elapsed time to resolution, reopens included |
+| `reopened_count` | how many times work resumed after a resolution |
+
+Status transitions keep the stamps honest: **Resolved ↔ Closed** keeps the
+original resolve time; leaving a resolution state for active work counts a
+**reopen** and the next cycle is measured fresh; **Cancelled** abandons the
+resolution (stamps cleared, not counted as a reopen). Tickets that were
+already resolved before these stamps existed keep `null` timestamps and are
+excluded from the report rather than estimated.
+
+`GET /api/reports/mttr?days=7|30|90|365|all` (IT agents only; default 30)
+returns the dashboard feed: summary (mean / median / fastest / slowest,
+first-reply average, reopen count), a trend of mean-resolution time per day /
+week / month, breakdowns by category, priority and agent, and the slowest
+resolved tickets. Scoping follows the queue rules exactly — a super admin's
+report covers every ticket, a regular agent's only the tickets assigned to
+them (`scope: "all" | "own"`). The Agent Console shows it under **MTTR
+Reports**, and ticket tables display "Resolved in …" / "Reopened ×n" per row.
+
 ## Locked out of the super admin account?
 
 Passwords are stored as bcrypt hashes, so **nobody can read a password back out
