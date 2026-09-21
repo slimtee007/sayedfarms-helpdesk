@@ -109,16 +109,38 @@ PDF); the exports are also plain authenticated API endpoints:
 | Endpoint | Output |
 |---|---|
 | `GET /api/reports/mttr/export?days=…` | MTTR report CSV — summary block, then one row per resolved ticket behind the numbers (created / first response / resolved / closed stamps, resolution minutes, reopens). Same scoping as the JSON feed. |
-| `GET /api/reports/assets` | IT asset stock report — totals, **in stock vs out of stock**, per-category split, per-status counts, and the asset rows. |
-| `GET /api/reports/assets/export` | The asset report as CSV — summary block, category and status splits, then one row per asset with its stock state. |
+| `GET /api/reports/assets` | IT asset stock report — totals, **in stock / low stock / out of stock**, the restock watchlist, per-category split, per-status counts, and the asset rows with quantities. |
+| `GET /api/reports/assets/export` | The asset report as CSV — summary block, restock watchlist, category and status splits, then one row per asset with quantity, reorder level and stock state. |
+| `GET /api/inventory/low-stock` | The restock watchlist as JSON — store-room lines running out (at/below their reorder level) or already empty, with `lowStock` / `outOfStock` counts. |
 
-Assets count as **in stock** when their status is `In Stock` (available in the
-store room); every other status (Assigned, In Repair, Under Maintenance,
-Retired, Decommissioned) is **out of stock** — not available to hand out. The
-exact status is always carried alongside the binary split so retired gear is
-never confused with deployed gear. **Asset Reports** in the Agent Console
-shows the split with an All / In stock / Out of stock filter; CSVs are
-RFC-4180 quoted (Excel-friendly, with a UTF-8 BOM).
+### Stock tracking & low-stock alerts
+
+Inventory lines carry two stock fields (both optional, both validated as whole
+numbers 0–1,000,000):
+
+- `quantity` — how many are on the store-room shelf. Defaults to `1` (a
+  serial-numbered unit is one physical item); consumable lines (toners,
+  cartridges, drives…) count higher.
+- `reorder_level` — the "reorder at" threshold. `null` (default) disables
+  low-stock alerting for that line.
+
+The server derives a three-way **stock state** for every line (never the
+client, so the UI, the report and the CSV can never disagree):
+
+| State | Meaning |
+|---|---|
+| **In Stock** | on the shelf, above its reorder level |
+| **Low Stock** | on the shelf but at/below its reorder level — time to reorder |
+| **Out of Stock** | shelf empty (`quantity` 0), or not in the store room at all (Assigned, In Repair, Retired, …) |
+
+Running-out detection is the `needs_restock` flag / `GET /api/inventory/low-stock`
+watchlist: store-room lines at/below their reorder level or with an empty
+shelf. **Deployed, repaired or retired gear is never a restock alert** — it is
+just not on the shelf. In the Agent Console the **IT Assets** workspace shows a
+count badge and a restock banner, adjusts quantities in place (− / +) and lets
+you set the alert level per row; **Asset Reports** adds the low-stock KPI,
+watchlist and filter. Legacy rows migrate to `quantity: 1` / no alert level on
+boot, and the CSVs are RFC-4180 quoted (Excel-friendly, with a UTF-8 BOM).
 
 ## Locked out of the super admin account?
 

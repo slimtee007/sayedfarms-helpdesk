@@ -1366,3 +1366,189 @@ test('report generation: MTTR CSV export carries the summary and scoped ticket r
   assert.ok(agentCsv.includes('Tickets assigned to me'), 'the export header must state the scope');
   assert.ok(!agentCsv.includes('Printer, ""main"" office'), "another queue's ticket must never leak into the export");
 });
+
+// ---------------------------------------------------------------------------
+// Stock tracking — quantity + reorder level drive the stock state, the
+// low-stock watchlist, and the asset report.
+// ---------------------------------------------------------------------------
+test('stock tracking: quantity and reorder level drive the stock state and the low-stock watchlist', async () => {
+  // Employees cannot read the watchlist; anonymous stays 401.
+  const empEmail = `stock-emp-${Date.now()}@example.com`;
+  const emp = (
+    await client.post('/api/auth/signup', {
+      body: { name: 'Stock Employee', email: empEmail, password: 'EmployeePass!23' },
+    })
+  ).body;
+  assert.equal((await client.get('/api/inventory/low-stock', { token: emp.token })).status, 403);
+  assert.equal((await client.get('/api/inventory/low-stock')).status, 401);
+
+  // A consumable line: 10 on the shelf, alert at 3.
+  const created = await client.post('/api/inventory', {
+    token: admin.token,
+    body: {
+      name: 'Stock Tracker Toner',
+      category: 'Toner',
+      serial_number: `SN-STOCK-TRACKER-${Date.now()}`,
+      status: 'In Stock',
+      quantity: 10,
+      reorder_level: 3,
+    },
+  });
+  assert.equal(created.status, 200, `create failed: ${JSON.stringify(created.body)}`);
+  const id = created.body.id;
+  assert.equal(created.body.quantity, 10);
+  assert.equal(created.body.reorder_level, 3);
+  assert.equal(created.body.stock_state, 'In Stock');
+  assert.equal(created.body.needs_restock, false);
+
+  const patch = async (body) =>
+    client.patch(`/api/inventory/${id}`, { token: admin.token, body });
+  const watch = async () => client.get('/api/inventory/low-stock', { token: admin.token });
+
+  // Falling to the reorder level = running out.
+  const low = await patch({ quantity: 3 });
+  assert.equal(low.body.stock_state, 'Low Stock');
+  assert.equal(low.body.needs_restock, true);
+  let wl = (await watch()).body;
+  assert.ok(wl.alerts.some((a) => a.id === id), 'a low item must be on the watchlist');
+  assert.ok(wl.counts.lowStock >= 1);
+
+  // Handing out the last one = empty shelf.
+  const empty = await patch({ quantity: 0 });
+  assert.equal(empty.body.stock_state, 'Out of Stock');
+  assert.equal(empty.body.needs_restock, true);
+  wl = (await watch()).body;
+  const alertRow = wl.alerts.find((a) => a.id === id);
+  assert.ok(alertRow, 'an empty shelf must be on the watchlist');
+  assert.equal(alertRow.stock_state, 'Out of Stock');
+
+  // Restocked: the alert clears.
+  const restocked = await patch({ quantity: 12 });
+  assert.equal(restocked.body.stock_state, 'In Stock');
+  assert.equal(restocked.body.needs_restock, false);
+  wl = (await watch()).body;
+  assert.ok(!wl.alerts.some((a) => a.id === id), 'a restocked item must leave the watchlist');
+
+  // An empty shelf is a restock alert even without a reorder level.
+  await patch({ reorder_level: null, quantity: 0 });
+  assert.equal((await watch()).body.alerts.find((a) => a.id === id).stock_state, 'Out of Stock');
+  await patch({ quantity: 1 });
+
+  // Deployed gear is never a restock alert — it is just not on the shelf.
+  const deployed = await patch({ status: 'Assigned', reorder_level: 5, quantity: 0 });
+  assert.equal(deployed.body.stock_state, 'Out of Stock');
+  assert.equal(deployed.body.needs_restock, false, 'deployed gear must not be a restock alert');
+  const back = await patch({ status: 'In Stock', quantity: 1 });
+  assert.equal(back.body.stock_state, 'Low Stock', 'back on the shelf below the alert level = low');
+
+  // Bad stock counts are 400s, never silently stored.
+  const badPost = await client.post('/api/inventory', {
+    token: admin.token,
+    body: { name: 'Bad Quantity', category: 'Toner', serial_number: `SN-BAD-QTY-${Date.now()}`, quantity: -1 },
+  });
+  assert.equal(badPost.status, 400);
+  const badLevel = await client.post('/api/inventory', {
+    token: admin.token,
+    body: { name: 'Bad Level', category: 'Toner', serial_number: `SN-BAD-LVL-${Date.now()}`, reorder_level: 'soon' },
+  });
+  assert.equal(badLevel.status, 400);
+  assert.equal((await patch({ quantity: 2.5 })).status, 400);
+  assert.equal((await patch({ quantity: 'ten' })).status, 400);
+
+  // The decorated fields are on the plain inventory feed too.
+  const feed = (await client.get('/api/inventory', { token: admin.token })).body;
+  const row = feed.find((i) => i.id === id);
+  assert.ok(row, 'the created asset must be in the feed');
+  assert.equal(typeof row.stock_state, 'string');
+  assert.equal(typeof row.needs_restock, 'boolean');
+
+  await client.delete(`/api/inventory/${id}`, { token: admin.token });
+});
+
+test('stock tracking: the asset report carries quantities, the low-stock split and the restock list', async () => {
+  const before = (await client.get('/api/reports/assets', { token: admin.token })).body;
+  const stamp = Date.now();
+  const mk = (name, extra) =>
+    client.post('/api/inventory', {
+      token: admin.token,
+      body: { name, category: 'Toner', serial_number: `SN-RPT-${name.replace(/\W+/g, '-').toUpperCase()}-${stamp}`, status: 'In Stock', ...extra },
+    });
+  const low = (await mk('Report Toner Running Low', { quantity: 2, reorder_level: 5 })).body;
+  const full = (await mk('Report Toner Full', { quantity: 8, reorder_level: 2 })).body;
+  const deployed = (
+    await client.post('/api/inventory', {
+      token: admin.token,
+      body: { name: 'Report Deployed SSD', category: 'SSD/HDD', serial_number: `SN-RPT-DEPLOYED-${stamp}`, status: 'Assigned', quantity: 1 },
+    })
+  ).body;
+
+  const after = (await client.get('/api/reports/assets', { token: admin.token })).body;
+  assert.equal(after.summary.total, before.summary.total + 3);
+  assert.equal(after.summary.inStock, before.summary.inStock + 1);
+  assert.equal(after.summary.lowStock, before.summary.lowStock + 1);
+  assert.equal(after.summary.outOfStock, before.summary.outOfStock + 1);
+
+  const row = (asset) => after.rows.find((r) => r.id === asset.id);
+  assert.equal(row(low).stockState, 'Low Stock');
+  assert.equal(row(low).quantity, 2);
+  assert.equal(row(low).reorderLevel, 5);
+  assert.equal(row(full).stockState, 'In Stock');
+  assert.equal(row(deployed).stockState, 'Out of Stock');
+
+  assert.ok(after.restockList.some((r) => r.id === low.id), 'the running-low toner must be on the restock list');
+  assert.ok(!after.restockList.some((r) => r.id === deployed.id), 'deployed gear is not a restock item');
+  const tonerCat = after.byCategory.find((c) => c.key === 'Toner');
+  assert.ok(tonerCat && tonerCat.lowStock >= 1, 'the category split must carry the low-stock column');
+
+  // The CSV export carries the new columns and the watchlist section.
+  const res = await fetch(`${server.base}/api/reports/assets/export`, {
+    headers: { Authorization: `Bearer ${admin.token}` },
+  });
+  assert.equal(res.status, 200);
+  const text = await res.text();
+  for (const wanted of ['Low stock (at/below reorder level)', 'Restock watchlist', 'Quantity on hand', 'Reorder level', 'Report Toner Running Low']) {
+    assert.ok(text.includes(wanted), `the CSV must contain ${JSON.stringify(wanted)}`);
+  }
+
+  for (const asset of [low, full, deployed]) {
+    await client.delete(`/api/inventory/${asset.id}`, { token: admin.token });
+  }
+});
+
+test('stock tracking: legacy assets migrate to quantity 1 with no alert level on boot', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sayedfarms-stock-'));
+  const file = path.join(dir, 'db.json');
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      users: [],
+      tickets: [],
+      // Pre-stock-tracking rows: no quantity at all, and hand-edited junk.
+      inventory: [
+        { id: 'stk-legacy', name: 'Legacy Laptop', category: 'Laptop', serial_number: 'SN-STK-1', assigned_to: 'Unassigned', assigned_to_id: null, status: 'In Stock' },
+        { id: 'stk-junk', name: 'Junk Counts', category: 'Toner', serial_number: 'SN-STK-2', assigned_to: 'Unassigned', assigned_to_id: null, status: 'In Stock', quantity: 'many', reorder_level: -3 },
+      ],
+      resetCodes: {},
+    })
+  );
+
+  const s = await startServer(file, await freePort());
+  try {
+    const c = api(s.base);
+    const token = (await login(c, ADMIN_EMAIL, ADMIN_PASSWORD)).token;
+    const assets = (await c.get('/api/inventory', { token })).body;
+    const legacy = assets.find((a) => a.id === 'stk-legacy');
+    const junk = assets.find((a) => a.id === 'stk-junk');
+    assert.equal(legacy.quantity, 1, 'a serial-numbered unit is one physical item');
+    assert.equal(legacy.reorder_level, null, 'no alert level is tracked by default');
+    assert.equal(legacy.stock_state, 'In Stock');
+    assert.equal(junk.quantity, 1, 'an invalid quantity resets to 1, never crashes the report');
+    assert.equal(junk.reorder_level, null, 'an invalid reorder level is cleared');
+
+    const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(onDisk.inventory.find((a) => a.id === 'stk-legacy').quantity, 1, 'the migration must be persisted');
+  } finally {
+    await s.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

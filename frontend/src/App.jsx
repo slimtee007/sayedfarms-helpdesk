@@ -35,6 +35,21 @@ const STATUS_LABELS = {
 
 const statusLabel = (value) => STATUS_LABELS[value] || value;
 
+// Three stock states, coloured consistently everywhere they appear:
+// on the shelf (green), running out — at/below the reorder level (amber),
+// shelf empty or not in the store room at all (red). The state itself is
+// always computed server-side (stock_state) so UI and exports can't disagree.
+const STOCK_BADGE_CLASSES = {
+  'In Stock': 'bg-emerald-100 text-emerald-800',
+  'Low Stock': 'bg-amber-100 text-amber-800',
+  'Out of Stock': 'bg-red-100 text-red-800',
+};
+const StockStateBadge = ({ state }) => (
+  <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${STOCK_BADGE_CLASSES[state] || 'bg-slate-100 text-slate-600'}`}>
+    {state}
+  </span>
+);
+
 // Assignments are keyed by user id (#17) so two people with the same display
 // name stay distinguishable and renaming someone never orphans their tickets.
 // These literals are sentinel option values, never real ids.
@@ -1719,6 +1734,7 @@ function AssetReports({ token }) {
   const STOCK_FILTERS = [
     { value: 'all', label: 'All assets' },
     { value: 'In Stock', label: 'In stock' },
+    { value: 'Low Stock', label: 'Low stock' },
     { value: 'Out of Stock', label: 'Out of stock' },
   ];
   const [report, setReport] = useState(null);
@@ -1788,11 +1804,7 @@ function AssetReports({ token }) {
     openPrintableReport('IT Asset Report', body);
   };
 
-  const stockBadge = (state) => (
-    <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${state === 'In Stock' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>
-      {state}
-    </span>
-  );
+  const stockBadge = (state) => <StockStateBadge state={state} />;
 
   const kpi = (label, value, hint) => (
     <div className="bg-white border border-slate-200 rounded-md p-3.5 shadow-sm">
@@ -1842,12 +1854,47 @@ function AssetReports({ token }) {
 
       {!loading && !error && report && (
         <>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
             {kpi('Total assets', String(summary.total), 'tracked in the inventory')}
-            {kpi('In stock', String(summary.inStock), 'available in the store room')}
-            {kpi('Out of stock', String(summary.outOfStock), 'deployed, in repair or retired')}
+            {kpi('In stock', String(summary.inStock), 'on the shelf, above reorder level')}
+            {kpi('Low stock', String(summary.lowStock), 'at/below reorder level — reorder soon')}
+            {kpi('Out of stock', String(summary.outOfStock), 'shelf empty, deployed or retired')}
             {kpi('Availability', summary.total ? `${Math.round((summary.inStock / summary.total) * 100)}%` : '—', 'share of stock on hand')}
           </div>
+
+          {/* The restock watchlist: the direct answer to "is anything running
+              out of stock?" — tracked lines at/below their reorder level. */}
+          {(report.restockList || []).length > 0 && (
+            <div className="bg-amber-50 border border-amber-200 rounded-md p-4 shadow-sm">
+              <h3 className="text-sm font-bold text-amber-900 mb-3 flex items-center gap-1.5">
+                <AlertCircle className="h-4 w-4" /> Restock watchlist — running out
+              </h3>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="text-amber-700/70 font-semibold uppercase text-[10px] border-b border-amber-200">
+                    <tr>
+                      <th className="py-2 pr-2">Asset</th>
+                      <th className="py-2 pr-2">Category</th>
+                      <th className="py-2 pr-2">On hand</th>
+                      <th className="py-2 pr-2">Alert at</th>
+                      <th className="py-2">Stock state</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-amber-100">
+                    {report.restockList.map((r) => (
+                      <tr key={r.id}>
+                        <td className="py-2 pr-2 font-medium text-slate-800">{r.name}</td>
+                        <td className="py-2 pr-2 text-slate-600">{r.category}</td>
+                        <td className="py-2 pr-2 font-semibold text-slate-800">{r.quantity}</td>
+                        <td className="py-2 pr-2 text-slate-600">{r.reorderLevel == null ? '—' : r.reorderLevel}</td>
+                        <td className="py-2">{stockBadge(r.stockState)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
 
           <div className="grid md:grid-cols-2 gap-4">
             <div className="bg-white border border-slate-200 rounded-md p-4 shadow-sm">
@@ -1927,13 +1974,14 @@ function AssetReports({ token }) {
                     <th className="py-3 px-4">Serial Number</th>
                     <th className="py-3 px-4">Assigned To</th>
                     <th className="py-3 px-4">Status</th>
+                    <th className="py-3 px-4">On Hand</th>
                     <th className="py-3 px-4">Stock State</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {visibleRows.length === 0 ? (
                     <tr>
-                      <td colSpan="6" className="py-8 text-center text-slate-400">No assets match this filter.</td>
+                      <td colSpan="7" className="py-8 text-center text-slate-400">No assets match this filter.</td>
                     </tr>
                   ) : visibleRows.map((r) => (
                     <tr key={r.id} className="hover:bg-slate-50 transition">
@@ -1942,6 +1990,12 @@ function AssetReports({ token }) {
                       <td className="py-3.5 px-4 font-mono text-[#0052CC]">{r.serial}</td>
                       <td className="py-3.5 px-4 text-slate-600">{r.assignedTo}</td>
                       <td className="py-3.5 px-4 text-slate-600">{statusLabel(r.status)}</td>
+                      <td className="py-3.5 px-4 text-slate-700">
+                        <span className="font-semibold">{r.quantity}</span>
+                        {r.reorderLevel != null && (
+                          <span className="text-slate-400 text-[10px]"> / alert at {r.reorderLevel}</span>
+                        )}
+                      </td>
                       <td className="py-3.5 px-4">{stockBadge(r.stockState)}</td>
                     </tr>
                   ))}
@@ -1987,8 +2041,16 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
     category: 'Laptop',
     serial_number: '',
     assigned_to_id: UNASSIGNED,
-    status: 'In Stock'
+    status: 'In Stock',
+    quantity: 1,
+    reorder_level: ''
   });
+
+  // Restock watchlist straight off the decorated inventory feed: store-room
+  // lines at/below their reorder level, or with an empty shelf.
+  const restockAlerts = (inventoryList || []).filter((i) => i.needs_restock);
+  const lowStockCount = restockAlerts.filter((a) => a.stock_state === 'Low Stock').length;
+  const emptyShelfCount = restockAlerts.filter((a) => a.stock_state === 'Out of Stock').length;
 
   const location = useLocation();
   // Order matters: /agent/asset-reports also contains "reports".
@@ -2024,8 +2086,18 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`
         },
-        // id-keyed assignee (#17)
-        body: JSON.stringify({ ...newAsset, ...assigneePayload(newAsset.assigned_to_id) })
+        // id-keyed assignee (#17). Quantity/reorder_level are sent as proper
+        // numbers (or null = no low-stock alerting) for the stock tracker.
+        body: JSON.stringify({
+          ...newAsset,
+          quantity: Number.isInteger(Number(newAsset.quantity)) && Number(newAsset.quantity) >= 0
+            ? Number(newAsset.quantity)
+            : 1,
+          reorder_level: newAsset.reorder_level === '' || newAsset.reorder_level == null
+            ? null
+            : Number(newAsset.reorder_level),
+          ...assigneePayload(newAsset.assigned_to_id)
+        })
       });
       // Never render a literal "undefined" dialog (#19): fall back to a real
       // message when the error body isn't JSON or has no `error` field.
@@ -2034,7 +2106,7 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
         return alert(data.error || `Could not create the asset (HTTP ${res.status}). Please try again.`);
       }
       setIsAssetModalOpen(false);
-      setNewAsset({ name: '', category: 'Laptop', serial_number: '', assigned_to_id: UNASSIGNED, status: 'In Stock' });
+      setNewAsset({ name: '', category: 'Laptop', serial_number: '', assigned_to_id: UNASSIGNED, status: 'In Stock', quantity: 1, reorder_level: '' });
       fetchInventory();
     } catch (err) {
       alert('Network error — could not reach the server. Please try again.');
@@ -2245,7 +2317,7 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
                       : 'How quickly your assigned requests are resolved — mean, median, and trends.')
                     : currentTab === 'asset-reports'
                       ? 'What is in stock, what is out of stock — per category and status. Export or print the report.'
-                      : currentTab === 'inventory' ? 'Track hardware assignments, serials, and equipment status.' : 'View registered users and invite agents or team members.'}
+                      : currentTab === 'inventory' ? 'Track hardware, serials, and store-room stock — adjust quantities in place and set low-stock alerts on consumables.' : 'View registered users and invite agents or team members.'}
               </p>
             </div>
             {currentTab === 'users' && (
@@ -2371,7 +2443,31 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
           )}
 
           {currentTab === 'inventory' && (
-            <div className="bg-white border border-slate-200 rounded-md shadow-sm">
+            <div>
+              {/* Restock banner — answers "is anything running out of stock?"
+                  before the table is even scanned. */}
+              {restockAlerts.length > 0 && (
+                <div className="mb-4 bg-amber-50 border border-amber-200 rounded-md p-4 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-start gap-3">
+                    <AlertCircle className="h-5 w-5 text-amber-600 mt-0.5 shrink-0" />
+                    <div>
+                      <div className="text-xs font-bold text-amber-900">
+                        Stock alert — {lowStockCount > 0 && `${lowStockCount} running low`}
+                        {lowStockCount > 0 && emptyShelfCount > 0 && ' · '}
+                        {emptyShelfCount > 0 && `${emptyShelfCount} out of stock`}
+                      </div>
+                      <p className="text-[11px] text-amber-800 mt-0.5">
+                        {restockAlerts.slice(0, 4).map((a) => `${a.name} (${a.quantity} left${a.reorder_level != null ? `, alert at ${a.reorder_level}` : ''})`).join(' · ')}
+                        {restockAlerts.length > 4 ? ` · +${restockAlerts.length - 4} more` : ''}
+                      </p>
+                    </div>
+                  </div>
+                  <Link to="/agent/asset-reports" className="px-3 py-1.5 bg-white border border-amber-300 rounded text-[11px] font-medium text-amber-800 hover:bg-amber-100 transition whitespace-nowrap">
+                    View stock report →
+                  </Link>
+                </div>
+              )}
+              <div className="bg-white border border-slate-200 rounded-md shadow-sm">
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs">
                   <thead className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold uppercase">
@@ -2381,6 +2477,7 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
                       <th className="py-3 px-4">Serial Number</th>
                       <th className="py-3 px-4">Assigned User</th>
                       <th className="py-3 px-4">Status</th>
+                      <th className="py-3 px-4">Stock on Hand</th>
                       <th className="py-3 px-4 text-right">Actions</th>
                     </tr>
                   </thead>
@@ -2410,6 +2507,47 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
                             ))}
                           </select>
                         </td>
+                        <td className="py-3.5 px-4">
+                          {/* Stock tracker: only lines on the store-room shelf
+                              carry a count. −/+ adjust it in place; the alert
+                              level is the "reorder at" threshold (blank = off). */}
+                          {item.status === 'In Stock' ? (
+                            <div className="space-y-1">
+                              <div className="flex items-center gap-1">
+                                <button
+                                  onClick={() => handleUpdateAsset(item.id, { quantity: Math.max(0, (item.quantity ?? 1) - 1) })}
+                                  disabled={(item.quantity ?? 1) <= 0}
+                                  title="One fewer in stock"
+                                  className="w-5 h-5 flex items-center justify-center rounded border border-slate-300 text-slate-600 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                                >−</button>
+                                <span className="w-7 text-center font-semibold text-slate-800">{item.quantity ?? 1}</span>
+                                <button
+                                  onClick={() => handleUpdateAsset(item.id, { quantity: (item.quantity ?? 1) + 1 })}
+                                  title="One more in stock"
+                                  className="w-5 h-5 flex items-center justify-center rounded border border-slate-300 text-slate-600 hover:bg-slate-100 transition"
+                                >+</button>
+                                <input
+                                  key={`${item.id}-lvl-${item.reorder_level == null ? 'off' : item.reorder_level}`}
+                                  type="number"
+                                  min="0"
+                                  defaultValue={item.reorder_level == null ? '' : item.reorder_level}
+                                  placeholder="—"
+                                  onBlur={(e) => {
+                                    const v = e.target.value.trim();
+                                    const current = item.reorder_level == null ? '' : String(item.reorder_level);
+                                    if (v === current) return;
+                                    handleUpdateAsset(item.id, { reorder_level: v === '' ? null : Number(v) });
+                                  }}
+                                  title="Low-stock alert level — warn when stock falls to this number (blank = no alert)"
+                                  className="w-14 border border-slate-300 rounded p-1 text-xs focus:outline-none focus:border-[#0052CC]"
+                                />
+                              </div>
+                              <StockStateBadge state={item.stock_state} />
+                            </div>
+                          ) : (
+                            <span className="text-slate-400" title="Not on the store-room shelf">—</span>
+                          )}
+                        </td>
                         <td className="py-3.5 px-4 text-right">
                           <button onClick={() => handleDeleteAsset(item.id)} className="p-1 text-slate-400 hover:text-red-600 transition">
                             <Trash2 className="h-4 w-4" />
@@ -2419,6 +2557,7 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
                     ))}
                   </tbody>
                 </table>
+              </div>
               </div>
             </div>
           )}
@@ -2530,6 +2669,36 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
                       {assignablePeople.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
                     </select>
                   </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Quantity in Stock</label>
+                      <input
+                        required
+                        type="number"
+                        min="0"
+                        value={newAsset.quantity}
+                        onChange={(e) => setNewAsset({ ...newAsset, quantity: e.target.value === '' ? '' : Number(e.target.value) })}
+                        title="How many of this item are on the store-room shelf"
+                        className="w-full border border-slate-300 rounded p-2 text-xs focus:border-[#0052CC] focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">Low-stock Alert At <span className="font-normal text-slate-400">(optional)</span></label>
+                      <input
+                        type="number"
+                        min="0"
+                        value={newAsset.reorder_level}
+                        placeholder="e.g. 5"
+                        onChange={(e) => setNewAsset({ ...newAsset, reorder_level: e.target.value === '' ? '' : Number(e.target.value) })}
+                        title="Warn when the quantity falls to this level — for consumables like toners and cartridges"
+                        className="w-full border border-slate-300 rounded p-2 text-xs focus:border-[#0052CC] focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                  <p className="text-[10px] text-slate-400 -mt-1">
+                    Single units stay at quantity 1. For consumables (toners, cartridges, drives…), set an alert
+                    level — the stock report and the low-stock watchlist flag them when they run low.
+                  </p>
                   <div className="flex justify-end gap-2 pt-4 border-t border-slate-100">
                     <button type="button" onClick={() => setIsAssetModalOpen(false)} className="px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-100 rounded">Cancel</button>
                     <button type="submit" className="px-4 py-1.5 bg-[#0052CC] hover:bg-blue-700 text-white font-medium text-xs rounded shadow-sm">Save Asset</button>
