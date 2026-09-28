@@ -28,6 +28,26 @@ Default admin sign-in (development only — override via `ADMIN_EMAIL` /
 - email: `admin@sayedfarms.com`
 - password: `Admin@12345`
 
+## Mobile app (employee portal)
+
+`mobile/` is a dedicated mobile-first web app for **employees**: raise
+requests, follow their live status, chat with the assigned agent, and use
+live IT chat — from a phone. It runs against the same backend and the same
+accounts as the desktop frontend (nothing in the backend changes).
+
+```bash
+cd mobile
+npm install
+npm run dev   # port 5174, proxies /api and /socket.io to the backend
+```
+
+Open http://localhost:5174 in a phone-sized viewport (or from a phone on the
+same network — it is installable to the home screen via its web app
+manifest). Scope: employee flows (requests, ticket detail + per-ticket chat,
+cancel, live chat, profile). An agent signing in on mobile sees their assigned
+queue and can reply in chats, but dispatch/assets/reports stay desktop-only.
+See `mobile/README.md` for the screen list and architecture notes.
+
 ## Authentication & roles
 
 - Passwords are stored as bcrypt hashes; sessions are signed JWTs

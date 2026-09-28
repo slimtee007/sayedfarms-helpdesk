@@ -1,0 +1,63 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand: #0052CC;
+  --color-brand-deep: #0747A6;
+  --color-brand-dark: #003E8F;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  overscroll-behavior-y: none;
+  -webkit-tap-highlight-color: transparent;
+  background: #f1f5f9;
+}
+
+/* Hide scrollbars on horizontal chip rails while keeping them scrollable */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  scrollbar-width: none;
+}
+
+/* Native-feeling transitions */
+@keyframes sf-slide-up {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+@keyframes sf-slide-in {
+  from { transform: translateX(28px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+@keyframes sf-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes sf-rise {
+  from { transform: translateY(10px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+.animate-sheet { animation: sf-slide-up 0.28s cubic-bezier(0.32, 0.72, 0.24, 1); }
+.animate-push { animation: sf-slide-in 0.22s ease-out; }
+.animate-fade { animation: sf-fade-in 0.18s ease-out; }
+.animate-rise { animation: sf-rise 0.25s ease-out both; }
+
+/* Safe-area helpers for notched phones */
+.safe-top { padding-top: env(safe-area-inset-top, 0px); }
+.safe-bottom { padding-bottom: env(safe-area-inset-bottom, 0px); }
+
+/* Press feedback for cards and rows (native-like touch states) */
+.pressable {
+  transition: transform 0.12s ease, opacity 0.12s ease;
+}
+.pressable:active {
+  transform: scale(0.97);
+  opacity: 0.85;
+}
