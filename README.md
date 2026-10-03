@@ -356,3 +356,25 @@ See `backend/.env.example` for Office 365 / Gmail settings.
 If SMTP is not configured, the app says so on screen and (outside
 `NODE_ENV=production`) shows the reset code directly in the page instead of
 silently pretending an email was sent.
+
+## Mobile browser regression checks
+
+The mobile QA suite exercises the real frontend, API and Socket.IO connection at
+320×568, 393×851, 768×1024 and 1440×900. It creates a disposable database; it does
+not use or modify `backend/db.json`. Ports **5100** and **5174** must be free.
+
+```bash
+npm ci --prefix backend
+cd frontend
+npm ci
+npx playwright install --with-deps chromium
+npm run test:mobile
+# One viewport only:
+npm run test:mobile -- --project=small-phone
+```
+
+The browser suite runs in CI alongside the backend tests, lint and build.
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` optionally selects an already-installed
+Chromium binary. Failure screenshots and traces are saved in the git-ignored
+`frontend/test-results/` directory. See [MOBILE-QA.md](MOBILE-QA.md) for the latest
+review, fixes and external-service/device verification still required.

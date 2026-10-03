@@ -186,6 +186,9 @@ const ForgotPassword = ({ onBackToLogin, apiBase = '' }) => {
             <label style={styles.label}>Verification Code (OTP)</label>
             <input
               type="text"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              pattern="[0-9]{6}"
               placeholder="Enter 6-digit OTP"
               value={otp}
               onChange={(e) => setOtp(e.target.value)}
@@ -217,6 +220,10 @@ const ForgotPassword = ({ onBackToLogin, apiBase = '' }) => {
               type="button"
               onClick={() => {
                 setStep(1);
+                setDevOtp('');
+                setOtp('');
+                setNewPassword('');
+                setEmailSent(false);
                 setError('');
                 setMessage('');
               }}
@@ -265,7 +272,8 @@ const styles = {
     maxWidth: '440px',
     backgroundColor: '#ffffff',
     borderRadius: '12px',
-    padding: '32px',
+    padding: 'clamp(20px, 5vw, 32px)',
+    overflowWrap: 'anywhere',
     boxShadow: '0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1)',
   },
   header: {

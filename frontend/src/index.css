@@ -1,1 +1,37 @@
 @import "tailwindcss";
+
+/* Keep dialogs usable on short screens and when a phone keyboard is open. */
+.modal-overlay > :first-child {
+  max-height: calc(100dvh - 2rem);
+  overflow-y: auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.modal-overlay form > *, .modal-overlay .grid > * { min-width: 0; }
+input[type="file"] { max-width: 100%; }
+.live-chat { padding-bottom: env(safe-area-inset-bottom); }
+.live-chat p, .live-chat [class*="max-w-"], [role="dialog"] [class*="max-w-"] { overflow-wrap: anywhere; }
+
+@media (max-width: 767px) {
+  /* 16px avoids iOS focus zoom; 44px gives controls a usable touch target. */
+  input:not([type="checkbox"]):not([type="radio"]), select, textarea {
+    font-size: 16px !important;
+    min-height: 44px;
+  }
+  button, nav a { min-height: 44px; }
+  button:has(> svg:only-child) { min-width: 44px; }
+  .agent-header > div { flex-wrap: wrap; gap: .5rem; min-width: 0; }
+  .agent-header > div > span { overflow-wrap: anywhere; }
+  .agent-main > header > div { min-width: 0; }
+  .modal-overlay > :first-child { padding: 1rem; }
+  .modal-overlay > :first-child:has(> form.flex) { padding: 0; }
+  .modal-overlay .grid-cols-2 { grid-template-columns: minmax(0, 1fr); }
+  .overflow-x-auto { max-width: 100%; }
+  .overflow-x-auto > table { min-width: 640px; }
+  .modal-overlay .col-span-2 { grid-column: span 1; }
+}
+
+.agent-main .grid > * { min-width: 0; }
+.agent-main div:has(> table) { overflow-x: auto; }
+
+.ticket-table th:first-child { min-width: 200px; }

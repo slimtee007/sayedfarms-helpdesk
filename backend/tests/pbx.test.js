@@ -185,6 +185,8 @@ const spawnServer = async (dataFile, port, extraEnv = {}) => {
       SMTP_USER: '',
       SMTP_PASS: '',
       RATE_LIMIT_SCALE: '100',
+      // The generated SMDR fixtures below use DD/MM/YY, including ambiguous dates.
+      PBX_DATE_FORMAT: 'DD/MM/YY',
       ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -753,6 +755,20 @@ test('PBX: logging a call by hand works, and refuses nonsense', async () => {
   assert.equal(badDirection.status, 400);
   const badDuration = await client.post('/api/pbx/calls/manual', { token: admin.token, body: { extension: '205', duration_seconds: -5 } });
   assert.equal(badDuration.status, 400);
+});
+
+test('PBX: manual calls distinguish callers and directions while rejecting exact replays', async () => {
+  const body = { extension: '205', direction: 'Incoming', call_at: new Date().toISOString(), duration_seconds: 123, caller_number: '08030001111' };
+  const post = (data) => client.post('/api/pbx/calls/manual', { token: admin.token, body: data });
+  const first = await post(body);
+  assert.equal(first.status, 200);
+  const other = await post({ ...body, caller_number: '08030002222' });
+  assert.equal(other.status, 200, 'different callers are different calls');
+  assert.notEqual(other.body.call.id, first.body.call.id);
+  const outgoing = await post({ ...body, direction: 'Outgoing' });
+  assert.equal(outgoing.status, 200, 'different directions are different calls');
+  assert.equal((await post(body)).status, 400, 'the original call is still deduplicated');
+  assert.equal((await post({ ...body, caller_number: '08030002222' })).status, 400);
 });
 
 test('PBX: /api/pbx/status reports the feed, the policy and what still needs configuring', async () => {

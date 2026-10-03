@@ -53,3 +53,7 @@ backend/db.json
 
 # Frontend specific
 .cache/
+# Browser QA artifacts and local tooling
+.qa/
+playwright-report/
+test-results/

@@ -287,7 +287,12 @@ const ingestRecord = (record, { source = 'smdr' } = {}) => {
     record.call_day, record.call_time, record.extension, record.trunk,
     record.dialed_number, record.duration_seconds, record.condition_code
   );
-  if (calls.some((c) => c.dedupe_key === key)) {
+  // Manual incoming calls have an empty dialed_number: the caller lives in
+  // caller_number instead. Do not collapse distinct callers/directions just
+  // because the UI captured the same minute and duration. Keep existing keys
+  // so replay detection still works for records stored before this fix.
+  if (calls.some((c) => c.dedupe_key === key && (record.parse_format !== 'manual'
+    || ((c.caller_number || '') === (record.caller_number || '') && c.direction === record.direction)))) {
     stats.duplicatesMerged += 1;
     return { duplicate: true, reason: 'already logged' };
   }

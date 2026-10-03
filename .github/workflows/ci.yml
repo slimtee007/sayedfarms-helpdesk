@@ -66,3 +66,28 @@ jobs:
       # annotations but don't fail the build.
       - run: npm run lint
       - run: npm run build
+
+  mobile:
+    name: Mobile browser workflows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            backend/package-lock.json
+      - run: npm ci --prefix backend
+      - run: npm ci --prefix frontend
+      - run: npx playwright install --with-deps chromium
+        working-directory: frontend
+      - run: npm run test:mobile
+        working-directory: frontend
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: mobile-test-results
+          path: frontend/test-results/
+          retention-days: 7

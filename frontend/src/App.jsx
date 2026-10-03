@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route, useNavigate, Navigate, Link, useLocation } from 'react-router-dom';
 import { io } from 'socket.io-client';
-import { Activity, Plus, ShieldCheck, User, LogOut, Image as ImageIcon, X, Paperclip, Users, Ticket, UserPlus, Copy, Check, Trash2, Box, PackagePlus, ChevronRight, Search, Headphones, KeyRound, AlertCircle, Monitor, Laptop, FilePlus, ChevronDown, Filter, MessageSquare, Send, Timer, FileText, Download, Printer, Phone, PhoneCall, RefreshCw, ClipboardList, BarChart3 } from 'lucide-react';
+import { Activity, Plus, Menu, LogOut, Image as ImageIcon, X, Users, Ticket, UserPlus, Copy, Check, Trash2, Box, PackagePlus, ChevronRight, Search, Headphones, KeyRound, AlertCircle, Monitor, Laptop, FilePlus, ChevronDown, MessageSquare, Send, Timer, FileText, Download, Printer, Phone, PhoneCall, RefreshCw, ClipboardList, BarChart3 } from 'lucide-react';
 import ForgotPassword from './pages/ForgotPassword.jsx';
 
 // Same-origin by default: in dev, Vite proxies /api and /socket.io to the
@@ -693,22 +693,22 @@ function AuthScreen({ initialMode = 'login', setToken, setUser }) {
         <form onSubmit={handleAuth} className="space-y-4">
           {authMode === 'signup' && (
             <div>
-              <label className="block text-xs font-semibold text-slate-600 mb-1">Full Name</label>
-              <input required type="text" value={authForm.name} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })} />
+              <label htmlFor="auth-name" className="block text-xs font-semibold text-slate-600 mb-1">Full Name</label>
+              <input id="auth-name" autoComplete="name" required type="text" value={authForm.name} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, name: e.target.value })} />
             </div>
           )}
           <div>
-            <label className="block text-xs font-semibold text-slate-600 mb-1">Email Address</label>
-            <input required type="email" value={authForm.email} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })} />
+            <label htmlFor="auth-email" className="block text-xs font-semibold text-slate-600 mb-1">Email Address</label>
+            <input id="auth-email" autoComplete="email" required type="email" value={authForm.email} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, email: e.target.value })} />
           </div>
           <div>
             <div className="flex justify-between items-center mb-1">
-              <label className="block text-xs font-semibold text-slate-600">Password</label>
+              <label htmlFor="auth-password" className="block text-xs font-semibold text-slate-600">Password</label>
               {authMode === 'login' && (
                 <Link to="/forgot-password" className="text-[11px] text-[#0052CC] hover:underline">Forgot password?</Link>
               )}
             </div>
-            <input required type="password" value={authForm.password} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} />
+            <input id="auth-password" autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'} required type="password" value={authForm.password} className="w-full bg-slate-50 border border-slate-300 rounded p-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} />
           </div>
           <button type="submit" disabled={loading} className="w-full py-2.5 bg-[#0052CC] hover:bg-blue-700 font-medium text-xs text-white rounded transition shadow-sm disabled:opacity-50">
             {loading ? (authMode === 'login' ? 'Signing in...' : 'Creating Account...') : (authMode === 'login' ? 'Sign In' : 'Create Account')}
@@ -791,8 +791,8 @@ function TicketChatModal({ ticket, sender, senderName, onClose, onMessagesChange
   };
 
   return (
-    <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4 z-50">
-      <div className="bg-white border border-slate-200 rounded-lg shadow-2xl w-full max-w-lg flex flex-col h-[520px] overflow-hidden">
+    <div role="dialog" aria-modal="true" className="modal-overlay fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+      <div className="bg-white border border-slate-200 rounded-lg shadow-2xl w-full max-w-lg flex flex-col h-[min(520px,calc(100dvh-2rem))] overflow-hidden">
         <div className="bg-[#0052CC] text-white px-4 py-3 flex items-center justify-between">
           <div>
             <div className="text-xs font-semibold">Ticket Chat — {ticket.title}</div>
@@ -800,7 +800,7 @@ function TicketChatModal({ ticket, sender, senderName, onClose, onMessagesChange
               {ticket.status} · {ticket.category} · Assigned: {ticket.assigned_to}
             </div>
           </div>
-          <button onClick={onClose} className="text-blue-100 hover:text-white">
+          <button aria-label="Close ticket chat" onClick={onClose} className="text-blue-100 hover:text-white">
             <X className="h-5 w-5" />
           </button>
         </div>
@@ -837,9 +837,9 @@ function TicketChatModal({ ticket, sender, senderName, onClose, onMessagesChange
             placeholder={`Message the ${otherSide}...`}
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            className="flex-1 bg-slate-100 border border-slate-200 rounded px-3 py-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none"
+            className="min-w-0 flex-1 bg-slate-100 border border-slate-200 rounded px-3 py-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none"
           />
-          <button type="submit" className="bg-[#0052CC] hover:bg-blue-700 text-white px-3 py-2 rounded transition flex items-center justify-center">
+          <button aria-label="Send message" type="submit" className="bg-[#0052CC] hover:bg-blue-700 text-white px-3 py-2 rounded transition flex items-center justify-center">
             <Send className="h-3.5 w-3.5" />
           </button>
         </form>
@@ -850,6 +850,7 @@ function TicketChatModal({ ticket, sender, senderName, onClose, onMessagesChange
 
 function CustomerPortal({ user, tickets, agentsList = [], enums = FALLBACK_ENUMS, fetchTickets, handleLogout, token }) {
   const [selectedGroup, setSelectedGroup] = useState('all');
+  const [searchQuery, setSearchQuery] = useState('');
   const [isDropdownOpen, setIsDropdownOpen] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   // Shown inside the create-request modal when the POST fails (#19).
@@ -1003,13 +1004,13 @@ function CustomerPortal({ user, tickets, agentsList = [], enums = FALLBACK_ENUMS
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 font-sans flex flex-col relative">
-      <header className="bg-[#0052CC] text-white px-8 py-3 flex items-center justify-between shadow-md">
+      <header className="bg-[#0052CC] text-white px-4 sm:px-8 py-3 flex flex-wrap gap-3 items-center justify-between shadow-md">
         <div className="flex items-center gap-6">
           <div className="font-semibold text-base flex items-center gap-2 tracking-tight cursor-pointer" onClick={() => { setSelectedGroup('all'); navigate('/portal'); }}>
             Help Center
           </div>
         </div>
-        <div className="flex items-center gap-4">
+        <div className="flex flex-wrap items-center gap-3">
           <button onClick={() => navigate(isMyTicketsView ? '/portal' : '/portal/tickets')} className="text-xs bg-blue-700 hover:bg-blue-800 px-3 py-1.5 rounded font-medium transition">
             {isMyTicketsView ? 'Raise a Request' : `My Requests (${tickets.length})`}
           </button>
@@ -1028,7 +1029,7 @@ function CustomerPortal({ user, tickets, agentsList = [], enums = FALLBACK_ENUMS
           <div className="relative w-full max-w-4xl px-6">
             <div className="relative">
               <Search className="absolute left-4 top-3.5 h-4 w-4 text-slate-400" />
-              <input type="text" placeholder="Search for help topics, articles, or request types..." className="w-full bg-white text-slate-800 pl-11 pr-4 py-3 rounded-md text-sm shadow-lg focus:outline-none focus:ring-2 focus:ring-blue-400" />
+              <input type="text" aria-label="Search request types" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Search request types..." className="w-full bg-white text-slate-800 pl-11 pr-4 py-3 rounded-md text-sm shadow-lg focus:outline-none focus:ring-2 focus:ring-blue-400" />
             </div>
           </div>
         )}
@@ -1084,41 +1085,21 @@ function CustomerPortal({ user, tickets, agentsList = [], enums = FALLBACK_ENUMS
 
             {selectedGroup === 'all' && (
               <div className="space-y-3">
-                <div onClick={() => setSelectedGroup('common')} className="bg-white border border-slate-200 hover:border-blue-400 hover:shadow-sm rounded-md p-4 transition cursor-pointer flex items-center justify-between group">
-                  <div>
-                    <h3 className="font-semibold text-blue-600 group-hover:underline text-sm mb-1">Common Requests</h3>
-                    <p className="text-xs text-slate-500">Get IT help, Request a new account, Report a system problem, Report broken hardware</p>
-                  </div>
-                  <ChevronRight className="h-4 w-4 text-slate-400 group-hover:text-blue-600" />
-                </div>
-                <div onClick={() => setSelectedGroup('computers')} className="bg-white border border-slate-200 hover:border-blue-400 hover:shadow-sm rounded-md p-4 transition cursor-pointer flex items-center justify-between group">
-                  <div>
-                    <h3 className="font-semibold text-blue-600 group-hover:underline text-sm mb-1">Computers</h3>
-                    <p className="text-xs text-slate-500">Get IT help, Request new software, Request new hardware, Report broken hardware</p>
-                  </div>
-                  <ChevronRight className="h-4 w-4 text-slate-400 group-hover:text-blue-600" />
-                </div>
-                <div onClick={() => setSelectedGroup('logins')} className="bg-white border border-slate-200 hover:border-blue-400 hover:shadow-sm rounded-md p-4 transition cursor-pointer flex items-center justify-between group">
-                  <div>
-                    <h3 className="font-semibold text-blue-600 group-hover:underline text-sm mb-1">Logins and Accounts</h3>
-                    <p className="text-xs text-slate-500">Request admin access, Request a new account, Onboard new employees</p>
-                  </div>
-                  <ChevronRight className="h-4 w-4 text-slate-400 group-hover:text-blue-600" />
-                </div>
-                <div onClick={() => setSelectedGroup('applications')} className="bg-white border border-slate-200 hover:border-blue-400 hover:shadow-sm rounded-md p-4 transition cursor-pointer flex items-center justify-between group">
-                  <div>
-                    <h3 className="font-semibold text-blue-600 group-hover:underline text-sm mb-1">Applications</h3>
-                    <p className="text-xs text-slate-500">Request new software, Report a system problem</p>
-                  </div>
-                  <ChevronRight className="h-4 w-4 text-slate-400 group-hover:text-blue-600" />
-                </div>
-                <div onClick={() => setSelectedGroup('servers')} className="bg-white border border-slate-200 hover:border-blue-400 hover:shadow-sm rounded-md p-4 transition cursor-pointer flex items-center justify-between group">
-                  <div>
-                    <h3 className="font-semibold text-blue-600 group-hover:underline text-sm mb-1">Servers and Infrastructure</h3>
-                    <p className="text-xs text-slate-500">Report a system problem, Report broken hardware</p>
-                  </div>
-                  <ChevronRight className="h-4 w-4 text-slate-400 group-hover:text-blue-600" />
-                </div>
+                {Object.entries(groupDetails).filter(([key, group]) => key !== 'all' &&
+                  `${group.name} ${group.desc}`.toLowerCase().includes(searchQuery.trim().toLowerCase())
+                ).map(([key, group]) => (
+                  <button key={key} onClick={() => setSelectedGroup(key)} className="w-full text-left bg-white border border-slate-200 hover:border-blue-400 hover:shadow-sm rounded-md p-4 transition flex items-center justify-between gap-3 group">
+                    <span>
+                      <span className="block font-semibold text-blue-600 group-hover:underline text-sm mb-1">{group.name}</span>
+                      <span className="block text-xs text-slate-500">{group.desc}</span>
+                    </span>
+                    <ChevronRight className="h-4 w-4 shrink-0 text-slate-400 group-hover:text-blue-600" />
+                  </button>
+                ))}
+                {searchQuery.trim() && !Object.entries(groupDetails).some(([key, group]) => key !== 'all' &&
+                  `${group.name} ${group.desc}`.toLowerCase().includes(searchQuery.trim().toLowerCase())) && (
+                  <p role="status" className="text-sm text-slate-500">No request types found. Try another search.</p>
+                )}
               </div>
             )}
 
@@ -1258,7 +1239,8 @@ function CustomerPortal({ user, tickets, agentsList = [], enums = FALLBACK_ENUMS
         ) : (
           <div className="bg-white border border-slate-200 rounded-md p-4 shadow-sm">
             <h2 className="text-base font-bold text-slate-800 mb-4">My Submitted Requests</h2>
-            <div className="overflow-x-auto">
+            <p className="md:hidden text-xs text-slate-500 mb-2">Swipe the table to see status and actions.</p>
+            <div className="overflow-x-auto ticket-table">
               <table className="w-full text-left text-xs">
                 <thead className="border-b border-slate-200 text-slate-500 font-semibold uppercase">
                   <tr>
@@ -1312,7 +1294,7 @@ function CustomerPortal({ user, tickets, agentsList = [], enums = FALLBACK_ENUMS
         )}
       </main>
 
-      <div className="fixed bottom-6 right-6 z-50">
+      <div className="live-chat fixed bottom-4 right-4 sm:bottom-6 sm:right-6 z-40">
         {!isChatOpen ? (
           <button 
             onClick={() => setIsChatOpen(true)}
@@ -1322,13 +1304,13 @@ function CustomerPortal({ user, tickets, agentsList = [], enums = FALLBACK_ENUMS
             <span className="text-xs font-semibold pr-1">Live IT Chat</span>
           </button>
         ) : (
-          <div className="bg-white border border-slate-200 rounded-lg shadow-2xl w-80 sm:w-96 flex flex-col h-[420px] overflow-hidden">
+          <div className="bg-white border border-slate-200 rounded-lg shadow-2xl w-[min(24rem,calc(100vw-2rem))] flex flex-col h-[min(420px,calc(100dvh-2rem))] overflow-hidden">
             <div className="bg-[#0052CC] text-white px-4 py-3 flex items-center justify-between shadow-sm">
               <div className="flex items-center gap-2">
                 <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></div>
                 <span className="text-xs font-semibold">SayedFarm IT Support Chat</span>
               </div>
-              <button onClick={() => setIsChatOpen(false)} className="text-blue-100 hover:text-white">
+              <button aria-label="Close live chat" onClick={() => setIsChatOpen(false)} className="text-blue-100 hover:text-white">
                 <X className="h-4 w-4" />
               </button>
             </div>
@@ -1357,9 +1339,9 @@ function CustomerPortal({ user, tickets, agentsList = [], enums = FALLBACK_ENUMS
                 placeholder="Type a message to IT agent..." 
                 value={chatInput} 
                 onChange={(e) => setChatInput(e.target.value)} 
-                className="flex-1 bg-slate-100 border border-slate-200 rounded px-3 py-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" 
+                className="min-w-0 flex-1 bg-slate-100 border border-slate-200 rounded px-3 py-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none"
               />
-              <button type="submit" className="bg-[#0052CC] hover:bg-blue-700 text-white px-3 py-2 rounded transition flex items-center justify-center">
+              <button aria-label="Send message" type="submit" className="bg-[#0052CC] hover:bg-blue-700 text-white px-3 py-2 rounded transition flex items-center justify-center">
                 <Send className="h-3.5 w-3.5" />
               </button>
             </form>
@@ -1372,11 +1354,11 @@ function CustomerPortal({ user, tickets, agentsList = [], enums = FALLBACK_ENUMS
       </footer>
 
       {isModalOpen && (
-        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+        <div role="dialog" aria-modal="true" className="modal-overlay fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4 z-50">
           <div className="bg-white border border-slate-200 rounded-lg shadow-2xl p-6 w-full max-w-lg text-slate-800">
             <div className="flex justify-between items-center mb-4 border-b border-slate-100 pb-3">
               <h2 className="text-base font-bold text-slate-900">{newTicket.title}</h2>
-              <button onClick={closeTicketModal} className="text-slate-400 hover:text-slate-600">
+              <button aria-label="Close request" onClick={closeTicketModal} className="text-slate-400 hover:text-slate-600">
                 <X className="h-5 w-5" />
               </button>
             </div>
@@ -1562,8 +1544,8 @@ function MttrReports({ token }) {
           to resolution — including any time spent reopened. Cancelled and not-yet-resolved
           tickets are excluded. {report && report.scope === 'own' ? 'These numbers cover the tickets assigned to you.' : 'These numbers cover the whole helpdesk.'}
         </p>
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-1 bg-white border border-slate-200 rounded-md p-1 shadow-sm">
+        <div className="flex flex-wrap min-w-0 items-center gap-2">
+          <div className="flex flex-wrap items-center gap-1 bg-white border border-slate-200 rounded-md p-1 shadow-sm">
             {RANGES.map((r) => (
               <button
                 key={r.value}
@@ -1871,7 +1853,7 @@ function AssetReports({ token }) {
           deployed, under repair or retired. "In stock" means status <span className="font-medium text-slate-700">In Stock</span>;
           everything else counts as out of stock.
         </p>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap min-w-0 items-center gap-2">
           {/* Report generation: CSV for spreadsheets, print for PDF archives. */}
           <button
             onClick={() => downloadCsv(token, `${API_URL}/api/reports/assets/export`, 'asset-report.csv')}
@@ -2288,7 +2270,7 @@ function ManualCallModal({ token, itExtensions, directory, onClose, onLogged }) 
   };
 
   return (
-    <div className="fixed inset-0 bg-slate-900/40 flex items-center justify-center p-4 z-50">
+    <div role="dialog" aria-modal="true" className="modal-overlay fixed inset-0 bg-slate-900/40 flex items-center justify-center p-4 z-50">
       <form onSubmit={submit} className="bg-white rounded-lg shadow-xl border border-slate-200 w-full max-w-lg p-5 max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2"><PhoneCall className="h-4 w-4 text-[#0052CC]" /> Log a phone call</h3>
@@ -2385,7 +2367,7 @@ function ParsePreviewModal({ token, onClose }) {
   };
 
   return (
-    <div className="fixed inset-0 bg-slate-900/40 flex items-center justify-center p-4 z-50">
+    <div role="dialog" aria-modal="true" className="modal-overlay fixed inset-0 bg-slate-900/40 flex items-center justify-center p-4 z-50">
       <div className="bg-white rounded-lg shadow-xl border border-slate-200 w-full max-w-3xl p-5 max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between mb-3">
           <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2"><FileText className="h-4 w-4 text-[#0052CC]" /> Test a PBX record</h3>
@@ -2463,7 +2445,7 @@ function CallNotesModal({ token, call, onClose, onSaved }) {
     onSaved(data);
   };
   return (
-    <div className="fixed inset-0 bg-slate-900/40 flex items-center justify-center p-4 z-50">
+    <div role="dialog" aria-modal="true" className="modal-overlay fixed inset-0 bg-slate-900/40 flex items-center justify-center p-4 z-50">
       <div className="bg-white rounded-lg shadow-xl border border-slate-200 w-full max-w-lg p-5">
         <div className="flex items-center justify-between mb-3">
           <h3 className="text-sm font-bold text-slate-900">Call notes — {callStamp(call)}</h3>
@@ -2969,13 +2951,15 @@ function CallReports({ token }) {
 
           <div className="bg-white border border-slate-200 rounded-md shadow-sm p-4">
             <h3 className="text-xs font-bold text-slate-900 mb-3">When the phone rings</h3>
-            <div className="flex items-end gap-1 h-24">
+            <div className="overflow-x-auto">
+            <div className="flex items-end gap-1 h-24 min-w-[480px]">
               {report.byHour.map((h) => (
                 <div key={h.hour} className="flex-1 flex flex-col items-center justify-end h-full" title={`${String(h.hour).padStart(2, '0')}:00 — ${h.calls} call(s)`}>
                   <div className="w-full bg-[#0052CC]/80 rounded-t" style={{ height: `${Math.round((h.calls / maxHour) * 100)}%`, minHeight: h.calls ? 3 : 1 }} />
                   <span className="text-[9px] text-slate-400 mt-1">{String(h.hour).padStart(2, '0')}</span>
                 </div>
               ))}
+            </div>
             </div>
           </div>
 
@@ -3064,6 +3048,7 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
   // full directory; regular agents get the email-free one (#36).
   const assignablePeople = superAdmin ? usersList : peopleList;
   const [isAssetModalOpen, setIsAssetModalOpen] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
   const [inviteEmail, setInviteEmail] = useState('');
   const [copied, setCopied] = useState(false);
@@ -3313,7 +3298,7 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col font-sans relative">
-      <header className="bg-[#0052CC] text-white px-6 py-3 flex items-center justify-between shadow-sm">
+      <header className="bg-[#0052CC] text-white px-4 sm:px-6 py-3 flex flex-wrap gap-3 items-center justify-between shadow-sm agent-header">
         <div className="flex items-center gap-4">
           <div className="p-1.5 bg-white/10 rounded text-white flex items-center justify-center">
             <Activity className="h-5 w-5" />
@@ -3345,13 +3330,16 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
         </div>
       </header>
 
-      <div className="flex flex-1">
-        <aside className="w-60 bg-white border-r border-slate-200 p-4 flex flex-col justify-between">
+      <button type="button" aria-expanded={mobileNavOpen} aria-controls="workspace-navigation" onClick={() => setMobileNavOpen((open) => !open)} className="md:hidden flex items-center gap-2 px-4 py-3 text-sm font-semibold text-blue-700 bg-white border-b border-slate-200">
+        <Menu className="h-5 w-5" /> {mobileNavOpen ? 'Hide workspaces' : 'Show workspaces'}
+      </button>
+      <div className="flex flex-col md:flex-row flex-1 min-w-0">
+        <aside id="workspace-navigation" className={`${mobileNavOpen ? 'flex' : 'hidden'} md:flex w-full md:w-60 shrink-0 bg-white border-r border-slate-200 p-4 flex-col justify-between`}>
           <div>
             <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-3 px-3">
               Workspaces
             </div>
-            <nav className="space-y-1">
+            <nav aria-label="Workspaces" onClick={(e) => { if (e.target.closest('a')) setMobileNavOpen(false); }} className="space-y-1">
               <Link to="/agent/tickets" className={`w-full flex items-center gap-2.5 px-3 py-2 rounded text-xs font-medium transition ${currentTab === 'tickets' ? 'bg-blue-50 text-[#0052CC] font-semibold border-l-2 border-[#0052CC]' : 'text-slate-600 hover:bg-slate-100'}`}>
                 <Ticket className="h-4 w-4" /> Queues & Tickets
               </Link>
@@ -3389,8 +3377,8 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
           </div>
         </aside>
 
-        <main className="flex-1 p-6 overflow-y-auto max-w-7xl mx-auto w-full pb-20">
-          <header className="flex justify-between items-center mb-6 pb-4 border-b border-slate-200">
+        <main className="agent-main min-w-0 flex-1 p-4 sm:p-6 max-w-7xl mx-auto w-full pb-20">
+          <header className="flex flex-wrap gap-3 justify-between items-center mb-6 pb-4 border-b border-slate-200">
             <div>
               <h1 className="text-xl font-bold text-slate-900">
                 {currentTab === 'tickets' ? (superAdmin ? 'Service Desk Queues' : 'My Assigned Tickets')
@@ -3459,7 +3447,8 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
 
           {currentTab === 'tickets' && (
             <div className="bg-white border border-slate-200 rounded-md shadow-sm">
-              <div className="overflow-x-auto">
+              <p className="md:hidden text-xs text-slate-500 px-4 py-2">Swipe the table to see status, assignee and actions.</p>
+              <div className="overflow-x-auto ticket-table">
                 <table className="w-full text-left text-xs">
                   <thead className="bg-slate-50 border-b border-slate-200 text-slate-500 font-semibold uppercase">
                     <tr>
@@ -3749,7 +3738,7 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
           )}
 
           {isAssetModalOpen && (
-            <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+            <div role="dialog" aria-modal="true" className="modal-overlay fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4 z-50">
               <div className="bg-white border border-slate-200 rounded-lg shadow-xl p-6 w-full max-w-md text-slate-800">
                 <h2 className="text-base font-bold mb-4 text-slate-900 border-b border-slate-100 pb-2">Add New IT Asset</h2>
                 <form onSubmit={handleCreateAsset} className="space-y-4">
@@ -3829,7 +3818,7 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
           )}
 
           {isInviteModalOpen && (
-            <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+            <div role="dialog" aria-modal="true" className="modal-overlay fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4 z-50">
               <div className="bg-white border border-slate-200 rounded-lg shadow-xl p-6 w-full max-w-md text-slate-800">
                 <h2 className="text-base font-bold mb-4 text-slate-900 border-b border-slate-100 pb-2">Send Registration Invitation</h2>
                 <div className="space-y-4">
@@ -3885,7 +3874,7 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
         </main>
       </div>
 
-      <div className="fixed bottom-6 right-6 z-50">
+      <div className="live-chat fixed bottom-4 right-4 sm:bottom-6 sm:right-6 z-40">
         {!isChatOpen ? (
           <button 
             onClick={() => setIsChatOpen(type => !type)}
@@ -3895,13 +3884,13 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
             <span className="text-xs font-semibold pr-1">Live Chat Console</span>
           </button>
         ) : (
-          <div className="bg-white border border-slate-200 rounded-lg shadow-2xl w-80 sm:w-96 flex flex-col h-[420px] overflow-hidden">
+          <div className="bg-white border border-slate-200 rounded-lg shadow-2xl w-[min(24rem,calc(100vw-2rem))] flex flex-col h-[min(420px,calc(100dvh-2rem))] overflow-hidden">
             <div className="bg-[#0052CC] text-white px-4 py-3 flex items-center justify-between shadow-sm">
               <div className="flex items-center gap-2">
                 <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></div>
                 <span className="text-xs font-semibold">Agent Live Response Console</span>
               </div>
-              <button onClick={() => setIsChatOpen(false)} className="text-blue-100 hover:text-white">
+              <button aria-label="Close live chat" onClick={() => setIsChatOpen(false)} className="text-blue-100 hover:text-white">
                 <X className="h-4 w-4" />
               </button>
             </div>
@@ -3930,9 +3919,9 @@ function AgentConsole({ user, tickets, usersList, inventoryList, enums = FALLBAC
                 placeholder="Type reply as IT Agent..." 
                 value={chatInput} 
                 onChange={(e) => setChatInput(e.target.value)} 
-                className="flex-1 bg-slate-100 border border-slate-200 rounded px-3 py-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none" 
+                className="min-w-0 flex-1 bg-slate-100 border border-slate-200 rounded px-3 py-2 text-xs focus:bg-white focus:border-[#0052CC] focus:outline-none"
               />
-              <button type="submit" className="bg-[#0052CC] hover:bg-blue-700 text-white px-3 py-2 rounded transition flex items-center justify-center">
+              <button aria-label="Send message" type="submit" className="bg-[#0052CC] hover:bg-blue-700 text-white px-3 py-2 rounded transition flex items-center justify-center">
                 <Send className="h-3.5 w-3.5" />
               </button>
             </form>
