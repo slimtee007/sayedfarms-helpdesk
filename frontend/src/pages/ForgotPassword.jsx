@@ -10,6 +10,10 @@ const ForgotPassword = ({ onBackToLogin, apiBase = '' }) => {
   const [message, setMessage] = useState('');
   const [emailSent, setEmailSent] = useState(null); // true: emailed, false: not sent
   const [devOtp, setDevOtp] = useState(''); // shown only when SMTP is not configured (dev mode)
+  // Set when the server reached its mail host and was refused. Kept apart from
+  // the red error box so the mail server's own reason and the .env fix show up
+  // instead of a single "please try again" line.
+  const [deliveryProblem, setDeliveryProblem] = useState(null);
   const [loading, setLoading] = useState(false);
 
   const [resendCooldown, setResendCooldown] = useState(0);
@@ -26,11 +30,25 @@ const ForgotPassword = ({ onBackToLogin, apiBase = '' }) => {
     return () => clearInterval(timer);
   }, [resendCooldown]);
 
+  // Turn a failed OTP request into something actionable. The server sends
+  // { error, reason, detail, hint } when the SMTP conversation failed; anything
+  // else (rate limit, network) keeps the plain error message.
+  const describeFailure = (data, fallback) => {
+    if (data && (data.hint || data.detail)) {
+      setDeliveryProblem({ reason: data.reason || '', detail: data.detail || '', hint: data.hint || '' });
+      setError(data.error || fallback);
+    } else {
+      setDeliveryProblem(null);
+      setError((data && data.error) || fallback);
+    }
+  };
+
   // Step 1: Request OTP
   const handleSendOtp = async (e) => {
     e.preventDefault();
     setError('');
     setMessage('');
+    setDeliveryProblem(null);
     setLoading(true);
 
     try {
@@ -41,8 +59,12 @@ const ForgotPassword = ({ onBackToLogin, apiBase = '' }) => {
       });
       const data = await res.json();
 
-      if (!res.ok) throw new Error(data.error || 'Failed to send verification code.');
+      if (!res.ok) {
+        describeFailure(data, 'Failed to send verification code.');
+        return;
+      }
 
+      setDeliveryProblem(null);
       if (data.devOtp) {
         // SMTP is not configured on the server — no email went out.
         setEmailSent(false);
@@ -55,8 +77,8 @@ const ForgotPassword = ({ onBackToLogin, apiBase = '' }) => {
       }
       setStep(2);
       setResendCooldown(30);
-    } catch (err) {
-      setError(err.message);
+    } catch {
+      setError('Could not reach the server. Check your connection and try again.');
     } finally {
       setLoading(false);
     }
@@ -66,6 +88,7 @@ const ForgotPassword = ({ onBackToLogin, apiBase = '' }) => {
   const handleResendOtp = async () => {
     setError('');
     setMessage('');
+    setDeliveryProblem(null);
     setIsResending(true);
 
     try {
@@ -76,8 +99,12 @@ const ForgotPassword = ({ onBackToLogin, apiBase = '' }) => {
       });
       const data = await res.json();
 
-      if (!res.ok) throw new Error(data.error || 'Failed to resend OTP.');
+      if (!res.ok) {
+        describeFailure(data, 'Failed to resend the verification code.');
+        return;
+      }
 
+      setDeliveryProblem(null);
       if (data.devOtp) {
         setEmailSent(false);
         setDevOtp(data.devOtp);
@@ -88,8 +115,8 @@ const ForgotPassword = ({ onBackToLogin, apiBase = '' }) => {
         setMessage('A new verification code has been sent to your email.');
       }
       setResendCooldown(30);
-    } catch (err) {
-      setError(err.message);
+    } catch {
+      setError('Could not reach the server. Check your connection and try again.');
     } finally {
       setIsResending(false);
     }
@@ -131,6 +158,22 @@ const ForgotPassword = ({ onBackToLogin, apiBase = '' }) => {
       </div>
 
       {error && <div style={styles.errorBox}>{error}</div>}
+      {deliveryProblem && (deliveryProblem.hint || deliveryProblem.detail) && (
+        <div style={styles.diagnosticBox}>
+          <div style={styles.diagnosticTitle}>Why the email did not go out</div>
+          {deliveryProblem.detail && <p style={styles.diagnosticText}>{deliveryProblem.detail}</p>}
+          {deliveryProblem.hint && (
+            <>
+              <div style={styles.diagnosticTitle}>How the administrator can fix it</div>
+              <p style={styles.diagnosticText}>{deliveryProblem.hint}</p>
+            </>
+          )}
+          <p style={styles.diagnosticMeta}>
+            Server-side check: <code style={styles.code}>cd backend &amp;&amp; npm run test-email</code> prints
+            the exact SMTP conversation{deliveryProblem.reason ? <> (code <code style={styles.code}>{deliveryProblem.reason}</code>)</> : null}.
+          </p>
+        </div>
+      )}
       {message && <div style={styles.successBox}>{message}</div>}
       {devOtp && (
         <div style={styles.devBox}>
@@ -356,6 +399,38 @@ const styles = {
     borderRadius: '6px',
     fontSize: '13px',
     marginBottom: '16px',
+  },
+  diagnosticBox: {
+    backgroundColor: '#fff7ed',
+    color: '#9a3412',
+    border: '1px solid #fed7aa',
+    padding: '12px',
+    borderRadius: '6px',
+    fontSize: '13px',
+    lineHeight: '1.5',
+    marginBottom: '16px',
+  },
+  diagnosticTitle: {
+    fontWeight: '700',
+    fontSize: '12px',
+    textTransform: 'uppercase',
+    letterSpacing: '0.4px',
+    marginBottom: '4px',
+    color: '#c2410c',
+  },
+  diagnosticText: {
+    margin: '0 0 10px',
+  },
+  diagnosticMeta: {
+    margin: 0,
+    fontSize: '12px',
+    color: '#7c2d12',
+  },
+  code: {
+    backgroundColor: '#ffedd5',
+    padding: '1px 4px',
+    borderRadius: '3px',
+    fontSize: '12px',
   },
   devBox: {
     backgroundColor: '#fffbeb',
