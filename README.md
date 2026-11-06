@@ -356,3 +356,36 @@ See `backend/.env.example` for Office 365 / Gmail settings.
 If SMTP is not configured, the app says so on screen and (outside
 `NODE_ENV=production`) shows the reset code directly in the page instead of
 silently pretending an email was sent.
+
+### When "the verification email could not be sent"
+
+The reset page now shows **why** — the mail server's own verdict (`reason`, e.g.
+`SEND_AS_DENIED`) plus the exact `.env` change that fixes it — instead of one
+generic sentence. To see the whole SMTP conversation:
+
+```bash
+cd backend
+npm run test-email                      # reach the host + sign in, send nothing
+npm run test-email -- you@sayedfarms.com  # also deliver a real test message
+```
+
+The same check is available to a signed-in super admin at
+`GET /api/admin/email-status` (no email is sent).
+
+Failure reasons the app maps to a fix:
+
+| `reason` | What happened | Usual fix |
+| --- | --- | --- |
+| `SEND_AS_DENIED` | `550 5.2.252 SendAsDenied` — `MAIL_FROM` is a different mailbox than `SMTP_USER` and the account has no **Send As** right on it | set `MAIL_FROM` to the `SMTP_USER` address (or grant Send As in the M365 admin center) |
+| `SMTP_AUTH_DISABLED` | `5.7.57` / "SMTP AUTH is disabled" | enable **Authenticated SMTP** on the sending mailbox (M365: Users → mailbox → Mail → Manage email apps) |
+| `SMTP_AUTH_FAILED` | `535` — wrong mailbox password, MFA blocking, or a normal Gmail password | fix `SMTP_PASS`; for Gmail use an App Password with 2-step verification on |
+| `SMTP_BLOCKED` | tenant anti-spam policy rejects the sender (`5.7.708`, …) | allow the mailbox in Exchange → Mail flow → Anti-spam outbound policies |
+| `SMTP_RELAY_DENIED` | `554 5.7.1` relay denied — unauthenticated, or `MAIL_FROM` not on that server | set `SMTP_USER`/`SMTP_PASS` to a real mailbox on `SMTP_HOST` |
+| `SMTP_UNREACHABLE` | timeout / refused on the configured port | `SMTP_PORT=587` with `SMTP_SECURE=false`; port 587/25 may be blocked by a firewall |
+| `SMTP_TLS` | TLS handshake failed | 587 + `SMTP_SECURE=false`, or 465 + `SMTP_SECURE=true` — never mixed |
+
+The backend also warns at boot about combinations it can detect without
+connecting (empty `SMTP_PASS`, `MAIL_FROM` ≠ `SMTP_USER`, port/TLS mismatch).
+Microsoft is retiring basic SMTP AUTH in Exchange Online, so a tenant that has
+it switched off will need Authenticated SMTP enabled for the mailbox (or an
+OAuth/relay alternative) — the `SMTP_AUTH_DISABLED` message says which.

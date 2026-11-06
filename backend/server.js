@@ -760,7 +760,13 @@ const ENUMS = {
   pbxTicketPolicy: [...VALID_PBX_TICKET_POLICY],
 };
 
-const { sendOtpEmail, isSmtpConfigured } = require('./utils/sendEmail');
+const {
+  sendOtpEmail,
+  isSmtpConfigured,
+  verifySmtp,
+  explainSmtpError,
+  smtpConfigWarnings,
+} = require('./utils/sendEmail');
 
 // ------------------------------------------------------------------
 // Password-reset codes (#24).
@@ -813,7 +819,43 @@ if (!isSmtpConfigured()) {
   console.warn('\n[WARN] SMTP is NOT configured (backend/.env). Password reset emails will NOT be sent.');
   console.warn('       Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS in backend/.env and restart the server.');
   console.warn('       Until then, reset codes are only printed to this terminal / shown in the app (dev mode).\n');
+} else {
+  // Config mistakes that can be spotted without opening a connection. Printing
+  // them at boot beats the first user discovering them with a failed reset.
+  const warnings = smtpConfigWarnings();
+  if (warnings.length) {
+    console.warn('\n[WARN] SMTP settings in backend/.env look wrong:');
+    warnings.forEach((w) => console.warn(`       • ${w}`));
+    console.warn('       Diagnose with: cd backend && npm run test-email -- you@sayedfarms.com\n');
+  }
 }
+
+/**
+ * Turns an SMTP failure into what the person waiting for the code should read.
+ *
+ * The old contract was one opaque sentence ("Failed to send the verification
+ * email…"), so a SendAsDenied / disabled-SMTP-AUTH / blocked-port mistake in
+ * .env looked identical to a temporary glitch. We now surface the mail server's
+ * own verdict (`reason`) plus the concrete .env fix (`hint`) — never the
+ * credentials, and never WHETHER the address exists (the response shape is the
+ * same for a known and an unknown address when SMTP is configured, so this
+ * cannot be used to probe the user directory).
+ */
+const otpDeliveryFailure = (res, err, kind) => {
+  const explained = explainSmtpError(err);
+  console.error(`[${kind.toUpperCase()}] Email send error [${explained.code}]:`, (err && err.message) || err);
+  if (explained.hint) console.error(`          fix: ${explained.hint}`);
+  return res.status(502).json({
+    error: `The verification email could not be sent: ${explained.detail} ` +
+      'If this keeps happening, contact the administrator.',
+    emailSent: false,
+    reason: explained.code,
+    detail: explained.detail,
+    // Admin-facing guidance. It only describes this server's own mail
+    // configuration, so it is safe for a public endpoint.
+    hint: explained.hint,
+  });
+};
 
 /**
  * Generates an OTP for `email` and delivers it.
@@ -858,14 +900,58 @@ const generateAndSendOtp = async (res, email, kind) => {
     await sendOtpEmail(key, otp, kind);
     return genericSuccess();
   } catch (err) {
-    console.error(`[${kind.toUpperCase()}] Email send error:`, err && err.message ? err.message : err);
-    console.log(`\n========================================\n [DEV FALLBACK OTP CODE for ${key}]: ${otp}\n========================================\n`);
-    return res.status(500).json({
+    // Only leak diagnostics to a signed-out stranger in development. In
+    // production the public endpoint must not describe the mail setup.
+    if (!isProduction) {
+      console.log(`\n========================================\n [DEV FALLBACK OTP CODE for ${key}]: ${otp}\n========================================\n`);
+      return otpDeliveryFailure(res, err, kind);
+    }
+    console.error(`[${kind.toUpperCase()}] Email send error [${explainSmtpError(err).code}]:`, (err && err.message) || err);
+    return res.status(502).json({
       error: 'Failed to send the verification email. Please try again or contact the administrator.',
       emailSent: false,
     });
   }
 };
+
+// Admin-only SMTP self-test: opens the connection, signs in and (optionally)
+// sends a real message, then reports exactly which step failed. `GET` with no
+// side effects is the default so a button in the console can be wired to it
+// without emailing anybody.
+app.get('/api/admin/email-status', requireSuperAdmin, async (req, res) => {
+  const configured = isSmtpConfigured();
+  const status = {
+    configured,
+    host: (process.env.SMTP_HOST || '').trim() || null,
+    port: parseInt(process.env.SMTP_PORT || '587', 10),
+    secure: process.env.SMTP_SECURE === 'true',
+    user: process.env.SMTP_USER || null,
+    mailFrom: (process.env.MAIL_FROM || process.env.SMTP_USER || '').trim() || null,
+    warnings: smtpConfigWarnings(),
+    reachable: null,
+    error: null,
+    reason: null,
+    hint: null,
+  };
+  if (!configured) {
+    status.error = 'SMTP is not configured in backend/.env.';
+    status.hint = 'Set SMTP_HOST, SMTP_PORT, SMTP_USER and SMTP_PASS, then restart the backend.';
+    return res.json(status);
+  }
+  try {
+    await verifySmtp();
+    status.reachable = true;
+  } catch (err) {
+    status.reachable = false;
+    const explained = explainSmtpError(err);
+    status.error = explained.detail;
+    status.reason = explained.code;
+    status.hint = explained.hint;
+    console.error('[email-status] SMTP verify failed:', (err && err.message) || err);
+  }
+  res.json(status);
+});
+
 
 app.post('/api/auth/signup', writeRateLimit, async (req, res) => {
   try {

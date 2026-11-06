@@ -437,6 +437,65 @@ npm run lint && npm run build` → 0 errors, build OK.
 | 23 | **Attachments base64-inlined into `db.json`**, which is rewritten in full on every chat message. PARTIAL: new ticket images are capped (~2 MB) so the worst bloat is bounded; the inline-base64 storage design remains. Move attachments to files/object storage with a size limit. | `server.js`, `App.jsx` |
 | 24 | ~~Reset codes live only in memory~~ — **FIXED**, see FIXED §13 (persisted in `db.json`, stored as a SHA-256 digest, 5-attempt cap). Everything else in the original finding was already fixed — JSON 404s, error middleware, duplicate serial rejection, string OTP compare. | — |
 
+### 17. "I configured the mail in .env but it still says Failed to send" — FIXED (this branch)
+
+**Reproduced from the reported screenshot.** `SMTP_HOST`/`SMTP_USER`/`SMTP_PASS` were
+genuinely configured (the server was talking to `smtp.office365.com`), and Exchange
+refused the message:
+
+```
+550 5.2.252 SendAsDenied; not allowed to send as it-helpdesk@sayedfarms.com;
+STOREDRV.Submission.Exception:SendAsDeniedException.MapiExceptionSendAsDenied
+```
+
+Nothing was broken in `.env` loading — the bug was that **all of this was invisible**:
+
+1. **One opaque sentence for every failure.** `generateAndSendOtp` turned any SMTP error
+   into `Failed to send the verification email. Please try again or contact the administrator.`
+   A wrong `MAIL_FROM`, a mailbox with SMTP AUTH switched off, a bad password and a
+   firewall blocking port 587 were indistinguishable — and the actual Exchange answer only
+   existed in the backend terminal. The classification now lives in
+   `utils/sendEmail.js#explainSmtpError`, which returns `{code, detail, hint}` for
+   `SEND_AS_DENIED`, `SMTP_AUTH_DISABLED`, `SMTP_AUTH_FAILED`, `SMTP_BLOCKED`,
+   `SMTP_RELAY_DENIED`, `SMTP_UNKNOWN`, `SMTP_UNREACHABLE`, `SMTP_HOST_NOT_FOUND` and
+   `SMTP_TLS`.
+2. **The reset page threw the diagnosis away.** `ForgotPassword` only rendered `data.error`
+   and then `throw`n a new `Error`, discarding `reason`/`hint`. It now shows the mail
+   server's verdict plus the concrete `.env` fix, and a network failure no longer reads as
+   an SMTP failure.
+3. **No way to test the settings.** Added `npm run test-email` (`scripts/test-email.js`):
+   prints the effective config with the password masked, warns about detectable mistakes,
+   connects + authenticates, and optionally sends a real message — reporting the SMTP
+   conversation and the fix at whichever step fails. Also added
+   `GET /api/admin/email-status` (super-admin only, sends nothing) for the console.
+4. **Config mistakes that never needed a network call went unmentioned.** The server now
+   warns at boot when `MAIL_FROM` names a different mailbox than `SMTP_USER` (the exact
+   cause of the reported 550), when `SMTP_PASS`/`SMTP_USER` is empty, and on port/TLS
+   mismatches (587 + `SMTP_SECURE=true`).
+5. **A blocked port hung for two minutes.** No connect/greeting/socket timeouts were set,
+   so nodemailer's defaults applied. Now 15/15/30 s, overridable via
+   `SMTP_CONNECT_TIMEOUT_MS` / `SMTP_GREETING_TIMEOUT_MS` / `SMTP_SOCKET_TIMEOUT_MS`.
+6. **The delivery failure was a bare 500 with no `emailSent` contract value**, and
+   `NODE_ENV=production` still returned the same generic text. Failures now answer
+   `502 { emailSent:false, error, reason, detail, hint }` in development; production keeps
+   the generic message and logs the classified reason instead (no mail-setup details on a
+   public endpoint). In development the code is still printed **and** shown so nobody is
+   locked out of their own account while mail is being fixed.
+
+Also documented (README → *When "the verification email could not be sent"*): Microsoft is
+retiring basic SMTP AUTH client submission in Exchange Online, so a tenant that has it off
+needs **Authenticated SMTP** enabled on the sending mailbox — the `SMTP_AUTH_DISABLED`
+message says so, and the boot warning nudges toward it.
+
+Verified: `backend/tests/smtp.test.js`, 6 new tests against a stand-in in-process SMTP
+server — the real `SendAsDenied` string classified correctly and returned end-to-end
+through `POST /api/auth/forgot-password` (with `MAIL_FROM` ≠ `SMTP_USER`), the happy path
+actually delivering a message whose body contains the 6-digit code, `email-status` proving
+the connection without sending, the boot warnings, and the error mapping table. `npm run
+test-email` was run against the same stand-in to confirm the CLI output.
+
+---
+
 ## OPEN — repo hygiene
 
 | # | Finding |
